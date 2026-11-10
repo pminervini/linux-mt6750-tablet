@@ -10,7 +10,11 @@ It is not a polished distribution.
 
 ## What works
 
-- 8 CPUs (both clusters, SPM power-on), eMMC, USB CDC-ECM gadget (ssh over USB)
+- 8 CPUs (both clusters, SPM power-on), eMMC
+- USB-C dual role: CDC-ECM gadget (ssh over USB) when plugged into a computer, host mode (keyboard
+  etc. through an OTG adapter) when the ID pin is grounded, switched automatically; reboots with a
+  host device attached come back on battery (the port's 5 V is switched off and an RTC alarm powers
+  the PMIC back on)
 - console on the boot loader's framebuffer (simple-framebuffer; lk's overlay layer switched off),
   PWM backlight, panel sleep/wake over DSI
 - Wi-Fi (WPA2, DHCP, power save) and Bluetooth (BlueZ) through the vendor connsys stack, forward-ported
@@ -24,7 +28,7 @@ It is not a polished distribution.
 - unattended operation: watchdog full-reset, fallback to Android when a kernel fails early, Wi-Fi
   watchdog, quiet console with a clean login prompt
 
-Not working yet: USB host mode, cameras, CPU frequency scaling beyond the boot loader's operating point
+Not working yet: cameras, CPU frequency scaling beyond the boot loader's operating point
 (a small userspace governor switches between two points), GPU.
 
 ## Building

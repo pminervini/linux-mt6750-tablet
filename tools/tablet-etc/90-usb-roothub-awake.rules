@@ -1,0 +1,3 @@
+# MT6755 xhci-mtk: a device plugged into the USB-C port in host mode does not wake a runtime-suspended
+# root hub (no connect is ever seen), so keep the root hubs awake (they draw next to nothing).
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="1d6b", TEST=="power/control", ATTR{power/control}="on"

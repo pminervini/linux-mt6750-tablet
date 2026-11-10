@@ -1,0 +1,69 @@
+From b49cb89be372b7f5d64cdae1814db56153bc41fe Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 12:39:29 +0000
+Subject: [PATCH 29/29] soc: mediatek: mt6755-pmic: ignore CHRDET while the
+ USB-C port supplies host VBUS
+
+In host mode the port's own 5 V (GPIO43, drvvbus) reaches the charger input
+and sets CHRDET. Treating that as a charger blocked the low-battery power-off
+and reported 'Charging' with a USB keyboard attached.
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index 65047547e..de7a1f27a 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -28,7 +28,8 @@
+  *    is then "Not charging") and near empty; current_now is the real battery current (the charger ISENSE
+  *    path also feeds the system). charge_uah can be restored across reboots.
+  *  - power_supply "battery" (status/health/voltage/current/temp/capacity/charge)
+- *    and "usb" (online = charger detected).
++ *    and "usb" (online = charger detected; not while the USB-C port itself
++ *    supplies 5 V in host mode, which CHRDET also sees).
+  *  - rtc: MT6353 RTC (MT6397 layout at PMIC 0x4000), year base 1968 as stock.
+  *  - /sys/kernel/mt6755_pmic/boot_recovery: RTC_PDN1 FAC_RESET, the flag stock
+  *    `reboot recovery` sets; lk boots `recovery` once and clears it.
+@@ -551,6 +552,21 @@ static void chr_disable(void)
+ 	mt6755_pmic_rmw(CHR_CON0, 1, 4, 0);	/* CHR_EN */
+ }
+ 
++/*
++ * USB host mode: the port's own 5 V output (GPIO43, "drvvbus") reaches the charger input and sets
++ * CHRDET. That is not a charger: without this the low-battery power-off never fires with a USB
++ * keyboard attached, and the charger would be enabled from the tablet's own boost.
++ */
++#define GPIO_BASE		0x10005000
++#define  GPIO_DOUT(p)		(0x100 + ((p) / 32) * 0x10)
++#define USB_VBUS_GPIO		43
++static void __iomem *gpio_base;
++
++static bool otg_vbus_on(void)
++{
++	return gpio_base && (readl(gpio_base + GPIO_DOUT(USB_VBUS_GPIO)) & BIT(USB_VBUS_GPIO % 32));
++}
++
+ static void chr_work_fn(struct work_struct *w)
+ {
+ 	enum chg_state st = bs.st, old = bs.st;
+@@ -560,7 +576,7 @@ static void chr_work_fn(struct work_struct *w)
+ 
+ 	if (mt6755_pmic_read(CHR_CON0, &c0))
+ 		goto out;
+-	chr = !!(c0 & BIT(5));
++	chr = (c0 & BIT(5)) && !otg_vbus_on();
+ 	if (!battery_read(&vbat, &ibat)) {
+ 		bs.vbat = vbat;
+ 		bs.ibat = ibat;
+@@ -887,6 +903,7 @@ static int __init mt6755_pmic_init(void)
+ 	pwrap = ioremap(PWRAP_BASE, 0x1000);
+ 	if (!pwrap)
+ 		return -ENOMEM;
++	gpio_base = ioremap(GPIO_BASE, 0x1000);
+ 
+ 	kobj = kobject_create_and_add("mt6755_pmic", kernel_kobj);
+ 	pmic_kobj = kobj;
+-- 
+2.53.0
+

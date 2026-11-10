@@ -1,7 +1,7 @@
 From c373ec6b704f0055ce4e96be18755b71c283b103 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sat, 7 Nov 2026 09:25:13 +0000
-Subject: [PATCH 04/25] mt6750 tablet: SMP on both clusters (SPM core power-on,
+Subject: [PATCH 04/29] mt6750 tablet: SMP on both clusters (SPM core power-on,
  CCI-400 SI3 snoop for MP1)
 
 ---

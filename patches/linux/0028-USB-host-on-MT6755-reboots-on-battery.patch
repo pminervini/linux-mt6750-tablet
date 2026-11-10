@@ -1,0 +1,251 @@
+From 003ba2fcd060552bf69ce21e44dd976a41fc602e Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 12:24:23 +0000
+Subject: [PATCH 28/29] USB host on MT6755 + reboots on battery
+
+mtu3: on MT6755 (SSUSB IP v0) the U2 port follows the PHY's IDDIG while
+OTG_SEL is set and the IPPC FORCE_IDDIG bits do nothing; in host mode the
+xHCI root port never saw a connect. Force the PHY mode and take the port
+off OTG selection in host mode, restore both for device mode. A USB
+keyboard on an OTG adapter now enumerates 1.6 s after plug-in.
+
+mt6755-bringup: switch off the USB-C 5 V host output (GPIO43) before
+reboot/power-off; fed back into charger detection it confuses the boot
+loaders.
+
+mt6755-pmic: the watchdog restart is a full PMIC power cycle, which only
+powers up again from a power-on source (a charger on the port): on battery
+a reboot left the tablet off. Arm a one-shot RTC alarm 15 s ahead in the
+restart-prepare handler (BBPU PWREN: the alarm powers the PMIC on; no
+PDN2 PWRON_ALARM, so lk boots normally) and cancel it at the next boot.
+Image s7m.
+---
+ drivers/soc/mediatek/mt6755-bringup.c | 36 ++++++++++++++
+ drivers/soc/mediatek/mt6755-pmic.c    | 71 +++++++++++++++++++++++++++
+ drivers/usb/mtu3/mtu3_dr.c            | 28 +++++++++++
+ 3 files changed, 135 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mt6755-bringup.c b/drivers/soc/mediatek/mt6755-bringup.c
+index f3776ba74..df80dfc5a 100644
+--- a/drivers/soc/mediatek/mt6755-bringup.c
++++ b/drivers/soc/mediatek/mt6755-bringup.c
+@@ -15,6 +15,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/printk.h>
++#include <linux/reboot.h>
+ 
+ #define TOPCKGEN		0x10000000
+ #define  CLK_CFG_UPDATE		0x004
+@@ -98,6 +99,41 @@ static int __init mt6755_bringup_lk_layers(void)
+ }
+ arch_initcall(mt6755_bringup_lk_layers);
+ 
++/*
++ * Reboot / power-off: switch off the USB-C port's 5 V host output (GPIO43, stock "drvvbus") first.
++ * Left on, it feeds back into the PMIC's charger detection, the preloader/lk see "a charger is
++ * plugged in" after the reset and start power-off charging instead of booting (the tablet looks
++ * off). Stock does mtk_xhci_vbus_off() on the way down. Direct register access: this runs late.
++ */
++#define GPIO_BASE		0x10005000
++#define  GPIO_DOUT_CLR(p)	(0x100 + ((p) / 32) * 0x10 + 8)
++#define USB_VBUS_GPIO		43
++
++static int mt6755_vbus_off_reboot(struct notifier_block *nb, unsigned long action, void *data)
++{
++	void __iomem *gpio = ioremap(GPIO_BASE, 0x1000);
++
++	if (gpio) {
++		writel(BIT(USB_VBUS_GPIO % 32), gpio + GPIO_DOUT_CLR(USB_VBUS_GPIO));
++		iounmap(gpio);
++		mdelay(100);			/* let VBUS discharge before the reset */
++	}
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block mt6755_vbus_off_nb = {
++	.notifier_call = mt6755_vbus_off_reboot,
++	.priority = 200,			/* before the restart handlers */
++};
++
++static int __init mt6755_bringup_vbus_off(void)
++{
++	if (!of_machine_is_compatible("mediatek,k50v1-tablet"))
++		return 0;
++	return register_reboot_notifier(&mt6755_vbus_off_nb);
++}
++device_initcall(mt6755_bringup_vbus_off);
++
+ /*
+  * Secondary CPU power-up through the SPM (stock mt_spm_mtcmos.c
+  * spm_mtcmos_ctrl_cpuN, STA_POWER_ON). Only cluster 0 (MP0) for now: MP1
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index 5820b9333..65047547e 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -921,7 +921,14 @@ subsys_initcall(mt6755_pmic_init);
+ #define RTC_BBPU_RELOAD		BIT(5)
+ #define RTC_BBPU_CBUSY		BIT(6)
+ #define RTC_BBPU_KEY		(0x43 << 8)
++#define RTC_IRQ_STA		(RTC_BASE + 0x02)
++#define RTC_IRQ_EN		(RTC_BASE + 0x04)
++#define RTC_IRQ_EN_AL		BIT(0)
++#define RTC_IRQ_EN_ONESHOT	BIT(2)
++#define RTC_AL_MASK		(RTC_BASE + 0x08)
++#define RTC_AL_MASK_DOW		BIT(4)
+ #define RTC_TC_SEC		(RTC_BASE + 0x0a)	/* SEC MIN HOU DOM DOW MTH YEA, 2 bytes apart */
++#define RTC_AL_SEC		(RTC_BASE + 0x18)	/* same layout; upper bits hold other settings */
+ #define RTC_PDN1		(RTC_BASE + 0x2c)
+ #define RTC_PDN1_FAC_RESET	BIT(4)
+ #define RTC_PDN1_BYPASS_PWR	BIT(6)	/* stock rtc_mark_bypass_pwrkey(): a reboot, not a power-on */
+@@ -1056,6 +1063,49 @@ static void rtc_trigger_atomic(void)
+  * Without it, a watchdog reset with no external power on the USB port is treated as a power-on
+  * without the power key, and the tablet switches itself off.
+  */
++/*
++ * The watchdog restart is a full PMIC power cycle (mtk_wdt "restart-cycle-vemc": a warm reset after
++ * a non-stock kernel ends in BROM download mode). The PMIC only powers up again from a power-on
++ * source: with a charger on the USB port that is immediate, on battery nothing does it and the
++ * tablet stays off. So arm a one-shot RTC alarm a few seconds ahead (BBPU PWREN: the alarm powers
++ * the PMIC on). PDN2's PWRON_ALARM flag is not set, so lk does a normal boot (no alarm boot).
++ * The alarm is cancelled at the next boot (mt6755_rtc_cancel_reboot_alarm).
++ */
++#define REBOOT_ALARM_SECS	15
++
++static void rtc_arm_reboot_alarm_atomic(void)
++{
++	static const u16 mask[7] = { 0x3f, 0x3f, 0x1f, 0x1f, 0x07, 0x0f, 0x7f };
++	struct rtc_time tm;
++	u16 tc[7], v;
++	time64_t t;
++
++	__pmic_read(RTC_BBPU, &v);
++	__pmic_write(RTC_BBPU, (v & 0xff) | RTC_BBPU_KEY | RTC_BBPU_RELOAD);
++	rtc_trigger_atomic();
++	for (int i = 0; i < 7; i++) {
++		if (__pmic_read(RTC_TC_SEC + 2 * i, &tc[i]))
++			return;
++		tc[i] &= mask[i];
++	}
++	tm = (struct rtc_time){ .tm_sec = tc[0], .tm_min = tc[1], .tm_hour = tc[2], .tm_mday = tc[3],
++				.tm_mon = tc[5] - 1, .tm_year = tc[6] + RTC_MIN_YEAR_OFFSET };
++	t = rtc_tm_to_time64(&tm) + REBOOT_ALARM_SECS;
++	rtc_time64_to_tm(t, &tm);
++	tc[0] = tm.tm_sec; tc[1] = tm.tm_min; tc[2] = tm.tm_hour; tc[3] = tm.tm_mday;
++	tc[5] = tm.tm_mon + 1; tc[6] = tm.tm_year - RTC_MIN_YEAR_OFFSET;
++	for (int i = 0; i < 7; i++) {
++		if (i == 4)			/* day of week: masked */
++			continue;
++		__pmic_read(RTC_AL_SEC + 2 * i, &v);
++		__pmic_write(RTC_AL_SEC + 2 * i, (v & ~mask[i]) | (tc[i] & mask[i]));
++	}
++	__pmic_write(RTC_AL_MASK, RTC_AL_MASK_DOW);
++	__pmic_read(RTC_IRQ_EN, &v);
++	__pmic_write(RTC_IRQ_EN, v | RTC_IRQ_EN_AL | RTC_IRQ_EN_ONESHOT);
++	rtc_trigger_atomic();
++}
++
+ static int mt6755_restart_prepare(struct sys_off_data *data)
+ {
+ 	u16 v;
+@@ -1068,9 +1118,29 @@ static int mt6755_restart_prepare(struct sys_off_data *data)
+ 		__pmic_write(RTC_PDN1, v | RTC_PDN1_BYPASS_PWR);
+ 		rtc_trigger_atomic();
+ 	}
++	rtc_arm_reboot_alarm_atomic();
+ 	return NOTIFY_DONE;
+ }
+ 
++/* a reboot alarm left from the previous shutdown must not fire later */
++static void mt6755_rtc_cancel_reboot_alarm(void)
++{
++	u16 v;
++
++	mutex_lock(&rtc_lock);
++	if (!mt6755_pmic_read(RTC_IRQ_EN, &v) && (v & RTC_IRQ_EN_AL)) {
++		mt6755_pmic_write(RTC_PROT, 0x586a);
++		rtc_trigger();
++		mt6755_pmic_write(RTC_PROT, 0x9136);
++		rtc_trigger();
++		mt6755_pmic_write(RTC_IRQ_EN, v & ~RTC_IRQ_EN_AL);
++		rtc_trigger();
++		mt6755_pmic_read(RTC_IRQ_STA, &v);	/* read clears */
++		pr_info("mt6755-pmic: reboot alarm cancelled\n");
++	}
++	mutex_unlock(&rtc_lock);
++}
++
+ static int mt6755_power_off(struct sys_off_data *data)
+ {
+ 	pr_emerg("mt6755-pmic: power off (RTC BBPU pwrdown)\n");
+@@ -1224,6 +1294,7 @@ static int __init mt6755_battery_init(void)
+ 		if (IS_ERR(register_sys_off_handler(SYS_OFF_MODE_POWER_OFF, SYS_OFF_PRIO_DEFAULT,
+ 						    mt6755_power_off, NULL)))
+ 			pr_warn("mt6755-pmic: power-off handler failed\n");
++		mt6755_rtc_cancel_reboot_alarm();
+ 		if (IS_ERR(register_sys_off_handler(SYS_OFF_MODE_RESTART_PREPARE, SYS_OFF_PRIO_DEFAULT,
+ 						    mt6755_restart_prepare, NULL)))
+ 			pr_warn("mt6755-pmic: restart-prepare handler failed\n");
+diff --git a/drivers/usb/mtu3/mtu3_dr.c b/drivers/usb/mtu3/mtu3_dr.c
+index ffa5b9401..614060537 100644
+--- a/drivers/usb/mtu3/mtu3_dr.c
++++ b/drivers/usb/mtu3/mtu3_dr.c
+@@ -7,6 +7,8 @@
+  * Author: Chunfeng Yun <chunfeng.yun@mediatek.com>
+  */
+ 
++#include <linux/of.h>
++#include <linux/phy/phy.h>
+ #include <linux/string_choices.h>
+ #include "mtu3.h"
+ #include "mtu3_dr.h"
+@@ -125,6 +127,30 @@ int ssusb_set_vbus(struct otg_switch_mtk *otg_sx, int is_on)
+ 	return 0;
+ }
+ 
++
++/*
++ * MT6755 (SSUSB IP version 0): the U2 port follows the PHY's IDDIG while OTG_SEL is set, and the
++ * IPPC FORCE_IDDIG/RG_IDDIG bits used by ssusb_set_force_mode() have no effect. In host mode the
++ * xHCI root port never saw a connect. Force the PHY's IDDIG and take the port off OTG selection
++ * (so it follows its HOST bit) in host mode; restore both for device mode.
++ */
++static void ssusb_otg_sel_quirk(struct ssusb_mtk *ssusb, bool to_host)
++{
++	u32 value;
++	int i;
++
++	if (!of_device_is_compatible(ssusb->dev->of_node, "mediatek,mt6755-mtu3"))
++		return;
++	for (i = 0; i < ssusb->num_phys; i++)
++		phy_set_mode(ssusb->phys[i], to_host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
++	value = mtu3_readl(ssusb->ippc_base, SSUSB_U2_CTRL(0));
++	if (to_host)
++		value &= ~SSUSB_U2_PORT_OTG_SEL;
++	else
++		value |= SSUSB_U2_PORT_OTG_SEL;
++	mtu3_writel(ssusb->ippc_base, SSUSB_U2_CTRL(0), value);
++}
++
+ static void ssusb_mode_sw_work(struct work_struct *work)
+ {
+ 	struct otg_switch_mtk *otg_sx =
+@@ -153,6 +179,7 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 	switch (desired_role) {
+ 	case USB_ROLE_HOST:
+ 		ssusb_set_force_mode(ssusb, MTU3_DR_FORCE_HOST);
++		ssusb_otg_sel_quirk(ssusb, true);
+ 		mtu3_stop(mtu);
+ 		switch_port_to_host(ssusb);
+ 		ssusb_set_vbus(otg_sx, 1);
+@@ -160,6 +187,7 @@ static void ssusb_mode_sw_work(struct work_struct *work)
+ 		break;
+ 	case USB_ROLE_DEVICE:
+ 		ssusb_set_force_mode(ssusb, MTU3_DR_FORCE_DEVICE);
++		ssusb_otg_sel_quirk(ssusb, false);
+ 		ssusb->is_host = false;
+ 		ssusb_set_vbus(otg_sx, 0);
+ 		switch_port_to_device(ssusb);
+-- 
+2.53.0
+

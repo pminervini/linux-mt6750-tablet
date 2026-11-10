@@ -1,7 +1,7 @@
 From 21b7dcbcdadb98b3f44603466a38176ed03a6b07 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Fri, 6 Nov 2026 14:24:58 +0000
-Subject: [PATCH 01/25] WIP: MT6750 k50v1 tablet stage-0 bring-up (dts with lk
+Subject: [PATCH 01/29] WIP: MT6750 k50v1 tablet stage-0 bring-up (dts with lk
  overlay sink, ramcon, wdt pwrkey bypass)
 
 ---

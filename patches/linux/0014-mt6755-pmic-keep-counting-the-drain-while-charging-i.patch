@@ -1,7 +1,7 @@
 From 521bd5ce7c75f1e20e14f2be533f61f15d98cae7 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sun, 8 Nov 2026 08:21:00 +0000
-Subject: [PATCH 14/25] mt6755-pmic: keep counting the drain while charging is
+Subject: [PATCH 14/29] mt6755-pmic: keep counting the drain while charging is
  paused in full; status Not charging below 100%
 
 ---

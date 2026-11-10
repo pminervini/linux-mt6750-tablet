@@ -1,7 +1,7 @@
 From 5263b40e59af99c28f3b5ca256b71618698d5aac Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sat, 7 Nov 2026 17:14:35 +0000
-Subject: [PATCH 07/25] mt6750 tablet: arm PMIC WDTRSTB full-reset mode (early
+Subject: [PATCH 07/29] mt6750 tablet: arm PMIC WDTRSTB full-reset mode (early
  + wdt probe + restart): reboots and hangs come back to Android unattended;
  SPM cpu power-down disabled
 

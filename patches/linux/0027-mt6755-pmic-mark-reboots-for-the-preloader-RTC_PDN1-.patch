@@ -1,0 +1,84 @@
+From b7dbc37d7ec840f6f9524d9a7c5b5166a521b6f1 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 11:22:18 +0000
+Subject: [PATCH 27/29] mt6755-pmic: mark reboots for the preloader (RTC_PDN1
+ bypass-power-key); usb-conn-gpio: repeated role at debug level
+
+Stock arch_reset() calls rtc_mark_bypass_pwrkey() (RTC_PDN1 bit 6). Without
+it a watchdog reset with no external power on the USB port is treated as a
+power-on without the power key and the tablet switches itself off (seen
+rebooting with a USB keyboard on OTG instead of the charger cable). Set it
+in a SYS_OFF_MODE_RESTART_PREPARE handler; the preloader clears it.
+
+usb-conn-gpio: ID bounce while an OTG adapter is inserted printed 'repeated
+role' warnings onto the console login prompt. Image s7j.
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 24 ++++++++++++++++++++++++
+ drivers/usb/common/usb-conn-gpio.c |  2 +-
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index cc01fb285..5820b9333 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -924,6 +924,7 @@ subsys_initcall(mt6755_pmic_init);
+ #define RTC_TC_SEC		(RTC_BASE + 0x0a)	/* SEC MIN HOU DOM DOW MTH YEA, 2 bytes apart */
+ #define RTC_PDN1		(RTC_BASE + 0x2c)
+ #define RTC_PDN1_FAC_RESET	BIT(4)
++#define RTC_PDN1_BYPASS_PWR	BIT(6)	/* stock rtc_mark_bypass_pwrkey(): a reboot, not a power-on */
+ #define RTC_PROT		(RTC_BASE + 0x36)
+ #define RTC_CON			(RTC_BASE + 0x3e)
+ #define RTC_CON_F32KOB		BIT(5)	/* 1: RTC_GPIO does NOT export 32k */
+@@ -1050,6 +1051,26 @@ static void rtc_trigger_atomic(void)
+ 	}
+ }
+ 
++/*
++ * Reboot: tell the preloader this reset is a reboot (stock arch_reset -> rtc_mark_bypass_pwrkey()).
++ * Without it, a watchdog reset with no external power on the USB port is treated as a power-on
++ * without the power key, and the tablet switches itself off.
++ */
++static int mt6755_restart_prepare(struct sys_off_data *data)
++{
++	u16 v;
++
++	__pmic_write(RTC_PROT, 0x586a);
++	rtc_trigger_atomic();
++	__pmic_write(RTC_PROT, 0x9136);
++	rtc_trigger_atomic();
++	if (!__pmic_read(RTC_PDN1, &v)) {
++		__pmic_write(RTC_PDN1, v | RTC_PDN1_BYPASS_PWR);
++		rtc_trigger_atomic();
++	}
++	return NOTIFY_DONE;
++}
++
+ static int mt6755_power_off(struct sys_off_data *data)
+ {
+ 	pr_emerg("mt6755-pmic: power off (RTC BBPU pwrdown)\n");
+@@ -1203,6 +1224,9 @@ static int __init mt6755_battery_init(void)
+ 		if (IS_ERR(register_sys_off_handler(SYS_OFF_MODE_POWER_OFF, SYS_OFF_PRIO_DEFAULT,
+ 						    mt6755_power_off, NULL)))
+ 			pr_warn("mt6755-pmic: power-off handler failed\n");
++		if (IS_ERR(register_sys_off_handler(SYS_OFF_MODE_RESTART_PREPARE, SYS_OFF_PRIO_DEFAULT,
++						    mt6755_restart_prepare, NULL)))
++			pr_warn("mt6755-pmic: restart-prepare handler failed\n");
+ 	}
+ 	bat_psy = power_supply_register(&pdev->dev, &bat_desc, &cfg);
+ 	if (IS_ERR(bat_psy)) {
+diff --git a/drivers/usb/common/usb-conn-gpio.c b/drivers/usb/common/usb-conn-gpio.c
+index 421c3af38..4a43de06d 100644
+--- a/drivers/usb/common/usb-conn-gpio.c
++++ b/drivers/usb/common/usb-conn-gpio.c
+@@ -93,7 +93,7 @@ static void usb_conn_detect_cable(struct work_struct *work)
+ 		usb_role_string(info->last_role), usb_role_string(role), id, vbus);
+ 
+ 	if (!info->initial_detection && info->last_role == role) {
+-		dev_warn(info->dev, "repeated role: %s\n", usb_role_string(role));
++		dev_dbg(info->dev, "repeated role: %s\n", usb_role_string(role));
+ 		return;
+ 	}
+ 
+-- 
+2.53.0
+

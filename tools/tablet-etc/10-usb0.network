@@ -1,0 +1,14 @@
+[Match]
+Name=usb0
+
+[Network]
+Address=192.168.77.2/24
+Gateway=192.168.77.1
+DNS=8.8.8.8
+DNS=1.1.1.1
+KeepConfiguration=yes
+IPv6AcceptRA=no
+
+[Link]
+# host mode (USB keyboard) leaves usb0 without carrier: do not hold network-online.target for it
+RequiredForOnline=no

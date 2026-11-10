@@ -1,0 +1,70 @@
+From 6e0dbe6448ba8c0e735e4dd993a5e5a231c1de95 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 10:49:00 +0000
+Subject: [PATCH 26/29] tablet DT: USB dual role - ID pin GPIO23
+ (gpio-usb-b-connector), 5 V host VBUS on GPIO43, xhci host child
+
+As the stock kernel (otg_gpios, IDDIG on GPIO23, pinctrl drvvbus_high =
+GPIO43 output high; mtk_xhci_vbus_on): an OTG adapter grounds ID -> host
+mode with VBUS on; otherwise device mode (USB network). mtu3 role switch,
+xhci-mtk at 0x11270000 (IRQ 123), U3 port disabled. Image s7h.
+---
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts | 38 ++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index 0f7856e05..a2b2a5d49 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -288,11 +288,47 @@ ssusb: usb@11271000 {
+ 		clocks = <&ssusb_sys_clk>;
+ 		clock-names = "sys_ck";
+ 		vusb33-supply = <&vusb33_fixed>;
+-		dr_mode = "peripheral";
++		/*
++		 * Dual role as stock: the micro-USB ID pin (GPIO23, pulled up; an OTG adapter grounds it)
++		 * selects host mode, and host mode switches on the 5 V output (stock "drvvbus_high" =
++		 * GPIO43). Device mode (USB network to a laptop) is the default.
++		 */
++		dr_mode = "otg";
++		usb-role-switch;
++		role-switch-default-mode = "peripheral";
+ 		maximum-speed = "high-speed";
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+ 		ranges;
++
++		connector {
++			compatible = "gpio-usb-b-connector", "usb-b-connector";
++			type = "micro";
++			label = "usb";
++			id-gpios = <&gpio 23 GPIO_ACTIVE_HIGH>;
++			vbus-supply = <&usb_otg_vbus>;
++		};
++
++		usb_host: usb@11270000 {
++			compatible = "mediatek,mt6755-xhci", "mediatek,mtk-xhci";
++			reg = <0 0x11270000 0 0x1000>;
++			reg-names = "mac";
++			interrupts = <GIC_SPI 123 IRQ_TYPE_LEVEL_LOW>;
++			clocks = <&ssusb_sys_clk>;
++			clock-names = "sys_ck";
++			vusb33-supply = <&vusb33_fixed>;
++			mediatek,u3p-dis-msk = <1>;
++		};
++	};
++
++	/* 5 V on the micro-USB port in host mode (stock pinctrl "drvvbus_high": GPIO43 output high) */
++	usb_otg_vbus: regulator-usb-otg-vbus {
++		compatible = "regulator-fixed";
++		regulator-name = "usb_otg_vbus";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		gpio = <&gpio 43 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
+ 	};
+ 
+ 	/* GPIO + EINT (stock: GPIO 0x10005000, eintc 0x1000b000 SPI 155) */
+-- 
+2.53.0
+

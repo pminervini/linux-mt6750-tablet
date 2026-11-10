@@ -1,7 +1,7 @@
 From 6ac2a262bc88dd969f7e9a85133bd439b159522c Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 07:50:52 +0000
-Subject: [PATCH 22/25] mt6755-pmic: stop pausing MDRT (it got stuck); filter
+Subject: [PATCH 22/29] mt6755-pmic: stop pausing MDRT (it got stuck); filter
  the BATON contamination instead
 
 Switching AUXADC_MDRT_DET_EN off/on around every AP conversion (715b3c394)

@@ -1,7 +1,7 @@
 From 29d040c4dca185d09a34c091bcdebe55c44716d5 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sat, 7 Nov 2026 23:36:54 +0000
-Subject: [PATCH 11/25] soc: mediatek: mt6755-pmic: RTC 32k export API for
+Subject: [PATCH 11/29] soc: mediatek: mt6755-pmic: RTC 32k export API for
  CONSYS (GPS), root-only PMIC register peek/poke
 
 ---
