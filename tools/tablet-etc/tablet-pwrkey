@@ -1,17 +1,22 @@
 #!/usr/bin/python3
-"""Power key -> screen (MT6750 tablet, mainline).
+"""Power key / input activity -> screen (MT6750 tablet, mainline).
 
-Short press toggles the LCD backlight; the screen turns itself off after
-SCREEN_TIMEOUT seconds since it was last switched on. A long press (5 s) is
-left to systemd-logind (HandlePowerKeyLongPress=poweroff, short press ignored).
+- short press of the power key toggles the screen (backlight + DSI panel sleep);
+- a key or button on any keyboard or mouse (USB or Bluetooth, hot-plugged ones too) wakes it;
+- the touchscreen keeps it on while in use but does not wake it (no accidental wake-ups);
+- the screen turns off after SCREEN_TIMEOUT seconds without input.
+A long press (5 s) is left to systemd-logind (HandlePowerKeyLongPress=poweroff, short press ignored).
 """
 import glob, os, select, struct, subprocess, sys, time
 
 SCREEN_TIMEOUT = 120
 ON_LEVEL = 300
+RESCAN = 2.0                           # seconds between looks for new input devices
 BL = '/sys/class/backlight/backlight/brightness'
 EV = struct.Struct('llHHi')            # struct input_event on 64-bit
-EV_KEY, KEY_POWER = 1, 116
+EV_KEY, EV_REL, KEY_POWER = 1, 2, 116
+INPUT_PROP_DIRECT = 1                  # touchscreen
+
 
 def panel(on):
     """DSI panel sleep/wake (tablet-panel: DCS 0x28/0x10, 0x11/0x29 in video mode)."""
@@ -31,48 +36,105 @@ def bl(level=None):
     if level == 0:
         panel(False)                # backlight off first, then put the panel to sleep
 
-def find_dev():
-    for n in glob.glob('/sys/class/input/event*/device/name'):
-        if open(n).read().strip() == 'mt6755-pwrkey':
-            return '/dev/input/' + n.split('/')[4]
+
+def sysfs_hex(path):
+    """input capability bitmap (space-separated hex words, most significant first) -> int"""
+    try:
+        return int("".join("%016x" % int(w, 16) for w in open(path).read().split()), 16)
+    except (OSError, ValueError):
+        return 0
+
+
+def classify(ev):
+    """'power', 'wake' (keyboard/mouse), 'touch', or None for devices we ignore."""
+    d = '/sys/class/input/%s/device/' % ev
+    try:
+        name = open(d + 'name').read().strip()
+    except OSError:
+        return None
+    if name == 'mt6755-pwrkey':
+        return 'power'
+    if sysfs_hex(d + 'properties') >> INPUT_PROP_DIRECT & 1:
+        return 'touch'
+    evbits = sysfs_hex(d + 'capabilities/ev')
+    if evbits >> EV_KEY & 1 or evbits >> EV_REL & 1:
+        return 'wake'
     return None
 
+
 def main():
-    off_at = time.monotonic() + SCREEN_TIMEOUT
+    devs = {}                           # fd -> (eventN, kind)
+    def rescan():
+        have = {e for e, _ in devs.values()}
+        for path in sorted(glob.glob('/dev/input/event*')):
+            ev = os.path.basename(path)
+            if ev in have:
+                continue
+            kind = classify(ev)
+            if kind is None:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            devs[fd] = (ev, kind)
+            print('tablet-pwrkey: %s (%s) %s' % (ev, kind,
+                  open('/sys/class/input/%s/device/name' % ev).read().strip()), flush=True)
+
     bl(ON_LEVEL)
-    dev = None
-    while dev is None:
-        dev = find_dev()
-        if dev is None:
-            time.sleep(2)
-    fd = os.open(dev, os.O_RDONLY)
+    off_at = time.monotonic() + SCREEN_TIMEOUT
     down_at = None
-    print(f'tablet-pwrkey: {dev}, screen off in {SCREEN_TIMEOUT}s', flush=True)
+    next_scan = 0
+    print(f'tablet-pwrkey: screen off after {SCREEN_TIMEOUT}s without input', flush=True)
     while True:
-        timeout = None if off_at is None else max(0, off_at - time.monotonic())
-        r, _, _ = select.select([fd], [], [], timeout)
-        if not r:
+        now = time.monotonic()
+        if now >= next_scan:
+            rescan()
+            next_scan = now + RESCAN
+        wait = next_scan - now
+        if off_at is not None:
+            wait = min(wait, max(0, off_at - now))
+        r, _, _ = select.select(list(devs), [], [], wait)
+        now = time.monotonic()
+        if off_at is not None and now >= off_at:
             bl(0)
             off_at = None
-            continue
-        data = os.read(fd, EV.size * 16)
-        for i in range(0, len(data) - EV.size + 1, EV.size):
-            _, _, typ, code, val = EV.unpack_from(data, i)
-            if typ != EV_KEY or code != KEY_POWER:
+            print('tablet-pwrkey: screen off (no input for %ds)' % SCREEN_TIMEOUT, flush=True)
+        for fd in r:
+            ev, kind = devs[fd]
+            try:
+                data = os.read(fd, EV.size * 64)
+            except BlockingIOError:
                 continue
-            if val == 1:
-                down_at = time.monotonic()
-            elif val == 0 and down_at is not None:
-                held = time.monotonic() - down_at
-                down_at = None
-                if held >= 2:          # long press: logind's business
-                    continue
-                if bl() > 0:
-                    bl(0)
-                    off_at = None
-                else:
-                    bl(ON_LEVEL)
-                    off_at = time.monotonic() + SCREEN_TIMEOUT
+            except OSError:             # unplugged
+                os.close(fd)
+                del devs[fd]
+                print('tablet-pwrkey: %s gone' % ev, flush=True)
+                continue
+            for i in range(0, len(data) - EV.size + 1, EV.size):
+                _, _, typ, code, val = EV.unpack_from(data, i)
+                if kind == 'power':
+                    if typ != EV_KEY or code != KEY_POWER:
+                        continue
+                    if val == 1:
+                        down_at = now
+                    elif val == 0 and down_at is not None:
+                        held, down_at = now - down_at, None
+                        if held >= 2:          # long press: logind's business
+                            continue
+                        if bl() > 0:
+                            bl(0)
+                            off_at = None
+                        else:
+                            bl(ON_LEVEL)
+                            off_at = now + SCREEN_TIMEOUT
+                elif bl() > 0:                 # screen on: any input keeps it on
+                    off_at = now + SCREEN_TIMEOUT
+                elif kind == 'wake' and ((typ == EV_KEY and val == 1) or typ == EV_REL):
+                    bl(ON_LEVEL)               # screen off: key press / mouse move wakes it
+                    off_at = now + SCREEN_TIMEOUT
+                    print('tablet-pwrkey: screen on (input on %s)' % ev, flush=True)
+
 
 if __name__ == '__main__':
     sys.exit(main())

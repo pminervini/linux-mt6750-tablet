@@ -1,5 +1,5 @@
 [Unit]
-Description=Power key toggles the LCD backlight; screen off 2 min after it was switched on
+Description=Screen on/off: power key toggles, keyboard/mouse wakes, off after 2 min without input
 After=systemd-udevd.service
 
 [Service]
