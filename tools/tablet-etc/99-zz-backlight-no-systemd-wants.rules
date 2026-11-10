@@ -1,0 +1,3 @@
+# tablet-screen manages the backlight; systemd-backlight@ is masked. Do not ask systemd to start it on
+# every backlight change (it logs a warning to the console each time). Sorts after 99-systemd.rules.
+SUBSYSTEM=="backlight", ENV{SYSTEMD_WANTS}=""
