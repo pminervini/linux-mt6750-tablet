@@ -1,0 +1,169 @@
+From 26d97449cc1211b26b441b33bc874d19e542e264 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 08:57:28 +0000
+Subject: [PATCH 23/25] thermal: MT6755 SoC temperature (auxadc_thermal) +
+ tablet DT
+
+The MT6755 thermal controller is the MT8173 one with the same v1 eFuse
+calibration layout (vendor mtk_tc.c: eFuse 0x180-0x18b, identical bit
+fields) and sensor mux (TS1-TS4, ABB on AUXADC channel 11); the vendor
+formula reduces to raw_to_mcelsius_v1 (the ADC offset error cancels).
+MT6755 differences: three banks (CPU cluster 0: TS4; SoC+GPU: TS1/TS3/TS2;
+CPU cluster 1: TS4) and the sensor buffer enable TS_CON1[5:4] = 0.
+
+Tablet DT: eFuse cell, AP AUXADC @11001000, apmixedsys @1000c000 (vendor
+header comments name the MT8173 addresses), thermal @1100b000 (lk leaves
+the infra_therm/infra_auxadc gates open), cpu-thermal zone with a hot trip
+at 90 C and a critical (orderly shutdown) trip at 105 C. Readings: ~17 C
+idle outdoors, +11 C after 60 s on all 8 cores, back within 30 s.
+Image s7e.
+---
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts | 59 +++++++++++++++++++
+ drivers/thermal/mediatek/auxadc_thermal.c     | 47 +++++++++++++++
+ 2 files changed, 106 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index b1ef04ff8..ebc46a326 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -436,6 +436,65 @@ wifi@180f0000 {
+ 		clock-names = "wifi-dma";
+ 	};
+ 
++	/* thermal: MT8173-style controller + v1 eFuse calibration (vendor mtk_tc.c, stock DT) */
++	efuse: efuse@10206000 {
++		compatible = "mediatek,efuse";
++		reg = <0 0x10206000 0 0x1000>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		thermal_calibration: calib@180 {
++			reg = <0x180 0xc>;
++		};
++	};
++
++	/* AP AUXADC: no driver of its own, the thermal controller drives channel 11 */
++	ap_auxadc: adc@11001000 {
++		compatible = "mediatek,mt6755-auxadc";
++		reg = <0 0x11001000 0 0x1000>;
++	};
++
++	ap_apmixedsys: syscon@1000c000 {
++		compatible = "mediatek,mt6755-apmixedsys", "syscon";
++		reg = <0 0x1000c000 0 0x1000>;
++	};
++
++	soc_thermal: thermal@1100b000 {
++		compatible = "mediatek,mt6755-thermal";
++		reg = <0 0x1100b000 0 0x1000>;
++		/* infra_therm / infra_auxadc gates (CG0/CG1 bit 10) are left open by lk */
++		clocks = <&clk26m_ref>, <&clk26m_ref>;
++		clock-names = "therm", "auxadc";
++		mediatek,auxadc = <&ap_auxadc>;
++		mediatek,apmixedsys = <&ap_apmixedsys>;
++		nvmem-cells = <&thermal_calibration>;
++		nvmem-cell-names = "calibration-data";
++		#thermal-sensor-cells = <1>;
++	};
++
++	thermal-zones {
++		cpu-thermal {
++			polling-delay-passive = <1000>;
++			polling-delay = <2000>;
++			thermal-sensors = <&soc_thermal 0>;
++
++			/* readings verified: ~17 C idle outdoors, +11 C after 60 s on all 8 cores */
++			trips {
++				cpu_hot: cpu-hot {
++					temperature = <90000>;
++					hysteresis = <5000>;
++					type = "hot";
++				};
++				/* orderly shutdown; the vendor's hardware protection is at 117 C */
++				cpu_crit: cpu-crit {
++					temperature = <105000>;
++					hysteresis = <2000>;
++					type = "critical";
++				};
++			};
++		};
++	};
++
+ 	watchdog@10007000 {
+ 		compatible = "mediatek,mt6589-wdt";
+ 		/* stock reboot = AUTO_RESTART|EXTEN, else the preloader powers off */
+diff --git a/drivers/thermal/mediatek/auxadc_thermal.c b/drivers/thermal/mediatek/auxadc_thermal.c
+index 9ee2e7283..8f038adfe 100644
+--- a/drivers/thermal/mediatek/auxadc_thermal.c
++++ b/drivers/thermal/mediatek/auxadc_thermal.c
+@@ -394,6 +394,18 @@ static const int mt8173_vts_index[MT8173_NUM_SENSORS] = {
+ 	VTS1, VTS2, VTS3, VTS4, VTSABB
+ };
+ 
++/*
++ * MT6755/MT6750: the MT8173 thermal controller and v1 eFuse calibration (same bit layout, at
++ * eFuse 0x180-0x18b), five sensors (TS1-TS4, ABB) on AUXADC channel 11, three banks as in the
++ * vendor driver: CPU cluster 0 (TS4), SoC+GPU (TS1, TS3, TS2), CPU cluster 1 (TS4).
++ */
++#define MT6755_NUM_ZONES	3
++static const int mt6755_bank_data[MT6755_NUM_ZONES][3] = {
++	{ MT8173_TS4 },
++	{ MT8173_TS1, MT8173_TS3, MT8173_TS2 },
++	{ MT8173_TS4 },
++};
++
+ /* MT2701 thermal sensor data */
+ static const int mt2701_bank_data[MT2701_NUM_SENSORS] = {
+ 	MT2701_TS1, MT2701_TS2, MT2701_TSABB
+@@ -511,6 +523,37 @@ static const struct mtk_thermal_data mt8173_thermal_data = {
+ 	.version = MTK_THERMAL_V1,
+ };
+ 
++static const struct mtk_thermal_data mt6755_thermal_data = {
++	.auxadc_channel = MT8173_TEMP_AUXADC_CHANNEL,
++	.num_banks = MT6755_NUM_ZONES,
++	.num_sensors = MT8173_NUM_SENSORS,
++	.vts_index = mt8173_vts_index,
++	.cali_val = MT8173_CALIBRATION,
++	.num_controller = MT8173_NUM_CONTROLLER,
++	.controller_offset = mt8173_tc_offset,
++	.need_switch_bank = true,
++	.bank_data = {
++		{
++			.num_sensors = 1,
++			.sensors = mt6755_bank_data[0],
++		}, {
++			.num_sensors = 3,
++			.sensors = mt6755_bank_data[1],
++		}, {
++			.num_sensors = 1,
++			.sensors = mt6755_bank_data[2],
++		},
++	},
++	.msr = mt8173_msr,
++	.adcpnp = mt8173_adcpnp,
++	.sensor_mux_values = mt8173_mux_values,
++	.version = MTK_THERMAL_V1,
++	/* sensor buffer on: TS_CON1[5:4] = 0 (vendor driver; the boot loader leaves 0x30) */
++	.apmixed_buffer_ctl_reg = APMIXED_SYS_TS_CON1,
++	.apmixed_buffer_ctl_mask = (u32) ~GENMASK(5, 4),
++	.apmixed_buffer_ctl_set = 0,
++};
++
+ /*
+  * The MT2701 thermal controller has one bank, which can read up to
+  * three temperature sensors simultaneously. The MT2701 has a total of 3
+@@ -1133,6 +1176,10 @@ static int mtk_thermal_get_calibration_data(struct device *dev,
+ }
+ 
+ static const struct of_device_id mtk_thermal_of_match[] = {
++	{
++		.compatible = "mediatek,mt6755-thermal",
++		.data = (void *)&mt6755_thermal_data,
++	},
+ 	{
+ 		.compatible = "mediatek,mt8173-thermal",
+ 		.data = (void *)&mt8173_thermal_data,
+-- 
+2.53.0
+

@@ -1,0 +1,193 @@
+From 421fc982738970ea551d4d2a123a3a8c6a46a0cf Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Mon, 9 Nov 2026 22:20:27 +0000
+Subject: [PATCH 20/25] mt6755-pmic: charge limit (default 70-80 %) for a
+ tablet that stays on the charger
+
+Stop charging at chg_end_pct by the coulomb counter and resume below
+chg_start_pct, through the standard charge_control_{start,end}_threshold
+power_supply properties (end 100 = charge to full as before). The OCV
+curve is flat at 65-85 %, so the IR-compensated voltage is only a ceiling
+(4.10 V) against a counter drifting low; resuming also needs < 4.05 V.
+The limit is a flag, so hot/cold/unplug interruptions return to it.
+Debounce hot/cold by two samples: the BATON reading glitches to ~1.11 V
+(0 C) for a sample, e.g. right after CHR_EN switches. Image s6z.
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 88 ++++++++++++++++++++++++++++--
+ 1 file changed, 82 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index e68ed0b7d..7b7a301fd 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -19,6 +19,8 @@
+  *    0..45 C (resume 3..42 C), stop when full (>= 4.15 V and battery current
+  *    < 60 mA for 60 s, recharge below 4.05 V), software VBAT cap 4.25 V, NTC open/
+  *    short = no charging. Orderly power-off below 3.45 V when not charging.
++ *    Charge limit (default 70-80 %, the standard charge_control_{start,end}_threshold
++ *    properties; end 100 = charge to full) with a 4.10 V IR-compensated ceiling.
+  *  - fuel gauge: MT6353 FGADC coulomb counter (R_FG 10 mOhm, CAR_TUNE 118, both
+  *    from the stock DT and confirmed by charger-current = load + battery-current),
+  *    started from the OCV table at boot, anchored at 100 % on charge termination
+@@ -362,13 +364,22 @@ MODULE_PARM_DESC(qmax_mah, "usable battery capacity (mAh)");
+ static int recharge_mv = 4050;
+ module_param(recharge_mv, int, 0644);
+ MODULE_PARM_DESC(recharge_mv, "after charge termination, resume charging below this voltage");
++static int chg_start_pct = 70, chg_end_pct = 80;
++module_param(chg_start_pct, int, 0644);
++MODULE_PARM_DESC(chg_start_pct, "charge limit: resume charging below this capacity (%)");
++module_param(chg_end_pct, int, 0644);
++MODULE_PARM_DESC(chg_end_pct, "charge limit: stop charging at this capacity (%); 100 = charge to full");
++static int limit_max_mv = 4100;
++module_param(limit_max_mv, int, 0644);
++MODULE_PARM_DESC(limit_max_mv, "with a charge limit, also stop at this battery voltage (IR-compensated), whatever the gauge says");
+ static int lowbat_mv = 3450;
+ module_param(lowbat_mv, int, 0644);
+ MODULE_PARM_DESC(lowbat_mv, "power off below this battery voltage when not charging (0 = never)");
+ 
+-enum chg_state { CHG_NONE, CHG_ON, CHG_FULL, CHG_HOT, CHG_COLD, CHG_OV, CHG_NTC, CHG_OFF };
++enum chg_state { CHG_NONE, CHG_ON, CHG_FULL, CHG_HOT, CHG_COLD, CHG_OV, CHG_NTC, CHG_OFF, CHG_LIMIT };
+ static const char * const chg_names[] = {
+ 	"no-charger", "charging", "full", "too-hot", "too-cold", "over-voltage", "ntc-fault", "disabled",
++	"limit",
+ };
+ 
+ static struct {
+@@ -377,7 +388,8 @@ static struct {
+ 	s64 q_nah;			/* remaining charge, nAh */
+ 	bool chr, ntc_ok, q_valid, car_valid, hot, cold, ov;
+ 	enum chg_state st;
+-	int full_cnt, low_cnt, start_wait;
++	int full_cnt, low_cnt, start_wait, lim_cnt, hot_cnt, cold_cnt;
++	bool limited;			/* charge limit reached; survives hot/cold/unplug interruptions */
+ } bs;
+ static struct power_supply *bat_psy, *usb_psy;
+ 
+@@ -533,7 +545,7 @@ static void chr_disable(void)
+ static void chr_work_fn(struct work_struct *w)
+ {
+ 	enum chg_state st = bs.st, old = bs.st;
+-	int vbat, ibat, vntc, t, oldcap = bs.cap;
++	int vbat, ibat, vntc, t, vocv, oldcap = bs.cap;
+ 	bool chr, oldchr = bs.chr;
+ 	u16 c0;
+ 
+@@ -552,13 +564,20 @@ static void chr_work_fn(struct work_struct *w)
+ 	}
+ 	bs.chr = chr;
+ 	fg_update();
++	vocv = bs.vbat - bs.fg_ma * r_int_mohm / 1000;	/* IR-compensated (approx. open-circuit) */
+ 
+ 	/* hysteresis: 0..45 C allowed, resume at 3..42 C; VBAT cap 4.25 V, resume 4.15 V */
+-	if (bs.temp > 450)
++	/*
++	 * Two consecutive samples (4 s) to declare hot/cold: the BATON reading glitches for one
++	 * sample (~1.11 V = 0 C) right after CHR_EN switches.
++	 */
++	bs.hot_cnt = bs.temp > 450 ? bs.hot_cnt + 1 : 0;
++	bs.cold_cnt = bs.temp < 0 ? bs.cold_cnt + 1 : 0;
++	if (bs.hot_cnt >= 2)
+ 		bs.hot = true;
+ 	else if (bs.temp <= 420)
+ 		bs.hot = false;
+-	if (bs.temp < 0)
++	if (bs.cold_cnt >= 2)
+ 		bs.cold = true;
+ 	else if (bs.temp >= 30)
+ 		bs.cold = false;
+@@ -582,7 +601,29 @@ static void chr_work_fn(struct work_struct *w)
+ 	else if (st == CHG_FULL)
+ 		st = bs.vbat < recharge_mv ? CHG_ON : CHG_FULL;
+ 	else
+-		st = CHG_ON;
++		st = bs.limited ? CHG_LIMIT : CHG_ON;
++
++	/*
++	 * Charge limit (a battery kept at 100 % on a charger ages fast): stop at chg_end_pct by
++	 * the coulomb counter, resume below chg_start_pct. The OCV curve is too flat at 65-85 %
++	 * to switch on voltage, but the IR-compensated voltage is a hard ceiling in case the
++	 * counter (only re-anchored at a full charge or near empty) drifts low.
++	 */
++	if (bs.limited && (chg_end_pct >= 100 ||
++			   (bs.cap < chg_start_pct && vocv < limit_max_mv - 50))) {
++		bs.limited = false;
++		if (st == CHG_LIMIT)
++			st = CHG_ON;
++	}
++	if (!bs.limited && st == CHG_ON && chg_end_pct < 100 && bs.q_valid &&
++	    (bs.cap >= chg_end_pct || vocv >= limit_max_mv)) {
++		if (++bs.lim_cnt >= 15) {
++			bs.limited = true;
++			st = CHG_LIMIT;
++		}
++	} else {
++		bs.lim_cnt = 0;
++	}
+ 
+ 	/* termination: at CV and the battery itself takes < 60 mA (gauge, not charger, current) */
+ 	if (st == CHG_ON && bs.vbat >= 4150 && bs.fg_ma < 60) {
+@@ -673,6 +714,8 @@ static enum power_supply_property bat_props[] = {
+ 	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN, POWER_SUPPLY_PROP_SCOPE,
+ 	POWER_SUPPLY_PROP_CHARGE_NOW, POWER_SUPPLY_PROP_CHARGE_FULL,
+ 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
++	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+ };
+ 
+ static int bat_get(struct power_supply *psy, enum power_supply_property psp,
+@@ -723,12 +766,43 @@ static int bat_get(struct power_supply *psy, enum power_supply_property psp,
+ 	case POWER_SUPPLY_PROP_SCOPE:
+ 		val->intval = POWER_SUPPLY_SCOPE_SYSTEM;
+ 		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		val->intval = chg_start_pct;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		val->intval = chg_end_pct;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ 	return 0;
+ }
+ 
++static int bat_set(struct power_supply *psy, enum power_supply_property psp,
++		   const union power_supply_propval *val)
++{
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
++		if (val->intval < 0 || val->intval > chg_end_pct - 5)
++			return -EINVAL;
++		chg_start_pct = val->intval;
++		return 0;
++	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
++		if (val->intval < 50 || val->intval > 100 || val->intval < chg_start_pct + 5)
++			return -EINVAL;
++		chg_end_pct = val->intval;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int bat_writeable(struct power_supply *psy, enum power_supply_property psp)
++{
++	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
++	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
++}
++
+ static enum power_supply_property usb_props[] = { POWER_SUPPLY_PROP_ONLINE };
+ 
+ static int usb_get(struct power_supply *psy, enum power_supply_property psp,
+@@ -744,6 +818,8 @@ static const struct power_supply_desc bat_desc = {
+ 	.name = "battery", .type = POWER_SUPPLY_TYPE_BATTERY,
+ 	.properties = bat_props, .num_properties = ARRAY_SIZE(bat_props),
+ 	.get_property = bat_get,
++	.set_property = bat_set,
++	.property_is_writeable = bat_writeable,
+ };
+ 
+ static char *usb_supplied_to[] = { "battery" };
+-- 
+2.53.0
+

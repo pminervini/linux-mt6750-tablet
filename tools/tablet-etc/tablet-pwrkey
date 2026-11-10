@@ -1,0 +1,78 @@
+#!/usr/bin/python3
+"""Power key -> screen (MT6750 tablet, mainline).
+
+Short press toggles the LCD backlight; the screen turns itself off after
+SCREEN_TIMEOUT seconds since it was last switched on. A long press (5 s) is
+left to systemd-logind (HandlePowerKeyLongPress=poweroff, short press ignored).
+"""
+import glob, os, select, struct, subprocess, sys, time
+
+SCREEN_TIMEOUT = 120
+ON_LEVEL = 300
+BL = '/sys/class/backlight/backlight/brightness'
+EV = struct.Struct('llHHi')            # struct input_event on 64-bit
+EV_KEY, KEY_POWER = 1, 116
+
+def panel(on):
+    """DSI panel sleep/wake (tablet-panel: DCS 0x28/0x10, 0x11/0x29 in video mode)."""
+    r = subprocess.run(["/usr/local/sbin/tablet-panel", "on" if on else "off"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        print("tablet-pwrkey: panel", "on" if on else "off", "failed:", r.stderr.strip(), flush=True)
+
+
+def bl(level=None):
+    if level is None:
+        return int(open(BL).read())
+    if level > 0:
+        panel(True)                 # wake the panel (and video stream) before lighting it; idempotent
+    with open(BL, 'w') as f:
+        f.write(str(level))
+    if level == 0:
+        panel(False)                # backlight off first, then put the panel to sleep
+
+def find_dev():
+    for n in glob.glob('/sys/class/input/event*/device/name'):
+        if open(n).read().strip() == 'mt6755-pwrkey':
+            return '/dev/input/' + n.split('/')[4]
+    return None
+
+def main():
+    off_at = time.monotonic() + SCREEN_TIMEOUT
+    bl(ON_LEVEL)
+    dev = None
+    while dev is None:
+        dev = find_dev()
+        if dev is None:
+            time.sleep(2)
+    fd = os.open(dev, os.O_RDONLY)
+    down_at = None
+    print(f'tablet-pwrkey: {dev}, screen off in {SCREEN_TIMEOUT}s', flush=True)
+    while True:
+        timeout = None if off_at is None else max(0, off_at - time.monotonic())
+        r, _, _ = select.select([fd], [], [], timeout)
+        if not r:
+            bl(0)
+            off_at = None
+            continue
+        data = os.read(fd, EV.size * 16)
+        for i in range(0, len(data) - EV.size + 1, EV.size):
+            _, _, typ, code, val = EV.unpack_from(data, i)
+            if typ != EV_KEY or code != KEY_POWER:
+                continue
+            if val == 1:
+                down_at = time.monotonic()
+            elif val == 0 and down_at is not None:
+                held = time.monotonic() - down_at
+                down_at = None
+                if held >= 2:          # long press: logind's business
+                    continue
+                if bl() > 0:
+                    bl(0)
+                    off_at = None
+                else:
+                    bl(ON_LEVEL)
+                    off_at = time.monotonic() + SCREEN_TIMEOUT
+
+if __name__ == '__main__':
+    sys.exit(main())

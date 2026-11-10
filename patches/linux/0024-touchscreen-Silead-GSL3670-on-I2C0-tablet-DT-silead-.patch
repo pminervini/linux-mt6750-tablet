@@ -1,0 +1,99 @@
+From 6194b06bf916bd7c0dd94957316b00d83d6270a4 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 09:38:23 +0000
+Subject: [PATCH 24/25] touchscreen: Silead GSL3670 on I2C0 (tablet DT) +
+ silead: tolerate a NACKed reset command
+
+The chip answers register transactions (write the register, then read)
+but NACKs bare address probes, which is why every i2cdetect/bit-bang
+scan reported an empty bus. Android ground truth (stock gslX68X driver,
+disassembled with the device's own kallsyms): always-on supply, GPIO10 =
+active-low shutdown, EINT1 interrupt, config entry 0 firmware.
+
+silead: this chip resets as soon as it receives 0xe0 = 0x88 and NACKs the
+end of that write (the vendor driver ignores write errors); treat a NACK
+on the reset command as success. With firmware cut from the stock kernel
+(tools/gsl-fwextract.py) the driver probes, the firmware runs (status
+0x5a5a5a5a) and the chip raises interrupts. Image s7f + module.
+---
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts | 18 ++++++++++++---
+ drivers/input/touchscreen/silead.c            | 22 +++++++++++++++----
+ 2 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index ebc46a326..b3ae23ebe 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -334,10 +334,22 @@ i2c_0: i2c@11007000 {
+ 		/* 0x3e: LCD bias (NT50358), programmed by lk: leave alone */
+ 
+ 		/*
+-		 * Touch: Silead GSL1680 at 0x40 (stock gslX68X driver; the 0x5d cap_touch node in the
+-		 * stock DT is MediaTek's generic placeholder). It does not answer under mainline yet
+-		 * (nothing on this bus ACKs, see tools/regdiff), so no node for now.
++		 * Touch: Silead GSL3670 family at 0x40 (stock gslX68X driver; the 0x5d cap_touch node in
++		 * the stock DT is MediaTek's placeholder). It answers register transactions only (write
++		 * the register, then read) - bare address probes (i2cdetect) get NACKs. Powered from an
++		 * always-on rail; GPIO10 is its active-low shutdown. Firmware: cut from the stock kernel
++		 * (config entry 0, as Android uses), not shipped here.
+ 		 */
++		touchscreen@40 {
++			compatible = "silead,gsl3670";
++			reg = <0x40>;
++			interrupts-extended = <&gpio 1 IRQ_TYPE_EDGE_FALLING>;
++			power-gpios = <&gpio 10 GPIO_ACTIVE_HIGH>;
++			firmware-name = "gsl3670-k50v1.fw";
++			touchscreen-size-x = <800>;
++			touchscreen-size-y = <1280>;
++			silead,max-fingers = <5>;
++		};
+ 	};
+ 
+ 	/* I2C1 (SDA1/SCL1 = GPIO91/94, mode 1 from lk): accelerometer */
+diff --git a/drivers/input/touchscreen/silead.c b/drivers/input/touchscreen/silead.c
+index 44d714110..9474c8dc4 100644
+--- a/drivers/input/touchscreen/silead.c
++++ b/drivers/input/touchscreen/silead.c
+@@ -312,12 +312,27 @@ static void silead_ts_read_data(struct i2c_client *client)
+ 	input_sync(input);
+ }
+ 
++/*
++ * Some chips (a GSL3670 on a MediaTek tablet) reset as soon as they receive the reset command
++ * and NACK the end of that very write; the vendor driver ignores write errors. A NACK on the
++ * reset command itself is therefore not an error.
++ */
++static int silead_ts_cmd_reset(struct i2c_client *client)
++{
++	int error = i2c_smbus_write_byte_data(client, SILEAD_REG_RESET, SILEAD_CMD_RESET);
++
++	if (error == -ENXIO || error == -EREMOTEIO) {
++		dev_dbg(&client->dev, "reset command NACKed (chip resetting)\n");
++		error = 0;
++	}
++	return error;
++}
++
+ static int silead_ts_init(struct i2c_client *client)
+ {
+ 	int error;
+ 
+-	error = i2c_smbus_write_byte_data(client, SILEAD_REG_RESET,
+-					  SILEAD_CMD_RESET);
++	error = silead_ts_cmd_reset(client);
+ 	if (error)
+ 		goto i2c_write_err;
+ 	usleep_range(SILEAD_CMD_SLEEP_MIN, SILEAD_CMD_SLEEP_MAX);
+@@ -351,8 +366,7 @@ static int silead_ts_reset(struct i2c_client *client)
+ {
+ 	int error;
+ 
+-	error = i2c_smbus_write_byte_data(client, SILEAD_REG_RESET,
+-					  SILEAD_CMD_RESET);
++	error = silead_ts_cmd_reset(client);
+ 	if (error)
+ 		goto i2c_write_err;
+ 	usleep_range(SILEAD_CMD_SLEEP_MIN, SILEAD_CMD_SLEEP_MAX);
+-- 
+2.53.0
+

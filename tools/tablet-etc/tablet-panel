@@ -1,0 +1,87 @@
+#!/usr/bin/python3
+"""tablet-panel off|on|dcs <cmd> — put the JD9365D DSI panel to sleep / wake it (mainline).
+
+lk leaves DSI0 (0x14012000) in burst video mode with video-mode commands enabled
+(VM_CMD_CON = VM_CMD_EN | TS_VFP_EN). A DCS short packet is queued in VM_CMD_CON
+and sent in the next vertical front porch by pulsing DSI_START.VM_CMD_START (as
+stock DSI_set_cmdq_V2 + DSI_EnableVM_CMD do), so video never stops. The panel keeps
+its configuration in sleep, so wake is just sleep-out + display-on.
+
+While the panel sleeps the video stream is stopped too (DSI back to command mode, DSI_START=0):
+the display engine then stops fetching the framebuffer and DRAM can idle (measured: 206 -> 162 mA
+system load with the screen off). DCS commands go out in the video stream's front porch, so the
+stream is restarted before waking the panel.
+"""
+import mmap, os, struct, sys, time
+
+DSI0 = 0x14012000
+START, INTSTA, MODE_CTRL, VM_CMD_CON = 0x00, 0x0C, 0x14, 0x130
+VM_CMD_START = 1 << 16
+VM_CMD_DONE = 1 << 5
+DCS_SHORT_0, DCS_SHORT_1 = 0x05, 0x15
+
+
+class Dsi:
+    def __init__(self):
+        fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+        self.m = mmap.mmap(fd, 0x1000, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=DSI0)
+
+    def rd(self, o):
+        return struct.unpack_from("<I", self.m, o)[0]
+
+    def wr(self, o, v):
+        struct.pack_into("<I", self.m, o, v)
+
+    def stream(self, on):
+        if on:
+            if self.rd(MODE_CTRL) & 3 == 3 and self.rd(START) & 1:
+                return
+            self.wr(MODE_CTRL, 3)                       # burst video mode
+            s = self.rd(START) & ~1
+            self.wr(START, s); self.wr(START, s | 1)
+            time.sleep(0.05)                            # a few frames before talking to the panel
+        else:
+            self.wr(START, self.rd(START) & ~1)
+            self.wr(MODE_CTRL, 0)                       # command mode: no video stream
+
+    def dcs(self, cmd, param=None):
+        if self.rd(MODE_CTRL) & 3 == 0:
+            raise SystemExit("DSI0 not in video mode; refusing")
+        con = self.rd(VM_CMD_CON) & 0x3D               # keep EN/TS_* bits, short packet
+        did = DCS_SHORT_0 if param is None else DCS_SHORT_1
+        self.wr(VM_CMD_CON, con | 1 | (did << 8) | (cmd << 16) | ((param or 0) << 24))
+        self.wr(INTSTA, self.rd(INTSTA) & ~VM_CMD_DONE)
+        s = self.rd(START)
+        self.wr(START, s & ~VM_CMD_START)
+        self.wr(START, s | VM_CMD_START)
+        t = time.monotonic() + 0.2                      # one frame is ~16 ms
+        while not self.rd(INTSTA) & VM_CMD_DONE:
+            if time.monotonic() > t:
+                self.wr(START, s & ~VM_CMD_START)
+                raise SystemExit(f"DCS 0x{cmd:02x}: no VM_CMD_DONE")
+            time.sleep(0.001)
+        self.wr(INTSTA, self.rd(INTSTA) & ~VM_CMD_DONE)
+        self.wr(START, s & ~VM_CMD_START)
+
+
+def main():
+    a = sys.argv[1:] or ["status"]
+    d = Dsi()
+    if a[0] == "off":
+        d.dcs(0x28); time.sleep(0.02)                   # display off
+        d.dcs(0x10); time.sleep(0.12)                   # sleep in
+        d.stream(False)
+    elif a[0] == "on":
+        d.stream(True)
+        d.dcs(0x11); time.sleep(0.12)                   # sleep out
+        d.dcs(0x29); time.sleep(0.02)                   # display on
+    elif a[0] == "dcs":
+        d.stream(True)
+        d.dcs(int(a[1], 0), int(a[2], 0) if len(a) > 2 else None)
+    elif a[0] == "status":
+        print(f"DSI_START=0x{d.rd(START):08x} MODE=0x{d.rd(MODE_CTRL):08x} VM_CMD_CON=0x{d.rd(VM_CMD_CON):08x}")
+    else:
+        raise SystemExit("usage: tablet-panel off|on|dcs <cmd> [param]|status")
+
+
+main()

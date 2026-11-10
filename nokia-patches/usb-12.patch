@@ -1,0 +1,336 @@
+From 4dd1427a388eb71d1b861154e39553f4be8a1ab2 Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Mon, 2 Jan 2023 10:38:17 +0400
+Subject: [PATCH] dt-bindings: clock: Add Mediatek MT6755 clock bindings
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ .../dt-bindings/clock/mediatek,mt6755-clk.h   | 316 ++++++++++++++++++
+ 1 file changed, 316 insertions(+)
+ create mode 100644 include/dt-bindings/clock/mediatek,mt6755-clk.h
+
+diff --git a/include/dt-bindings/clock/mediatek,mt6755-clk.h b/include/dt-bindings/clock/mediatek,mt6755-clk.h
+new file mode 100644
+index 000000000000..c09e7f668f43
+--- /dev/null
++++ b/include/dt-bindings/clock/mediatek,mt6755-clk.h
+@@ -0,0 +1,316 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2014 MediaTek Inc.
++ * Copyright (C) 2023 Arseniy Velikanov <adomerlee@gmail.com>
++ */
++
++#ifndef _DT_BINDINGS_CLK_MT6755_H
++#define _DT_BINDINGS_CLK_MT6755_H
++
++
++/* TOPCKGEN */
++#define CLK_TOP_MUX_AXI	            1
++#define CLK_TOP_MUX_MEM	            2
++#define CLK_TOP_MUX_DDRPHY     	    3
++#define CLK_TOP_MUX_MM	            4
++#define CLK_TOP_MUX_PWM	            5
++#define CLK_TOP_MUX_VDEC	        6
++#define CLK_TOP_MUX_MFG	            7
++#define CLK_TOP_MUX_CAMTG	        8
++#define CLK_TOP_MUX_UART	        9
++#define CLK_TOP_MUX_SPI	            10
++#define CLK_TOP_MUX_MSDC50_0_HCLK	11
++#define CLK_TOP_MUX_MSDC50_0	    12
++#define CLK_TOP_MUX_MSDC30_0	    13
++#define CLK_TOP_MUX_MSDC30_1	    14
++#define CLK_TOP_MUX_MSDC30_2	    15
++#define CLK_TOP_MUX_MSDC30_3	    16
++#define CLK_TOP_MUX_AUDIO	        17
++#define CLK_TOP_MUX_AUDINTBUS	    18
++#define CLK_TOP_MUX_PMICSPI	        19
++#define CLK_TOP_MUX_ATB	            20
++#define CLK_TOP_MUX_DPI0	        21
++#define CLK_TOP_MUX_SCAM	        22
++#define CLK_TOP_MUX_MFG13M	        23
++#define CLK_TOP_MUX_AUD1	        24
++#define CLK_TOP_MUX_AUD2	        25
++#define CLK_TOP_MUX_DISPPWM	        26
++#define CLK_TOP_MUX_SSUSBTOPSYS	    27
++#define CLK_TOP_MUX_USBTOP	        28
++#define CLK_TOP_MUX_SPM	            29
++#define CLK_TOP_MUX_BSISPI	        30
++#define CLK_TOP_MUX_I2C	            31
++#define CLK_TOP_MUX_DVFSP	        32
++#define CLK_TOP_AD_APLL1_CK		    33
++#define CLK_TOP_AD_APLL2_CK		    34
++#define CLK_TOP_MMPLL_CK		    35
++#define CLK_TOP_DDRX1_CK		    36
++#define CLK_TOP_DMPLL_CK		    37
++#define CLK_TOP_MPLL_208M_CK        38
++#define CLK_TOP_MSDCPLL_CK		    39
++#define CLK_TOP_MSDCPLL_D16		    40
++#define CLK_TOP_MSDCPLL_D2		    41
++#define CLK_TOP_MSDCPLL_D4		    42
++#define CLK_TOP_MSDCPLL_D8		    43
++#define CLK_TOP_OSC_D2              44
++#define CLK_TOP_OSC_D4              45
++#define CLK_TOP_OSC_D8              46
++#define CLK_TOP_SYSPLL_D3		    47
++#define CLK_TOP_SYSPLL_D3_D3	    48
++#define CLK_TOP_SYSPLL_D5		    49
++#define CLK_TOP_SYSPLL_D7		    50
++#define CLK_TOP_SYSPLL1_D2		    51
++#define CLK_TOP_SYSPLL1_D4		    52
++#define CLK_TOP_SYSPLL1_D8		    53
++#define CLK_TOP_SYSPLL1_D16		    54
++#define CLK_TOP_SYSPLL2_D2		    55
++#define CLK_TOP_SYSPLL2_D4		    56
++#define CLK_TOP_SYSPLL3_D2		    57
++#define CLK_TOP_SYSPLL3_D4		    58
++#define CLK_TOP_SYSPLL4_D2		    59
++#define CLK_TOP_SYSPLL4_D4		    60
++#define CLK_TOP_TVDPLL_D2		    61
++#define CLK_TOP_TVDPLL_D4		    62
++#define CLK_TOP_TVDPLL_D8		    63
++#define CLK_TOP_TVDPLL_D16		    64
++#define CLK_TOP_UNIVPLL_D2		    65
++#define CLK_TOP_UNIVPLL_D3		    66
++#define CLK_TOP_UNIVPLL_D5		    67
++#define CLK_TOP_UNIVPLL_D7		    68
++#define CLK_TOP_UNIVPLL_D26		    69
++#define CLK_TOP_UNIVPLL1_D2		    70
++#define CLK_TOP_UNIVPLL1_D4		    71
++#define CLK_TOP_UNIVPLL1_D8		    72
++#define CLK_TOP_UNIVPLL2_D2		    73
++#define CLK_TOP_UNIVPLL2_D4		    74
++#define CLK_TOP_UNIVPLL2_D8		    75
++#define CLK_TOP_UNIVPLL3_D2		    76
++#define CLK_TOP_UNIVPLL3_D4		    77
++#define CLK_TOP_VENCPLL_CK		    78
++#define CLK_TOP_WHPLL_AUDIO_CK		79
++#define CLK_TOP_CLKPH_MCK_O		    80
++#define CLK_TOP_DPI_CK		        81
++#define CLK_TOP_MUX_USB20	        82
++#define CLK_TOP_MUX_SCP	            83
++#define CLK_TOP_MUX_IRDA	        84
++#define CLK_TOP_MUX_IRTX	        85
++#define CLK_TOP_AD_SYS_26M_CK		86
++#define CLK_TOP_AD_SYS_26M_D2		87
++#define CLK_TOP_DMPLL_D2		    88
++#define CLK_TOP_DMPLL_D4			89
++#define CLK_TOP_DMPLL_D8			90
++#define CLK_TOP_SYSPLL_D2			91
++#define CLK_TOP_SYSPLL4_D2_D8		92
++#define CLK_TOP_TVDPLL_CK			93
++#define CLK_TOP_VENCPLL_D3			94
++#define CLK_TOP_SYSPLL_CK			95
++#define CLK_TOP_SYSPLL1_CK	    	96
++#define CLK_TOP_SYSPLL2_CK			97
++#define CLK_TOP_SYSPLL3_CK			98
++#define CLK_TOP_SYSPLL4_CK			99
++#define CLK_TOP_UNIVPLL_CK			100
++#define CLK_TOP_UNIVPLL1_CK			101
++#define CLK_TOP_UNIVPLL2_CK			102
++#define CLK_TOP_UNIVPLL3_CK			103
++#define CLK_TOP_OSC_CK 		        104
++#define CLK_TOP_NR_CLK				105
++
++/* APMIXED_SYS */
++#define CLK_APMIXED_ARMBPLL	        1
++#define CLK_APMIXED_ARMSPLL			2
++#define CLK_APMIXED_MAINPLL			3
++#define CLK_APMIXED_MSDCPLL			4
++#define CLK_APMIXED_UNIVPLL			5
++#define CLK_APMIXED_MMPLL			6
++#define CLK_APMIXED_VENCPLL			7
++#define CLK_APMIXED_TVDPLL			8
++#define CLK_APMIXED_APLL1			9
++#define CLK_APMIXED_APLL2			10
++#define CLK_APMIXED_ARMPLL			11
++#define CLK_SCP_OSCPLL				12
++#define CLK_APMIXED_NR_CLK			13
++
++/* INFRA_SYS0, infrasys0 */
++#define	CLK_INFRA_PMIC_TMR			1
++#define	CLK_INFRA_PMIC_AP			2
++#define	CLK_INFRA_PMIC_MD			3
++#define	CLK_INFRA_PMIC_CONN			4
++#define	CLK_INFRA_SEJ				5
++#define	CLK_INFRA_APXGPT			6
++#define	CLK_INFRA_ICUSB				7
++#define	CLK_INFRA_GCE				8
++#define	CLK_INFRA_THERM				9
++#define	CLK_INFRA_I2C0				10
++#define	CLK_INFRA_I2C1				11
++#define	CLK_INFRA_I2C2				12
++#define	CLK_INFRA_I2C3				13
++#define	CLK_INFRA_PWM_HCLK			14
++#define	CLK_INFRA_PWM1				15
++#define	CLK_INFRA_PWM2				16
++#define	CLK_INFRA_PWM3				17
++#define	CLK_INFRA_PWM4				18
++#define	CLK_INFRA_PWM				19
++#define	CLK_INFRA_UART0				20
++#define	CLK_INFRA_UART1				21
++#define	CLK_INFRA_UART2				22
++#define	CLK_INFRA_UART3				23
++#define	CLK_INFRA_MD2MD_CCIF0		24
++#define	CLK_INFRA_MD2MD_CCIF1		25
++#define	CLK_INFRA_MD2MD_CCIF2		26
++#define	CLK_INFRA_BTIF				27
++
++/* INFRA_SYS1, infrasys1 */
++#define	CLK_INFRA_MD2MD_CCIF3		28
++#define	CLK_INFRA_SPI0				29
++#define	CLK_INFRA_MSDC0				30
++#define	CLK_INFRA_MD2MD_CCIF4		31
++#define	CLK_INFRA_MSDC1				32
++#define	CLK_INFRA_MSDC2				33
++#define	CLK_INFRA_MSDC3				34
++#define	CLK_INFRA_MD2MD_CCIF5		35
++#define	CLK_INFRA_GCPU				36
++#define	CLK_INFRA_TRNG				37
++#define	CLK_INFRA_AUXADC			38
++#define	CLK_INFRA_CPUM				39
++#define	CLK_INFRA_CCIF1_AP			40
++#define	CLK_INFRA_CCIF1_MD			41
++#define	CLK_INFRA_AP_DMA			42
++#define	CLK_INFRA_XIU				43
++#define	CLK_INFRA_DEVICE_APC		44
++#define	CLK_INFRA_XIU2AHB			45
++#define	CLK_INFRA_CCIF_AP			46
++#define	CLK_INFRA_DEBUGSYS			47
++#define	CLK_INFRA_AUDIO				48
++#define	CLK_INFRA_CCIF_MD			49
++#define	CLK_INFRA_DRAMC_F26M		50
++
++/* INFRA_SYS2, infrasys2 */
++#define	CLK_INFRA_IRTX				51
++#define	CLK_INFRA_SSUSB_TOP			52
++#define	CLK_INFRA_DISP_PWM			53
++#define	CLK_INFRA_CLDMA_BCLK		54
++#define	CLK_INFRA_AUDIO_26M_BCLK	55
++#define	CLK_INFRA_MD_TEMP_26M_BCLK	56
++#define	CLK_INFRA_SPI1				57
++#define	CLK_INFRA_I2C4				58
++#define	CLK_INFRA_MD_TEMP_SHARE		59
++#define CLK_INFRA_CLK_13M			60
++#define CLK_INFRA_NR_CLK			61
++
++/* PERI_SYS, perisys */
++#define CLK_PERI_NR_CLK				1
++
++/* MFG_SYS, mfgsys */
++#define CLK_MFG_BG3D				1
++#define CLK_MFG_NR_CLK				2
++
++/* IMG_SYS, imgsys */
++#define CLK_IMG_IMAGE_LARB2_SMI					1
++#define CLK_IMG_IMAGE_LARB2_SMI_M4U				2
++#define CLK_IMG_IMAGE_LARB2_SMI_SMI_COMMON		3
++#define CLK_IMG_IMAGE_LARB2_SMI_MET_SMI_COMMON	4
++#define CLK_IMG_IMAGE_LARB2_SMI_ISPSYS			5
++#define CLK_IMG_IMAGE_CAM_SMI					6
++#define CLK_IMG_IMAGE_CAM_CAM					7
++#define CLK_IMG_IMAGE_SEN_TG					8
++#define CLK_IMG_IMAGE_SEN_CAM					9
++#define CLK_IMG_IMAGE_CAM_SV					10
++#define CLK_IMG_IMAGE_SUFOD						11
++#define CLK_IMG_IMAGE_FD						12
++#define CLK_IMG_NR_CLK							13
++
++/* MM_SYS, mmsys */
++#define CLK_MM_DISP0_SMI_COMMON						1
++#define CLK_MM_DISP0_SMI_COMMON_M4U					2
++#define CLK_MM_DISP0_SMI_COMMON_MALI				3
++#define CLK_MM_DISP0_SMI_COMMON_DISPSYS				4
++#define CLK_MM_DISP0_SMI_COMMON_SMI_COMMON			5
++#define CLK_MM_DISP0_SMI_COMMON_MET_SMI_COMMON		6
++#define CLK_MM_DISP0_SMI_COMMON_ISPSYS				7
++#define CLK_MM_DISP0_SMI_COMMON_FDVT				8
++#define CLK_MM_DISP0_SMI_COMMON_VDEC_GCON			9
++#define CLK_MM_DISP0_SMI_COMMON_JPGENC				10
++#define CLK_MM_DISP0_SMI_COMMON_JPGDEC				11
++#define CLK_MM_DISP0_SMI_LARB0						12
++#define CLK_MM_DISP0_SMI_LARB0_M4U					13
++#define CLK_MM_DISP0_SMI_LARB0_DISPSYS				14
++#define CLK_MM_DISP0_SMI_LARB0_SMI_COMMON			15
++#define CLK_MM_DISP0_SMI_LARB0_MET_SMI_COMMON		16
++#define CLK_MM_DISP0_CAM_MDP		17
++#define CLK_MM_DISP0_MDP_RDMA		18
++#define CLK_MM_DISP0_MDP_RSZ0		19
++#define CLK_MM_DISP0_MDP_RSZ1		20
++#define CLK_MM_DISP0_MDP_TDSHP		21
++#define CLK_MM_DISP0_MDP_WDMA		22
++#define CLK_MM_DISP0_MDP_WROT		23
++#define CLK_MM_DISP0_FAKE_ENG		24
++#define CLK_MM_DISP0_DISP_OVL0		25
++#define CLK_MM_DISP0_DISP_OVL1		26
++#define CLK_MM_DISP0_DISP_RDMA0		27
++#define CLK_MM_DISP0_DISP_RDMA1		28
++#define CLK_MM_DISP0_DISP_WDMA0		29
++#define CLK_MM_DISP0_DISP_COLOR		30
++#define CLK_MM_DISP0_DISP_CCORR		31
++#define CLK_MM_DISP0_DISP_AAL		32
++#define CLK_MM_DISP0_DISP_GAMMA		33
++#define CLK_MM_DISP0_DISP_DITHER	34
++#define CLK_MM_DISP0_MDP_COLOR		35
++#define CLK_M_DISP0_DISP_UFOE_MOUT	36
++#define CLK_MM_DISP0_DISP_WDMA1		37
++#define CLK_MM_DISP0_DISP_2L_OVL0	38
++#define CLK_MM_DISP0_DISP_2L_OVL1	39
++#define CLK_MM_DISP0_DISP_OVL0_MOUT	40
++#define CLK_MM_DISP1_DSI_ENGINE		41
++#define CLK_MM_DISP1_DSI_DIGITAL	42
++#define CLK_MM_DISP1_DPI_ENGINE		43
++#define CLK_MM_DISP1_DPI_PIXEL		44
++#define CLK_MM_NR_CLK				45
++
++/* VDEC_SYS, vdecsys */
++#define CLK_VDEC0_VDEC					1
++#define CLK_VDEC1_LARB					2
++#define CLK_VDEC1_LARB_M4U				3
++#define CLK_VDEC1_LARB_SMI_COMMON		4
++#define CLK_VDEC1_LARB_MET_SMI_COMMON	5
++#define CLK_VDEC1_LARB_VDEC_GCON		6
++#define CLK_VDEC_NR_CLK					7
++
++/* VENC_SYS, vencsys */
++#define CLK_VENC_LARB					1
++#define CLK_VENC_LARB_M4U				2
++#define CLK_VENC_LARB_SMI_COMMON		3
++#define CLK_VENC_LARB_MET_SMI_COMMON	4
++#define CLK_VENC_LARB_JPGENC			5
++#define CLK_VENC_LARB_JPGDEC			6
++#define CLK_VENC_VENC					7
++#define CLK_VENC_JPGENC					8
++#define CLK_VENC_JPGDEC					9
++#define CLK_VENC_NR_CLK					10
++
++/* AUDIO_SYS, audiosys */
++#define CLK_AUDIO_AFE				1
++#define CLK_AUDIO_I2S				2
++#define CLK_AUDIO_22M				3
++#define CLK_AUDIO_24M				4
++#define CLK_AUDIO_APLL2_TUNER		5
++#define CLK_AUDIO_APLL_TUNER		6
++#define CLK_AUDIO_ADC				7
++#define CLK_AUDIO_DAC				8
++#define CLK_AUDIO_DAC_PREDIS		9
++#define CLK_AUDIO_TML				10
++#define CLK_AUDIO_APLL1_DIV0		11
++#define CLK_AUDIO_APLL2_DIV0		12
++#define CLK_AUDIO_NR_CLK			13
++
++/* SCP_SYS */
++#define CLK_SCP_SYS_MD1				1
++#define CLK_SCP_SYS_MD2				2
++#define CLK_SCP_SYS_CONN			3
++#define CLK_SCP_SYS_DIS				4
++#define CLK_SCP_SYS_MFG				5
++#define CLK_SCP_SYS_ISP				6
++#define CLK_SCP_SYS_VDE				7
++#define CLK_SCP_SYS_VEN				8
++#define CLK_SCP_SYS_AUD				9
++#define CLK_SCP_NR_SYSS				10
++#endif /* _DT_BINDINGS_CLK_MT6755_H */
+-- 
+GitLab
+

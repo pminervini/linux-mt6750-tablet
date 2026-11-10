@@ -1,0 +1,113 @@
+From 29d040c4dca185d09a34c091bcdebe55c44716d5 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sat, 7 Nov 2026 23:36:54 +0000
+Subject: [PATCH 11/25] soc: mediatek: mt6755-pmic: RTC 32k export API for
+ CONSYS (GPS), root-only PMIC register peek/poke
+
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 68 ++++++++++++++++++++++++++++++
+ 1 file changed, 68 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index b02ab5579..7242802e5 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -25,6 +25,9 @@
+  *  - rtc: MT6353 RTC (MT6397 layout at PMIC 0x4000), year base 1968 as stock.
+  *  - /sys/kernel/mt6755_pmic/boot_recovery: RTC_PDN1 FAC_RESET, the flag stock
+  *    `reboot recovery` sets; lk boots `recovery` once and clears it.
++ *  - mt6755_rtc_32k_enable(user): RTC 32 kHz export to CONSYS (GPS needs it), as
++ *    stock rtc_gpio_enable_32k(); /sys/kernel/mt6755_pmic/reg: root-only register
++ *    peek/poke ("<addr>" then read, or "<addr> <val>"), for bring-up.
+  *  - power key: TOPSTATUS PWRKEY_DEB (active low, as mtk-pmic-keys) polled every
+  *    50 ms -> input device "mt6755-pwrkey" (KEY_POWER).
+  *  - power-off: stock mt_power_off() (RTC BBPU pwrdown = PWRBB low); if a
+@@ -636,6 +639,8 @@ subsys_initcall(mt6755_pmic_init);
+ #define RTC_PDN1		(RTC_BASE + 0x2c)
+ #define RTC_PDN1_FAC_RESET	BIT(4)
+ #define RTC_PROT		(RTC_BASE + 0x36)
++#define RTC_CON			(RTC_BASE + 0x3e)
++#define RTC_CON_F32KOB		BIT(5)	/* 1: RTC_GPIO does NOT export 32k */
+ #define RTC_WRTGR		(RTC_BASE + 0x3c)
+ #define RTC_MIN_YEAR_OFFSET	(1968 - 1900)
+ static const u16 rtc_tc_mask[7] = { 0x3f, 0x3f, 0x1f, 0x1f, 0x07, 0x0f, 0x7f };
+@@ -775,6 +780,67 @@ static int mt6755_power_off(struct sys_off_data *data)
+ 	return NOTIFY_DONE;
+ }
+ 
++/* stock hal_rtc_set_gpio_32k_status(): user = 8 WiFi, 9 GPS, 10 BT, 11 FM, 12 PMIC (RTC_PDN1 bit) */
++int mt6755_rtc_32k_enable(int user, bool enable)
++{
++	u16 pdn1, con;
++	int ret;
++
++	if (user < 8 || user > 12)
++		return -EINVAL;
++	mutex_lock(&rtc_lock);
++	mt6755_pmic_write(RTC_PROT, 0x586a);
++	rtc_trigger();
++	mt6755_pmic_write(RTC_PROT, 0x9136);
++	rtc_trigger();
++	ret = mt6755_pmic_read(RTC_PDN1, &pdn1);
++	if (ret)
++		goto out;
++	pdn1 = enable ? pdn1 | BIT(user) : pdn1 & ~BIT(user);
++	mt6755_pmic_write(RTC_PDN1, pdn1);
++	rtc_trigger();
++	ret = mt6755_pmic_read(RTC_CON, &con);
++	if (ret)
++		goto out;
++	if (enable)
++		con &= ~RTC_CON_F32KOB;
++	else if (!(pdn1 & GENMASK(12, 8)))
++		con |= RTC_CON_F32KOB;
++	mt6755_pmic_write(RTC_CON, con);
++	ret = rtc_trigger();
++	pr_info("mt6755-pmic: RTC 32k user %d %s (pdn1 0x%04x con 0x%04x)\n", user,
++		enable ? "on" : "off", pdn1, con);
++out:
++	mutex_unlock(&rtc_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt6755_rtc_32k_enable);
++
++static u16 reg_addr;
++
++static ssize_t reg_show(struct kobject *k, struct kobj_attribute *a, char *buf)
++{
++	u16 v;
++
++	if (mt6755_pmic_read(reg_addr, &v))
++		return -EIO;
++	return sysfs_emit(buf, "0x%04x 0x%04x\n", reg_addr, v);
++}
++
++static ssize_t reg_store(struct kobject *k, struct kobj_attribute *a, const char *buf, size_t n)
++{
++	unsigned int adr, val;
++	int c = sscanf(buf, "%x %x", &adr, &val);
++
++	if (c < 1 || adr > 0xfffe || (adr & 1))
++		return -EINVAL;
++	reg_addr = adr;
++	if (c == 2 && mt6755_pmic_write(adr, val))
++		return -EIO;
++	return n;
++}
++static struct kobj_attribute reg_attr = __ATTR(reg, 0600, reg_show, reg_store);
++
+ static const struct rtc_class_ops mt6755_rtc_ops = {
+ 	.read_time = mt6755_rtc_read_time,
+ 	.set_time = mt6755_rtc_set_time,
+@@ -846,6 +912,8 @@ static int __init mt6755_battery_init(void)
+ 			pr_warn("mt6755-pmic: rtc: %ld\n", PTR_ERR(rtc));
+ 		if (pmic_kobj && sysfs_create_file(pmic_kobj, &boot_recovery_attr.attr))
+ 			pr_warn("mt6755-pmic: boot_recovery attr failed\n");
++		if (pmic_kobj && sysfs_create_file(pmic_kobj, &reg_attr.attr))
++			pr_warn("mt6755-pmic: reg attr failed\n");
+ 		if (IS_ERR(register_sys_off_handler(SYS_OFF_MODE_POWER_OFF, SYS_OFF_PRIO_DEFAULT,
+ 						    mt6755_power_off, NULL)))
+ 			pr_warn("mt6755-pmic: power-off handler failed\n");
+-- 
+2.53.0
+

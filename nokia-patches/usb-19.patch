@@ -1,0 +1,25 @@
+From 97333aefde29f0528e325f63b31565455451a229 Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Sat, 7 Jan 2023 04:39:35 +0400
+Subject: [PATCH] fixup! arm64: dts: mediatek: mt6755: Refactor
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts b/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts
+index 7e6441c401dd..dce0529bc2d4 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts
+@@ -80,7 +80,3 @@ memory@40000000 {
+ &uart0 {
+ 	status = "okay";
+ };
+-
+-&uart1 {
+-	status = "okay";
+-};
+-- 
+GitLab
+

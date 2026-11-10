@@ -1,0 +1,31 @@
+From bbda23450101b17629ee278e05eabc5784b80678 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 09:48:34 +0000
+Subject: [PATCH 25/25] tablet DT: touchscreen axes swapped, chip ranges
+ 1664x960 (from corner taps); image s7g
+
+---
+ arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index b3ae23ebe..0f7856e05 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -346,8 +346,11 @@ touchscreen@40 {
+ 			interrupts-extended = <&gpio 1 IRQ_TYPE_EDGE_FALLING>;
+ 			power-gpios = <&gpio 10 GPIO_ACTIVE_HIGH>;
+ 			firmware-name = "gsl3670-k50v1.fw";
+-			touchscreen-size-x = <800>;
+-			touchscreen-size-y = <1280>;
++			/* chip axes: X along the long side, ~1.3 units/px; Y along the short side, ~1.2
++			 * units/px (corner taps: (60,60) -> raw (59,39), (740,1220) -> raw (1565,855)) */
++			touchscreen-size-x = <1664>;
++			touchscreen-size-y = <960>;
++			touchscreen-swapped-x-y;
+ 			silead,max-fingers = <5>;
+ 		};
+ 	};
+-- 
+2.53.0
+

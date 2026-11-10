@@ -1,0 +1,33 @@
+From 88bd14223949cc669c9a19a0d46cff3dd11e6368 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Mon, 9 Nov 2026 08:10:52 +0000
+Subject: [PATCH 18/25] mt6755-pmic: enable VTCXO24 (stock DT
+ regulator-boot-on) - GPS RF front end; GPS fix works
+
+With only the AUXADC fix the GPS core ran but received nothing at a window where stock Android
+got a fix in 30 s. VTCXO24 on: satellites within 3 s, fix in 59 s (5 SVs, up to 34 dB-Hz).
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index c4602ba12..e68ed0b7d 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -803,6 +803,13 @@ static int __init mt6755_pmic_init(void)
+ 	bs.temp = 250;
+ 	/* touch controller supply (stock vtouch = VLDO28, fixed 2.8 V): LDO_SHARE_VLDO28_CON0 b1 */
+ 	mt6755_pmic_rmw(0x0A16, 1, 1, 1);
++	/*
++	 * VTCXO24 (stock DT: regulator-boot-on, always on): feeds the GPS RF front end. Without it
++	 * the GPS core runs but receives nothing (0 satellites, Android at the same spot: fix in 30 s).
++	 * LDO_VTCXO24_SW_CON0 b4 LDO_VTCXO24_SWITCH, LDO3_VTCXO24_CON0 b1 LDO_VTCXO24_EN.
++	 */
++	mt6755_pmic_rmw(0x0A06, 1, 4, 1);
++	mt6755_pmic_rmw(0x0A36, 1, 1, 1);
+ 	auxadc_hw_init();
+ 	chr_hw_init();
+ 	INIT_DELAYED_WORK(&chr_work, chr_work_fn);
+-- 
+2.53.0
+

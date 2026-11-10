@@ -1,0 +1,21 @@
+0b0618bbadea2555b5ec4c438892151ca40df59b 2023-01-07T09:45:49 arm64: dts: mediatek: mt6755-nokia-es2: Enable USB
+dd51fb6e24d4302b62ebafda1face354ce521844 2023-01-07T09:45:22 arm64: dts: mediatek: mt6755: Add USB
+97333aefde29f0528e325f63b31565455451a229 2023-01-07T04:39:35 fixup! arm64: dts: mediatek: mt6755: Refactor
+763f55734bf9378a7ca07d7aaaa6538e434758e2 2023-01-07T04:35:26 arm64: dts: mediatek: mt6755: Refactor
+98c17fd16caecd50ef4be8a00ebc111c607c8cfe 2023-01-07T02:27:56 fixup! clk: mediatek: Add drivers for MediaTek MT6755 main clock drivers
+2d990675dffd5b84963e7de8a1e748808042a116 2023-01-03T01:06:00 fixup! [HACK] arm64: dts: mt6755-nokia-es2: add simplefb
+ce56eae87d108854e99699666be566897661107a 2023-01-03T01:03:22 arm64: dts: mediatek: mt6755: Drop infracfg_ao
+c5f9c96ad8eb536bb19001f9636c3bc59721f396 2023-01-02T23:21:37 arm64: dts: mediatek: mt6755: Add clock controllers
+1fda39bdd212a4eb766e6e3970f07117bf914198 2023-01-02T21:19:53 clk: mediatek: Add drivers for MediaTek MT6755 main clock drivers
+4dd1427a388eb71d1b861154e39553f4be8a1ab2 2023-01-02T10:38:17 dt-bindings: clock: Add Mediatek MT6755 clock bindings
+87fae71824101ea6a7314922c9c5a48dc4816057 2023-01-02T08:37:54 [HACK] arm64: dts: mt6755-nokia-es2: add simplefb
+70070b51b984c5ad21bc0435e9662811b55ab1ea 2023-01-02T08:29:53 arm64: dts: mediatek: mt6755: Add watchdog
+31e771f5bb6ddaac42bc19d9c8b225a0868697c2 2023-01-02T08:27:35 fixup! arm64: dts: mediatek: Add initial support for Nokia 3.1
+28c0230aa9f1549a098a984da03cb9b5493303d5 2023-01-02T08:26:34 arm64: dts: mediatek: mt6755: Set initrd address
+5773c51bb12588c14cfd533ab19a99d2568164c8 2023-01-02T08:24:30 watchdog: mediatek: mt6755: add wdt support
+02bada3beeeca250fdc4eecf74ba100848dd88c1 2023-01-02T08:20:44 dt-bindings: reset: add dt binding header for MediaTek MT6755 resets
+d81393c385a59ab4dc5a4e3d05728db2079067d6 2023-01-02T07:27:17 arm64: dts: mediatek: mt6755-nokia-es2: Add reserved-memory nodes from downstream
+abb9f27b238f2c2943bae4c9039785d0eaf04c06 2023-01-02T05:42:20 arm64: dts: mediatek: mt6755: Completely disable SMP
+f45562fcc3ba0d4cc1fa4848a9276822863efeda 2023-01-01T22:58:17 arm64: dts: mediatek: Add initial support for Nokia 3.1
+491c7c56cadc41f5cc84be966fcdcfd32ad062b7 2023-01-01T22:54:30 arm64: dts: mediatek: mt6755: Disable SMP
+e2b4b3d2854717a3e2df3f0084cb30ad0d05b054 2023-01-01T22:45:01 kbuild: Fix running modpost with musl libc

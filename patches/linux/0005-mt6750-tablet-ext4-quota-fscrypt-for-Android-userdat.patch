@@ -1,0 +1,33 @@
+From f75214154e4df7473193e9ffed7d883995bc97dc Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sat, 7 Nov 2026 14:53:20 +0000
+Subject: [PATCH 05/25] mt6750 tablet: ext4 quota/fscrypt for Android userdata;
+ WDT reset as PMIC full power cycle (WDTRSTB_MODE)
+
+---
+ drivers/watchdog/mtk_wdt.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/watchdog/mtk_wdt.c b/drivers/watchdog/mtk_wdt.c
+index ec7e2e864..dcd049099 100644
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -283,8 +283,13 @@ static void mtk_wdt_cycle_vemc(void __iomem *pw)
+ 	mdelay(100);
+ 	mtk_wdt_pwrap_rw(pw, true, MT6353_VEMC33_CON0, v | MT6353_VEMC33_EN, NULL);
+ 	mdelay(10);
+-	/* TOP_RST_MISC_SET: RG_WDTRSTB_EN, PMIC full reset on WDT (EXTEN) */
+-	mtk_wdt_pwrap_rw(pw, true, 0x02aa, 0x0001, NULL);
++	/*
++	 * MT6353 TOP_RST_MISC_SET: RG_WDTRSTB_EN (bit 0) | RG_WDTRSTB_MODE (bit 1).
++	 * MODE=1 makes the PMIC power-cycle the whole board when the SoC watchdog
++	 * asserts WDTRSTB (WDT_MODE EXTEN); MODE=0 (default) is a warm reset, which
++	 * after a non-stock kernel ends in BROM download mode and then power-off.
++	 */
++	mtk_wdt_pwrap_rw(pw, true, 0x02aa, 0x0003, NULL);
+ }
+ 
+ static int mtk_wdt_restart(struct watchdog_device *wdt_dev,
+-- 
+2.53.0
+

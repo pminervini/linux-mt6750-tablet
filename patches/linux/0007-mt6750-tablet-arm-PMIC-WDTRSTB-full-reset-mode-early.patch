@@ -1,0 +1,89 @@
+From 5263b40e59af99c28f3b5ca256b71618698d5aac Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sat, 7 Nov 2026 17:14:35 +0000
+Subject: [PATCH 07/25] mt6750 tablet: arm PMIC WDTRSTB full-reset mode (early
+ + wdt probe + restart): reboots and hangs come back to Android unattended;
+ SPM cpu power-down disabled
+
+---
+ arch/arm64/kernel/head.S              | 11 ++++++-----
+ drivers/soc/mediatek/mt6755-bringup.c | 10 +++++++++-
+ drivers/watchdog/mtk_wdt.c            | 10 +++++++++-
+ 3 files changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 154bd5476..63c047224 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -150,12 +150,13 @@ SYM_CODE_START(primary_entry)
+ 	movk	w12, #0x8545, lsl #16		/* VEMC on */
+ 	bl	bringup_pwrap_write
+ 	/*
+-	 * MT6353 TOP_RST_MISC_SET (0x02aa) = 1: RG_WDTRSTB_EN. Make the PMIC
+-	 * power-cycle all rails on a SoC watchdog reset (WDT_MODE EXTEN), as the
+-	 * stock kernel's PMIC init does; without it a WDT reset leaves the board
+-	 * half-reset and the boot ROM loops in download mode, then powers off.
++	 * MT6353 TOP_RST_MISC_SET (0x02aa) = 3: RG_WDTRSTB_EN | RG_WDTRSTB_MODE.
++	 * MODE=1 makes the PMIC power-cycle all rails on a SoC watchdog reset
++	 * (WDT_MODE EXTEN); with MODE=0 a WDT reset leaves the board half-reset
++	 * and the boot ROM loops in download mode, then powers off. Armed this
++	 * early so that even a hang before the watchdog driver probes recovers.
+ 	 */
+-	movz	w12, #0x0001
++	movz	w12, #0x0003
+ 	movk	w12, #0x8155, lsl #16
+ 	bl	bringup_pwrap_write
+ 	movz	x9, #0x7000
+diff --git a/drivers/soc/mediatek/mt6755-bringup.c b/drivers/soc/mediatek/mt6755-bringup.c
+index 209ae84b8..741fc5e1d 100644
+--- a/drivers/soc/mediatek/mt6755-bringup.c
++++ b/drivers/soc/mediatek/mt6755-bringup.c
+@@ -186,6 +186,9 @@ int mtk_spm_cpu_power_on(u64 mpidr)
+ 	return ret;
+ }
+ 
++static bool spm_pdn;
++module_param(spm_pdn, bool, 0644);
++
+ #define SPM_CPU_IDLE_STA	0x174
+ #define  CPU_STANDBYWFI(cl, n)	BIT(10 + 4 * (cl) + (n))
+ 
+@@ -200,7 +203,12 @@ int mtk_spm_cpu_power_off(u64 mpidr)
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	if (!mt6755_spm_cpu_ok() || cl > 1 || n > 3)
++	/*
++	 * Disabled: powering a core down this way and back up via
++	 * mtk_spm_cpu_power_on() hangs the whole SoC (2026-11-07). Probably the
++	 * re-powered core needs a warm-boot address / cluster handling we lack.
++	 */
++	if (!spm_pdn || !mt6755_spm_cpu_ok() || cl > 1 || n > 3)
+ 		return -EOPNOTSUPP;
+ 	/* the dying core must have reached WFI inside the firmware's CPU_OFF */
+ 	ret = readl_poll_timeout(spm + SPM_CPU_IDLE_STA, v, v & CPU_STANDBYWFI(cl, n), 10, 100000);
+diff --git a/drivers/watchdog/mtk_wdt.c b/drivers/watchdog/mtk_wdt.c
+index dcd049099..30c907793 100644
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -544,8 +544,16 @@ static int mtk_wdt_probe(struct platform_device *pdev)
+ 		of_property_read_bool(dev->of_node, "mediatek,disable-extrst");
+ 	mtk_wdt->restart_bypass_pwrkey =
+ 		of_property_read_bool(dev->of_node, "mediatek,restart-bypass-pwrkey");
+-	if (of_property_read_bool(dev->of_node, "mediatek,restart-cycle-vemc"))
++	if (of_property_read_bool(dev->of_node, "mediatek,restart-cycle-vemc")) {
+ 		mtk_wdt->pwrap = devm_ioremap(dev, 0x1000d000, 0x1000);
++		/*
++		 * Arm the PMIC full power-cycle for every WDT reset, including
++		 * timeouts after a hang, not just for an orderly restart.
++		 */
++		if (mtk_wdt->pwrap &&
++		    !mtk_wdt_pwrap_rw(mtk_wdt->pwrap, true, 0x02aa, 0x0003, NULL))
++			dev_info(dev, "PMIC WDTRSTB full-reset mode armed\n");
++	}
+ 
+ 	mtk_wdt->reset_by_toprgu =
+ 		of_property_read_bool(dev->of_node, "mediatek,reset-by-toprgu");
+-- 
+2.53.0
+

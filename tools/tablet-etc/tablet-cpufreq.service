@@ -1,0 +1,11 @@
+[Unit]
+Description=Load-based CPU clock/voltage scaling (MT6750 tablet, mainline)
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/local/sbin/tablet-cpufreq
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+From 31e771f5bb6ddaac42bc19d9c8b225a0868697c2 Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Mon, 2 Jan 2023 08:27:35 +0400
+Subject: [PATCH] fixup! arm64: dts: mediatek: Add initial support for Nokia
+ 3.1
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts b/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts
+index 1382e54232a8..3e3689b53cdd 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts
+@@ -14,12 +14,11 @@ / {
+ 	model = "Nokia 3.1";
+ 	compatible = "nokia,es2", "mediatek,mt6755";
+ 
+-	alieases {
++	aliases {
+ 		serial0 = &uart0;
+ 	};
+ 
+ 	chosen {
+-		bootargs = "earlycon";
+ 		stdout-path = "serial0:921600n8";
+ 	};
+ 
+-- 
+GitLab
+

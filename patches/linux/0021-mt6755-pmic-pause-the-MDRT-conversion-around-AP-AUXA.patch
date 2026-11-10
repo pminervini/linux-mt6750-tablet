@@ -1,0 +1,92 @@
+From 715b3c3940e1dd7de8d108a52b8f715122f6d7bf Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Mon, 9 Nov 2026 22:53:24 +0000
+Subject: [PATCH 21/25] mt6755-pmic: pause the MDRT conversion around AP AUXADC
+ reads (BATON glitch)
+
+The periodic modem real-time conversion enabled in c66f03af3 for the
+connsys GPS core also lands in the channel-3 output register, on top of
+BATON (~1.15 V = 0 C): 13 of 60 register samples, none with MDRT off;
+34 of 150 driver samples read too cold. Stop MDRT, let a conversion in
+flight finish, convert and read, restart it (~3 ms every 2 s; the GPS core
+keeps the last MDRT value). Now 0 of 150, ntc 589-598 mV; GPS core still
+starts and its FE42 crystal temperature keeps updating. Image s7a.
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 32 ++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index 7b7a301fd..685d509bd 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -245,11 +245,39 @@ static int auxadc_mv(u16 reg, int *mv)
+ 
+ static DEFINE_MUTEX(adc_lock);
+ 
++/*
++ * The periodic "modem real-time" conversion (AUXADC_MDRT_DET_EN, needed by the connsys GPS
++ * core, see auxadc_init_tbl) stores its result (~1.15 V here) in the channel-3 output register
++ * as well, i.e. on top of BATON: measured 13 of 60 register samples, none with MDRT off. Pause
++ * it around AP conversions (adc_lock held): stop, let a conversion in flight finish, convert,
++ * read, restart. ~3 ms every 2 s; the GPS core keeps the last MDRT value meanwhile.
++ */
++#define AUXADC_MDRT_0		0x0F1E	/* b15 MDRT_DET_EN */
++
++static bool mdrt_pause(void)
++{
++	u16 v;
++
++	if (mt6755_pmic_read(AUXADC_MDRT_0, &v) || !(v & BIT(15)))
++		return false;
++	mt6755_pmic_rmw(AUXADC_MDRT_0, 1, 15, 0);
++	usleep_range(1000, 1500);
++	return true;
++}
++
++static void mdrt_resume(bool was_on)
++{
++	if (was_on)
++		mt6755_pmic_rmw(AUXADC_MDRT_0, 1, 15, 1);
++}
++
+ static int battery_read(int *vbat, int *ichg)
+ {
+ 	int isense, ret;
++	bool mdrt;
+ 
+ 	mutex_lock(&adc_lock);
++	mdrt = mdrt_pause();
+ 	mt6755_pmic_write(CLK_CKPDN_CON0_CLR, BIT(11));
+ 	mt6755_pmic_rmw(AUXADC_CON0, 1, 15, 1);
+ 	mt6755_pmic_write(AUXADC_RQST0_SET, 0x3);
+@@ -259,6 +287,7 @@ static int battery_read(int *vbat, int *ichg)
+ 		ret = auxadc_mv(AUXADC_ADC25, &isense);
+ 	if (!ret)
+ 		*ichg = (isense - *vbat) * 1000 / R_SENSE_MOHM;
++	mdrt_resume(mdrt);
+ 	mutex_unlock(&adc_lock);
+ 	return ret;
+ }
+@@ -267,9 +296,11 @@ static int battery_read(int *vbat, int *ichg)
+ static int baton_read(int *mv)
+ {
+ 	int ret = -ETIMEDOUT;
++	bool mdrt;
+ 	u16 v;
+ 
+ 	mutex_lock(&adc_lock);
++	mdrt = mdrt_pause();
+ 	mt6755_pmic_write(CLK_CKPDN_CON0_CLR, BIT(11));
+ 	mt6755_pmic_rmw(AUXADC_CON0, 1, 15, 1);
+ 	mt6755_pmic_write(AUXADC_RQST0_SET, BIT(3));
+@@ -286,6 +317,7 @@ static int baton_read(int *mv)
+ 		}
+ 		usleep_range(100, 200);
+ 	}
++	mdrt_resume(mdrt);
+ 	mutex_unlock(&adc_lock);
+ 	return ret;
+ }
+-- 
+2.53.0
+

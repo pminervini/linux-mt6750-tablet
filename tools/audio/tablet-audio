@@ -1,0 +1,313 @@
+#!/usr/bin/python3
+"""tablet-audio: speaker playback bring-up for the MT6750 tablet on mainline (no ALSA driver yet).
+
+  tablet-audio start [freq] [level]   AFE + PMIC codec on, loop a sine from AFE SRAM (amp still OFF)
+  tablet-audio amp on|off             AW8736 external speaker amp (GPIO54, mode 3 = 3 pulses)
+  tablet-audio play <file|-> [volume] play anything ffmpeg decodes (file or stdin; default volume 0.3)
+  tablet-audio stop                   amp off, DAC/codec off, AFE off
+  tablet-audio status
+
+Path (as stock Android plays to the speaker, register values from a capture during playback):
+  AFE DL2 memif (16-bit stereo, 48 kHz, buffer in AFE SRAM 0x11221000..0x1122cfff)
+  -> interconnect I07/I08 -> O03/O04 -> ADDA DL (SRC2, new IF) -> AUD_CLK/AUD_DAT pins (GPIO149-151)
+  -> MT6353 codec: digital AFE (0x2000..), DAC -> line drivers -> external AW8736 amp -> speaker.
+PMIC sequences follow the stock mt_soc_codec_6353.c (TurnOnDacPower, Speaker_Amp_Change).
+"""
+import math, mmap, os, struct, sys, time
+
+AFE, SRAM, SRAM_SIZE = 0x11220000, 0x11221000, 0xC000
+GPIO = 0x10005000
+EXTAMP, EXTAMP2, HPDEPOP = 0, 54, 62
+PMIC_REG = "/sys/kernel/mt6755_pmic/reg"
+HP_GAIN = 0x00                     # ZCD_CON2 gain index as Android while playing (0 = loudest)
+
+fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+afe = mmap.mmap(fd, 0x1000, offset=AFE)
+gpio = mmap.mmap(fd, 0x1000, offset=GPIO)
+SRAM_MAP = mmap.mmap(fd, SRAM_SIZE, offset=SRAM)
+
+
+def rd(m, o):
+    return struct.unpack_from("<I", m, o)[0]
+
+
+def wr(m, o, v):
+    struct.pack_into("<I", m, o, v & 0xffffffff)
+
+
+def pmic(addr, val=None, mask=0xffff):
+    if val is None or mask != 0xffff:
+        with open(PMIC_REG, "w") as f:
+            f.write(f"{addr:#x}")
+        with open(PMIC_REG) as f:
+            cur = int(f.read().split()[1], 16)
+        if val is None:
+            return cur
+        val = (cur & ~mask) | (val & mask)
+    with open(PMIC_REG, "w") as f:
+        f.write(f"{addr:#x} {val:#x}")
+
+
+# ---- AUDIO power domain (SPM MTCMOS, stock clk-mt6755-pg.c spm_mtcmos_ctrl_audio) ----
+SPM, AUDIO_PWR_CON, PWR_STATUS, PWR_STATUS_2ND, AUDIO_STA = 0x10006000, 0x314, 0x180, 0x184, 1 << 24
+PWR_RST_B, PWR_ISO, PWR_ON, PWR_ON_2ND, PWR_CLK_DIS = 1, 2, 4, 8, 16
+spm = mmap.mmap(fd, 0x1000, offset=SPM)
+
+
+def wait(cond, what):
+    t = time.monotonic() + 0.5
+    while not cond():
+        if time.monotonic() > t:
+            raise SystemExit(f"timeout: {what}")
+
+
+def audio_domain(on):
+    wr(spm, 0x000, (0xb16 << 16) | 1)                  # POWERON_CONFIG_EN (project key)
+    c = lambda: rd(spm, AUDIO_PWR_CON)
+    if on:
+        if rd(spm, PWR_STATUS) & AUDIO_STA and not c() & PWR_ISO:
+            return
+        wr(spm, AUDIO_PWR_CON, c() | PWR_ON)
+        wr(spm, AUDIO_PWR_CON, c() | PWR_ON_2ND)
+        wait(lambda: rd(spm, PWR_STATUS) & AUDIO_STA and rd(spm, PWR_STATUS_2ND) & AUDIO_STA, "audio power ack")
+        wr(spm, AUDIO_PWR_CON, c() & ~PWR_CLK_DIS)
+        wr(spm, AUDIO_PWR_CON, c() & ~PWR_ISO)
+        wr(spm, AUDIO_PWR_CON, c() | PWR_RST_B)
+        wr(spm, AUDIO_PWR_CON, c() & ~(0xf << 8))      # SRAM banks on
+        wait(lambda: not c() & (0xf << 12), "audio SRAM ack")
+    else:
+        wr(spm, AUDIO_PWR_CON, c() | (0xf << 8))
+        wait(lambda: c() & (0xf << 12) == (0xf << 12), "audio SRAM pdn ack")
+        for b in (PWR_ISO, PWR_CLK_DIS):
+            wr(spm, AUDIO_PWR_CON, c() | b)
+        wr(spm, AUDIO_PWR_CON, c() & ~PWR_RST_B)
+        wr(spm, AUDIO_PWR_CON, c() & ~(PWR_ON | PWR_ON_2ND))
+
+
+# ---- AFE (SoC audio front end) ----
+AUD_PINS = (149, 150, 151)           # AUD_CLK_MOSI, AUD_DAT_MOSI, AUD_DAT_MISO (mode 1)
+
+
+def aud_pins():
+    """Function mode 1 and DIR=in: lk leaves GPIO150 (AUD_DAT_MOSI) as an output, which keeps
+    the PMIC from receiving any audio data."""
+    for p in AUD_PINS:
+        reg, i = 0x300 + (p // 10) * 0x10, p % 10
+        sh = i * 3 if i < 5 else 16 + (i - 5) * 3
+        wr(gpio, reg, (rd(gpio, reg) & ~(7 << sh)) | (1 << sh))
+        wr(gpio, (p // 32) * 0x10 + 8, 1 << (p % 32))     # DIR_CLR
+
+
+def sram_write(off, data):
+    """Copy into AFE SRAM with 32-bit stores only (device memory)."""
+    sram = SRAM_MAP
+    for o in range(0, len(data), 4):
+        sram[off + o:off + o + 4] = data[o:o + 4]
+
+
+def sine_buffer(freq, level):
+    # one period-exact loop of the sine, in the format stock Android uses on this path:
+    # 48 kHz stereo, 24-bit samples in bits 0..23 of 32-bit words ("32BIT_ALIGN_8BIT_0_24BIT_DATA")
+    amp = int(8388607 * level)
+    buf = bytearray(SRAM_SIZE)
+    for i in range(SRAM_SIZE // 8):
+        v = int(amp * math.sin(2 * math.pi * freq * i / 48000))
+        struct.pack_into("<II", buf, 8 * i, v & 0xffffff, v & 0xffffff)
+    return buf
+
+
+def afe_start(freq=None, level=None, buf=None):
+    aud_pins()
+    audio_domain(True)
+    wr(afe, 0x000, 0x80fd4038)        # AUDIO_TOP_CON0: AFE, DAC, DAC_PREDIS clocks on (stock value)
+    wr(afe, 0x00c, 0x60000004)        # AUDIO_TOP_CON3
+    sram_write(0, buf if buf is not None else sine_buffer(freq, level))
+    wr(afe, 0x050, SRAM)                               # AFE_DL2_BASE
+    wr(afe, 0x058, SRAM + SRAM_SIZE - 1)               # AFE_DL2_END
+    wr(afe, 0x014, (rd(afe, 0x014) & ~0xf0) | 0xa0)    # AFE_DAC_CON1: DL2 48 kHz
+    wr(afe, 0x3d8, (rd(afe, 0x3d8) & ~(3 << 18)) | (1 << 18))   # AFE_MEMIF_PBUF_SIZE: DL2 24-in-32 (stock)
+    wr(afe, 0x3d4, 0x11111115)                         # AFE_MEMIF_MAXLEN (stock)
+    wr(afe, 0x024, rd(afe, 0x024) | 0x00800000)        # AFE_CONN1: I07 -> O03
+    wr(afe, 0x028, rd(afe, 0x028) | 0x00000100)        # AFE_CONN2: I08 -> O04
+    wr(afe, 0x06c, 0x0019e018)                         # AFE_CONN_24BIT (stock: O03/O04 24-bit)
+    wr(afe, 0x138, 0x03f87200)                         # AFE_ADDA_NEWIF_CFG0 (stock)
+    wr(afe, 0x13c, 0x03117180)                         # AFE_ADDA_NEWIF_CFG1 (stock)
+    wr(afe, 0x10c, 0xf74f0000)                         # AFE_ADDA_DL_SRC2_CON1: gain
+    wr(afe, 0x108, 0x83001803)                         # AFE_ADDA_DL_SRC2_CON0: 48 kHz, gain on, enable
+    wr(afe, 0x124, rd(afe, 0x124) | 1)                 # AFE_ADDA_UL_DL_CON0: ADDA on
+    # remaining non-zero AFE registers from the Android capture (config only: no IRQ/status/pointers)
+    for o, v in ((0x034, 0x00000a0b), (0x038, 0x08000000), (0x0cc, 0x003f0000),   # I2S_CON1/2, MEMIF_MSB
+                 (0x1e0, 0x02000000), (0x1e8, 0x0000001f),                         # SIDETONE_CON0/1
+                 (0x5a0, 0x7700003f), (0x5a4, 0x07070707),                         # AUDIO_CLK_AUDDIV_0/1
+                 (0x410, 0x0000c800), (0x414, 0x00080000), (0x418, 0x0007c5e5), (0x41c, 0x00083bcd),
+                 (0x428, 0x0000c800), (0x42c, 0x00080000), (0x430, 0x0007c5e5), (0x434, 0x00083bcd)):
+        wr(afe, o, v)
+    wr(afe, 0x010, 0x28000005)                         # AFE_DAC_CON0 as stock: AFE_ON, DL2_ON
+
+
+def afe_stop():
+    wr(afe, 0x010, rd(afe, 0x010) & ~(1 << 2))
+    wr(afe, 0x108, rd(afe, 0x108) & ~1)
+    wr(afe, 0x124, rd(afe, 0x124) & ~1)
+    wr(afe, 0x010, rd(afe, 0x010) & ~1)
+    audio_domain(False)
+
+
+# ---- MT6353 codec ----
+def codec_on():
+    pmic(0x0d2a, 0x8000, 0x8000)      # DCXO_CW01: XO_AUDIO_EN_M (audio 26 MHz buffer)
+    pmic(0x0244, 0x0001, 0x0001)      # TOP_CLKSQ
+    pmic(0x0246, 0x0001)              # TOP_CLKSQ_SET
+    pmic(0x0272, 0x0070)              # CLK_CKPDN_CON0_CLR: audio clocks
+    time.sleep(0.001)
+    pmic(0x0d02, 0x0000, 0x0002)      # AUDDEC_ANA_CON8: AUDGLB (NV reg) on
+    pmic(0x203c, 0x8000, 0x8000)      # AFE_PMIC_NEWIF_CFG2[15]: set once by stock codec init
+    pmic(0x2014, 0x003a)              # AFE_AUDIO_TOP_CON0: digital clocks
+    pmic(0x2020, 0x0006)              # AFUNC_AUD_CON2: sdm fifo clock
+    pmic(0x201c, 0xc3a1)              # AFUNC_AUD_CON0: scrambler
+    pmic(0x2020, 0x0003)              # sdm power
+    pmic(0x2020, 0x000b)              # sdm fifo
+    pmic(0x2008, 0x001e)              # AFE_DL_SDM_CON1: attenuation
+    pmic(0x2000, 0x0001)              # AFE_UL_DL_CON0: afe on
+    pmic(0x2038, 0x8330)              # AFE_PMIC_NEWIF_CFG0: 48 kHz
+    pmic(0x2002, 0x8300)              # AFE_DL_SRC2_CON0_H: 48 kHz
+    pmic(0x2004, 0x0001)              # AFE_DL_SRC2_CON0_L: dl on
+    pmic(0x2012, 0x0000)              # PMIC_AFE_TOP_CON0: normal path (not sine gen)
+    # analog: headphone drivers (the AW8736 input is on HPL/HPR), stock Audio_Amp_Change() sequence
+    us = lambda n: time.sleep(n / 1e6)
+    pmic(0x0d1c, 0x0001); pmic(0x0d1e, 0x002b); pmic(0x0d1a, 0x0001)
+    pmic(0x0d22, 0x0003); pmic(0x0d20, 0x0000)                     # NCP 604 kHz, enable
+    pmic(0x0cfe, 0x0a41, 0xfeeb); pmic(0x0cfe, 0x2ac1, 0xfeeb)     # cap-less HC/LC LDOs
+    pmic(0x0d00, 0x8000, 0x8000)                                   # NV regulator (-1.5 V)
+    pmic(0x0800, 0x0000)                                           # ZCD off
+    pmic(0x0cf2, 0xe080)                                           # drivers off, HP mux open
+    pmic(0x0cfe, 0x2ac0, 0xfeeb)                                   # IBIST
+    pmic(0x0cfa, 0x0700)                                           # HP & HS driver bias
+    pmic(0x0cfc, 0x5490); us(50)                                   # bias current
+    pmic(0x0804, 0x0f9f)                                           # HPL/HPR gain minimum
+    pmic(0x0806, 0x001f)                                           # voice gain minimum
+    pmic(0x0cf4, 0x0480); pmic(0x0cf4, 0x1480)                     # De_OSC, STBENH
+    pmic(0x0cf2, 0xe090)                                           # voice driver
+    pmic(0x0cf4, 0x14a0); us(50)                                   # pre-charge buffer
+    pmic(0x0cfe, 0x2ac2, 0xfeeb)                                   # AUD_CLK
+    pmic(0x0cf2, 0x000f, 0x000f)                                   # audio DAC L/R
+    pmic(0x0cf2, 0x1480, 0x1f80)                                   # HP mux -> DAC
+    pmic(0x0cf2, 0x0060, 0x0060); us(50)                           # HPL/HPR on
+    pmic(0x0cf4, 0x1480); pmic(0x0cf4, 0x0480)                     # pre-charge off, De_OSC voice off
+    pmic(0x0cf2, 0x0000, 0x0190)                                   # voice buffer off
+    pmic(0x0cfa, 0x0300)                                           # HS bias off
+    for g in range(0x1f, HP_GAIN - 1, -1):                         # ramp HP gain up (no pop)
+        pmic(0x0804, g | (g << 7)); us(500)
+    # remaining analog state as Android has it while playing to the speaker
+    pmic(0x0802, 0x0408)                                           # ZCD_CON1: LOL/LOR gain
+    pmic(0x0808, 0x0505)                                           # ZCD_CON4: IV buffer gain
+    pmic(0x0cf8, 0x0072)                                           # AUDDEC_ANA_CON3: trim buffer
+
+
+def codec_off():
+    for a, v in ((0x0804, 0x0f9f), (0x0cf2, 0x0000), (0x0cf8, 0x0000), (0x0cfa, 0x0000)):
+        pmic(a, v)
+    pmic(0x0d00, 0x0000, 0x8000)
+    pmic(0x0cfe, 0x0001, 0xfeeb)
+    pmic(0x2004, 0x0000); pmic(0x2000, 0x0000)
+    pmic(0x0d02, 0x0002, 0x0002)
+
+
+# ---- AW8736 amp on GPIO54 ----
+def gpio_out(p, v):
+    b, bit = (p // 32) * 0x10, 1 << (p % 32)
+    wr(gpio, 0x100 + b + (4 if v else 8), bit)
+    wr(gpio, b + 4, bit)
+
+
+def gpio_mode0(p):
+    reg, i = 0x300 + (p // 10) * 0x10, p % 10
+    sh = i * 3 if i < 5 else 16 + (i - 5) * 3
+    wr(gpio, reg, rd(gpio, reg) & ~(7 << sh))
+
+
+def amp(on):
+    """Stock audio pinctrl (DT audgpio): extamp = GPIO0 (AW8736, mode 3 = three pulses),
+    extamp2 = GPIO54, hpdepop = GPIO62 (held high while playing)."""
+    for p in (EXTAMP, EXTAMP2, HPDEPOP):
+        gpio_mode0(p)
+    if not on:
+        for p in (EXTAMP, EXTAMP2, HPDEPOP):
+            gpio_out(p, 0)
+        return
+    gpio_out(HPDEPOP, 1)
+    for p in (EXTAMP, EXTAMP2):
+        gpio_out(p, 0)
+    time.sleep(0.002)
+    for _ in range(3):                                 # AW8736 mode 3: three rising edges
+        for p in (EXTAMP, EXTAMP2):
+            gpio_out(p, 0)
+        for p in (EXTAMP, EXTAMP2):
+            gpio_out(p, 1)
+    time.sleep(0.035)                                  # warm-up
+
+
+def play(path, volume):
+    """Decode anything ffmpeg reads to 48 kHz stereo and stream it through the SRAM ring."""
+    import subprocess
+    import numpy as np
+    dec = subprocess.Popen(["ffmpeg", "-v", "error", "-i", "pipe:0" if path == "-" else path, "-f", "s32le", "-ac", "2", "-ar", "48000", "-"],
+                           stdout=subprocess.PIPE)
+
+    def chunk(nbytes):
+        raw = dec.stdout.read(nbytes)
+        a = np.frombuffer(raw, dtype="<i4").astype(np.int64)
+        a = np.clip((a >> 8) * volume, -8388608, 8388607).astype(np.int64)
+        out = (a & 0xffffff).astype("<u4").tobytes()
+        return out + bytes(nbytes - len(out)), len(raw) == nbytes
+
+    first, more = chunk(SRAM_SIZE)
+    codec_on()
+    afe_start(buf=first)
+    amp(True)
+    w, silence_left = 0, None          # write offset == read pointer at start (buffer is full)
+    try:
+        while True:
+            time.sleep(0.01)
+            hw = rd(afe, 0x054) - SRAM
+            n = (hw - w) % SRAM_SIZE & ~7  # space the DMA has consumed since our last write
+            if not n:
+                continue
+            if silence_left is None:
+                data, more = chunk(n)
+                if not more:
+                    silence_left = SRAM_SIZE   # let the tail play out, then stop
+            else:
+                data = bytes(n)
+                silence_left -= n
+                if silence_left <= 0:
+                    break
+            end = min(n, SRAM_SIZE - w)
+            sram_write(w, data[:end])
+            if end < n:
+                sram_write(0, data[end:])
+            w = (w + n) % SRAM_SIZE
+    finally:
+        amp(False); afe_stop(); codec_off()
+        dec.kill()
+
+
+def status():
+    print(f"PMIC AFUNC_AUD_MON0=0x{pmic(0x2026):04x} (non-zero = data from the SoC arrives)")
+    print(f"AUDIO_PWR_CON=0x{rd(spm, AUDIO_PWR_CON):08x} PWR_STATUS.audio={rd(spm, PWR_STATUS) >> 24 & 1} "
+          f"AUDIO_TOP_CON0=0x{rd(afe, 0):08x} DAC_CON0=0x{rd(afe, 0x10):08x} "
+          f"DL2_CUR=0x{rd(afe, 0x54):08x} ADDA_DL=0x{rd(afe, 0x108):08x} "
+          f"PMIC AUDDEC0=0x{pmic(0x0cf2):04x} UL_DL=0x{pmic(0x2000):04x}")
+
+
+a = sys.argv[1:] or ["status"]
+if a[0] == "start":
+    codec_on()
+    afe_start(float(a[1]) if len(a) > 1 else 1000.0, float(a[2]) if len(a) > 2 else 0.3)
+elif a[0] == "play":
+    play(a[1], float(a[2]) if len(a) > 2 else 0.3)
+elif a[0] == "amp":
+    amp(a[1] == "on")
+elif a[0] == "stop":
+    amp(False); afe_stop(); codec_off()
+status()

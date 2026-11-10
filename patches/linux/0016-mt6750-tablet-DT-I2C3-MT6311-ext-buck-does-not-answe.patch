@@ -1,0 +1,37 @@
+From 3c733b14983586dae7aacefa8c6d0af7eb2d8519 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sun, 8 Nov 2026 11:55:49 +0000
+Subject: [PATCH 16/25] mt6750 tablet DT: I2C3 (MT6311 ext buck does not answer
+ under mainline)
+
+---
+ .../arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index fabdf6b54..b1ef04ff8 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -358,6 +358,19 @@ accelerometer@12 {
+ 		};
+ 	};
+ 
++	/* I2C3 (SDA3/SCL3 = GPIO50/49): MT6311 external CPU buck at 0x6b (stock "ext_buck") */
++	i2c_3: i2c@1100f000 {
++		compatible = "mediatek,mt6755-i2c";
++		reg = <0 0x1100f000 0 0x1000>, <0 0x11000280 0 0x80>;
++		interrupts = <GIC_SPI 87 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&i2c_src_clk>, <&clk26m_ref>;
++		clock-names = "main", "dma";
++		clock-div = <10>;
++		clock-frequency = <100000>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++	};
++
+ 	/*
+ 	 * LCD backlight: DISP_PWM (stock led_mode 5, CUST_BLS_PWM). lk leaves it
+ 	 * enabled at clk_div 0 / period 1023; with the 26 MHz stand-in clock a
+-- 
+2.53.0
+

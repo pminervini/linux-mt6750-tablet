@@ -1,0 +1,83 @@
+From 74d72469f804e93062e4cc6474174ac21b446959 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Mon, 9 Nov 2026 21:47:27 +0000
+Subject: [PATCH 19/25] mt6755-bringup: switch off lk's overlay layer (Orange
+ State text over the console)
+
+lk leaves OVL0 layers 0 and 3 enabled. Layer 0 scans out the buffer handed to
+simple-framebuffer; layer 3 is lk's second buffer with the Orange State
+warning, alpha-blended on top. Disable every layer other than the one showing
+the simple-framebuffer, at arch_initcall (before fbcon). Also drops one 4 MB
+fetch per frame. Image s6x.
+---
+ drivers/soc/mediatek/mt6755-bringup.c | 47 +++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mt6755-bringup.c b/drivers/soc/mediatek/mt6755-bringup.c
+index 741fc5e1d..f3776ba74 100644
+--- a/drivers/soc/mediatek/mt6755-bringup.c
++++ b/drivers/soc/mediatek/mt6755-bringup.c
+@@ -13,6 +13,7 @@
+ #include <asm/cputype.h>
+ #include <linux/io.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/printk.h>
+ 
+ #define TOPCKGEN		0x10000000
+@@ -51,6 +52,52 @@ static int __init mt6755_bringup_clocks(void)
+ }
+ arch_initcall(mt6755_bringup_clocks);
+ 
++/*
++ * lk leaves two OVL0 layers on: layer 0 scans out the framebuffer that we hand to
++ * simple-framebuffer, and layer 3 (lk's second buffer right after it) carries the
++ * "Orange State" warning, alpha-blended on top of everything. Linux never draws into
++ * layer 3, so lk's text stays over the console and login prompt. Turn off every layer
++ * except the one showing the simple-framebuffer (this also saves one 4 MB fetch per
++ * frame). Leaves the hardware alone if no layer shows that buffer.
++ */
++#define DISP_OVL0		0x14008000
++#define  OVL_SRC_CON		0x02c
++#define  OVL_LX_ADDR(n)		(0xf40 + 0x20 * (n))
++
++static int __init mt6755_bringup_lk_layers(void)
++{
++	struct device_node *fb;
++	void __iomem *ovl;
++	struct resource res;
++	u32 con, keep = 0;
++	int n;
++
++	if (!of_machine_is_compatible("mediatek,k50v1-tablet"))
++		return 0;
++	fb = of_find_compatible_node(NULL, NULL, "simple-framebuffer");
++	if (!fb)
++		return 0;
++	n = of_address_to_resource(fb, 0, &res);
++	of_node_put(fb);
++	if (n)
++		return 0;
++	ovl = ioremap(DISP_OVL0, 0x1000);
++	if (!ovl)
++		return -ENOMEM;
++	con = readl(ovl + OVL_SRC_CON);
++	for (n = 0; n < 4; n++)
++		if ((con & BIT(n)) && readl(ovl + OVL_LX_ADDR(n)) == (u32)res.start)
++			keep |= BIT(n);
++	if (keep && (con & 0xf) != keep) {
++		writel((con & ~0xf) | keep, ovl + OVL_SRC_CON);
++		pr_info("mt6755-bringup: OVL0 layers %x -> %x (boot loader overlay off)\n",
++			con & 0xf, keep);
++	}
++	iounmap(ovl);
++	return 0;
++}
++arch_initcall(mt6755_bringup_lk_layers);
++
+ /*
+  * Secondary CPU power-up through the SPM (stock mt_spm_mtcmos.c
+  * spm_mtcmos_ctrl_cpuN, STA_POWER_ON). Only cluster 0 (MP0) for now: MP1
+-- 
+2.53.0
+

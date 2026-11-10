@@ -1,0 +1,19 @@
+[Unit]
+Description=Mark this mainline boot healthy: arm lk's one-shot RTC recovery flag so the next power-on/reboot is mainline again
+After=multi-user.target network-online.target ssh.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# healthy = up 60 s with sshd running, and nobody asked for Android meanwhile (tablet-android).
+# lk clears the flag when it boots recovery, so a kernel that panics or hangs before reaching
+# this point falls back to Android on the next reset instead of boot-looping.
+ExecStart=/bin/sh -c 'sleep 60; systemctl is-active -q ssh || exit 1; [ "$(/usr/local/sbin/tablet-bcb get)" = android-once ] && exit 0; echo 1 > /sys/kernel/mt6755_pmic/boot_recovery'
+# Boot is healthy: stop echoing every kernel/systemd message to the screen (the cmdline has
+# loglevel=8 ignore_loglevel for bring-up debugging); keep errors and warnings (console level 5).
+ExecStartPost=/bin/sh -c 'echo N > /sys/module/printk/parameters/ignore_loglevel; echo 5 > /proc/sys/kernel/printk'
+# ... and redraw a clean login prompt on the screen, unless someone is logged in there
+ExecStartPost=/bin/sh -c 'pgrep -t tty1 -x agetty >/dev/null || exit 0; TERM=linux clear > /dev/tty1; systemctl restart getty@tty1'
+
+[Install]
+WantedBy=multi-user.target

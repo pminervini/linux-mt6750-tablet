@@ -1,0 +1,4 @@
+da peek 0x44410000 0xe0000 --filename out/s0a-pstore.bin
+da peek 0x44400000 0x10000 --filename out/s0a-ramconsole-dram.bin
+da peek 0x11D000 0xc00 --filename out/s0a-ramconsole-sram.bin
+reset

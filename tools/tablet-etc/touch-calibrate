@@ -1,0 +1,59 @@
+#!/usr/bin/python3
+"""touch-calibrate: red cross top-left, then bottom-right on the framebuffer - tap each - then a
+check cross in the centre. Computes the libinput calibration matrix for silead_ts (in normalised
+coordinates, i.e. reported value / axis maximum, as libinput applies it), writes
+/etc/udev/rules.d/99-touch-calibration.rules and logs the centre error in pixels.
+Log: /var/tmp/touch-calibrate.log"""
+import fcntl, glob, mmap, os, struct, subprocess, time
+W, H, STRIDE, M = 800, 1280, 3200, 60
+LOG = open("/var/tmp/touch-calibrate.log", "a", buffering=1)
+def log(s): LOG.write("%s %s\n" % (time.strftime("%H:%M:%S"), s))
+m = mmap.mmap(os.open("/dev/fb0", os.O_RDWR), STRIDE * H)
+def cross(cx, cy, colour):
+    c = {"red": b"\x00\x00\xff\xff", "green": b"\x00\xff\x00\xff", "black": b"\x00\x00\x00\xff"}[colour]
+    for d in range(-40, 41):
+        for t in range(-2, 3):
+            for x, y in ((cx + d, cy + t), (cx + t, cy + d)):
+                if 0 <= x < W and 0 <= y < H:
+                    m[y * STRIDE + 4 * x: y * STRIDE + 4 * x + 4] = c
+dev = [d for d in glob.glob("/sys/class/input/event*") if open(d + "/device/name").read().strip() == "silead_ts"][0]
+f = open("/dev/input/" + dev.split("/")[-1], "rb")
+amax = {}
+for code in (0x35, 0x36):
+    buf = bytearray(24); fcntl.ioctl(f, 0x80184540 + code, buf)
+    amax[code] = struct.unpack_from("ii", buf, 4)[1] or 1
+os.set_blocking(f.fileno(), False)
+def tap(cx, cy):
+    x = y = None
+    while True:
+        cross(cx, cy, "red")                                  # redrawn: the console may overwrite it
+        try:
+            data = f.read(24 * 64) or b""
+        except BlockingIOError:
+            data = b""
+        for k in range(0, len(data) - 23, 24):
+            _, _, typ, code, val = struct.unpack("llHHi", data[k:k + 24])
+            if typ == 3 and code == 0x35: x = val
+            if typ == 3 and code == 0x36: y = val
+            if typ == 1 and code == 330 and val == 0 and x is not None:
+                cross(cx, cy, "black")
+                return x / amax[0x35], y / amax[0x36]         # normalised, as libinput
+        time.sleep(0.1)
+subprocess.run(["/usr/local/bin/tablet-screen", "on"])
+log("axis max X %d Y %d; tap the red crosses: top-left, bottom-right, then the centre" % (amax[0x35], amax[0x36]))
+tl = tap(M, M); log("top-left (%d,%d) -> normalised (%.4f, %.4f)" % (M, M, *tl)); time.sleep(0.8)
+br = tap(W - M, H - M); log("bottom-right (%d,%d) -> normalised (%.4f, %.4f)" % (W - M, H - M, *br))
+swap = abs(br[0] - tl[0]) < 0.3 and abs(br[1] - tl[1]) < 0.3  # axes would not span: should not happen
+a = ((W - 2 * M) / W) / (br[0] - tl[0]); c = M / W - a * tl[0]
+e = ((H - 2 * M) / H) / (br[1] - tl[1]); f_ = M / H - e * tl[1]
+mat = [round(a, 4), 0, round(c, 4), 0, round(e, 4), round(f_, 4), 0, 0, 1]
+time.sleep(0.8)
+ce = tap(W // 2, H // 2)
+px, py = (a * ce[0] + c) * W, (e * ce[1] + f_) * H
+log("centre check (%d,%d) -> with the new matrix (%.0f,%.0f): error %.0f px" % (W // 2, H // 2, px, py, ((px - W / 2) ** 2 + (py - H / 2) ** 2) ** 0.5))
+cross(W // 2, H // 2, "green"); time.sleep(2); cross(W // 2, H // 2, "black")
+rule = 'ACTION=="add|change", KERNEL=="event*", ATTRS{name}=="silead_ts", ENV{LIBINPUT_CALIBRATION_MATRIX}="%s"\n' % " ".join(str(v) for v in mat)
+open("/etc/udev/rules.d/99-touch-calibration.rules", "w").write(rule)
+subprocess.run(["udevadm", "trigger", "--sysname-match=" + dev.split("/")[-1]])
+log("matrix %s%s" % (" ".join(map(str, mat)), "  (WARNING: taps did not span the screen)" if swap else ""))
+log("done")

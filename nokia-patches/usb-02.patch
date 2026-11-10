@@ -1,0 +1,38 @@
+From 491c7c56cadc41f5cc84be966fcdcfd32ad062b7 Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Sun, 1 Jan 2023 22:54:30 +0400
+Subject: [PATCH] arm64: dts: mediatek: mt6755: Disable SMP
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ arch/arm64/boot/dts/mediatek/mt6755.dtsi | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6755.dtsi b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+index b55d3fac9bd4..ad1afabedee6 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6755.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+@@ -79,6 +79,20 @@ cpu7: cpu@103 {
+ 		};
+ 	};
+ 
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/*
++		 * NOTE: /chosen/bootargs has to exist even if unused or
++		 * bootloader will be unhappy, also needs "bootopt=64S3,32N2,64N2"
++		 * on boot.img cmdline to boot 64-bit kernel (adding it here doesn't help)
++		 * FIXME: without "maxcpus=1" the kernel will panic while bringing up the secondary CPUs!
++		 */
++		bootargs = "maxcpus=1";
++	};
++
+ 	uart_clk: dummy26m {
+ 		compatible = "fixed-clock";
+ 		clock-frequency = <26000000>;
+-- 
+GitLab
+

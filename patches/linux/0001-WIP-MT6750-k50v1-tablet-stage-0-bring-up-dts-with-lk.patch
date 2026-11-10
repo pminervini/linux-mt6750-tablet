@@ -1,0 +1,533 @@
+From 21b7dcbcdadb98b3f44603466a38176ed03a6b07 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Fri, 6 Nov 2026 14:24:58 +0000
+Subject: [PATCH 01/25] WIP: MT6750 k50v1 tablet stage-0 bring-up (dts with lk
+ overlay sink, ramcon, wdt pwrkey bypass)
+
+---
+ arch/arm64/boot/dts/mediatek/Makefile         |   2 +
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts | 206 ++++++++++++++++++
+ arch/arm64/kernel/head.S                      |  24 ++
+ arch/arm64/kernel/setup.c                     |   7 +
+ drivers/tty/serial/Kconfig                    |  14 ++
+ drivers/tty/serial/Makefile                   |   2 +-
+ drivers/tty/serial/earlycon-ram.c             | 153 +++++++++++++
+ drivers/watchdog/mtk_wdt.c                    |  13 ++
+ 8 files changed, 420 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+ create mode 100644 drivers/tty/serial/earlycon-ram.c
+
+diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
+index a86fb313b..dbfafbcf5 100644
+--- a/arch/arm64/boot/dts/mediatek/Makefile
++++ b/arch/arm64/boot/dts/mediatek/Makefile
+@@ -188,3 +188,5 @@ DTC_FLAGS_mt7988a-bananapi-bpi-r4-2g5 := -@
+ DTC_FLAGS_mt7988a-bananapi-bpi-r4-pro-4e := -@
+ DTC_FLAGS_mt7988a-bananapi-bpi-r4-pro-8x := -@
+ DTC_FLAGS_mt8395-radxa-nio-12l := -@
++dtb-$(CONFIG_ARCH_MEDIATEK) += mt6750-k50v1-tablet.dtb
++DTC_FLAGS_mt6750-k50v1-tablet := -@
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+new file mode 100644
+index 000000000..4f5522e23
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -0,0 +1,206 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * No-name MT6750 tablet ("Pad_6s_Pro", board k50v1_64), stage 0 bring-up.
++ *
++ * Bootloader (MTK lk) quirks, from the live DT of the stock kernel:
++ *  - lk patches /memory, /chosen (initrd, bootargs, atags) and adds
++ *    dynamically placed mblock-* children to /reserved-memory, so both
++ *    nodes must exist with #address-cells/#size-cells = 2.
++ *  - "bootopt=64S3,32N2,64N2" must be on the boot.img cmdline for a 64-bit
++ *    kernel; the real cmdline is CONFIG_CMDLINE (forced).
++ */
++
++/dts-v1/;
++
++#include "mt6755.dtsi"
++
++/ {
++	model = "MT6750 tablet k50v1";
++	compatible = "mediatek,k50v1-tablet", "mediatek,mt6755";
++
++	/* ATF of this era: PSCI 0.1 with explicit function IDs (as stock) */
++	psci {
++		compatible = "arm,psci";
++		method = "smc";
++		cpu_suspend = <0x84000001>;
++		cpu_off = <0x84000002>;
++		cpu_on = <0x84000003>;
++	};
++
++	aliases {
++		serial0 = &uart0;
++	};
++
++	chosen: chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* must exist, lk rewrites it */
++		bootargs = "";
++		stdout-path = &framebuffer0;
++
++		/* Display left running by lk; base/size from atag,videolfb (800x1280, 32bpp) */
++		framebuffer0: framebuffer@7f190000 {
++			compatible = "simple-framebuffer";
++			reg = <0x0 0x7f190000 0x0 0x3e8000>;
++			width = <800>;
++			height = <1280>;
++			stride = <(800 * 4)>;
++			format = "a8r8g8b8";
++		};
++	};
++
++	memory@40000000 {
++		device_type = "memory";
++		/* lk overwrites this with the real size (2 GiB) */
++		reg = <0x0 0x40000000 0x0 0x80000000>;
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		/* MTK ram_console (SRAM/DRAM boot log of preloader/lk) */
++		ram_console@44400000 {
++			reg = <0x0 0x44400000 0x0 0x10000>;
++			no-map;
++		};
++
++		/*
++		 * Inside the stock pstore region (which survives the BROM/DA readback);
++		 * the upper part is the bring-up entry marker + RAM console.
++		 */
++		ramoops@44410000 {
++			compatible = "ramoops";
++			reg = <0x0 0x44410000 0x0 0x70000>;
++			record-size = <0x1000>;
++			console-size = <0x40000>;
++			ftrace-size = <0x1000>;
++			pmsg-size = <0x10000>;
++		};
++
++		bringup-ramcon@44480000 {
++			reg = <0x0 0x44480000 0x0 0x20000>;
++			no-map;
++		};
++
++		minirdump@444f0000 {
++			reg = <0x0 0x444f0000 0x0 0x10000>;
++			no-map;
++		};
++
++		atf@44600000 {
++			reg = <0x0 0x44600000 0x0 0x40000>;
++			no-map;
++		};
++
++		preloader@44800000 {
++			reg = <0x0 0x44800000 0x0 0x100000>;
++			no-map;
++		};
++
++		lk@46000000 {
++			reg = <0x0 0x46000000 0x0 0x400000>;
++			no-map;
++		};
++
++		framebuffer@7f190000 {
++			reg = <0x0 0x7f190000 0x0 0xdb0000>;
++			no-map;
++		};
++
++		atf-log@7ff40000 {
++			reg = <0x0 0x7ff40000 0x0 0x40000>;
++			no-map;
++		};
++
++		log-store@7ff80000 {
++			reg = <0x0 0x7ff80000 0x0 0x80000>;
++			no-map;
++		};
++
++		/* modem / ccci, consys, spm placed by lk on the stock boot */
++		ccci@8e000000 {
++			reg = <0x0 0x8e000000 0x0 0xa000000>;
++			no-map;
++		};
++
++		ccci-share@98000000 {
++			reg = <0x0 0x98000000 0x0 0x20000>;
++			no-map;
++		};
++
++		consys@9fe00000 {
++			reg = <0x0 0x9fe00000 0x0 0x100000>;
++			no-map;
++		};
++
++		spm@9ffe0000 {
++			reg = <0x0 0x9ffe0000 0x0 0x20000>;
++			no-map;
++		};
++	};
++
++
++	/*
++	 * lk unconditionally applies the ODM overlay from the "odmdtbo"
++	 * partition (stock 3.18 DT fragments) and ASSERTs if any target label
++	 * is missing (needs __symbols__, i.e. dtc -@). Give every target a
++	 * parking node without "compatible" so nothing probes from it.
++	 */
++	lk-overlay-sink {
++		lcm: lcm { status = "disabled"; };
++		pio: pio { status = "disabled"; };
++		odm: odm { status = "disabled"; };
++		accdet: accdet { status = "disabled"; };
++		touch: touch { status = "disabled"; };
++		kd_camera_hw1: kd-camera-hw1 { status = "disabled"; };
++		mtkfb: mtkfb { status = "disabled"; };
++		consys: consys { status = "disabled"; };
++		sleep: sleep { status = "disabled"; };
++		audgpio: audgpio { status = "disabled"; };
++		apuart0: apuart0 { status = "disabled"; };
++		irtx_pwm: irtx-pwm { status = "disabled"; };
++		speaker_gpio: speaker-gpio { status = "disabled"; };
++		nfc: nfc { status = "disabled"; };
++		usb0: usb0 { status = "disabled"; };
++		xhci0: xhci0 { status = "disabled"; };
++		i2c1: i2c1 { status = "disabled"; };
++		ext_buck_vmd1: ext-buck-vmd1 { status = "disabled"; };
++		hall: hall { status = "disabled"; };
++		i2c0: i2c0 { status = "disabled"; };
++		i2c2: i2c2 { status = "disabled"; };
++		i2c3: i2c3 { status = "disabled"; };
++		i2c4: i2c4 { status = "disabled"; };
++		eintc: eintc { status = "disabled"; };
++		msdc1_ins: msdc1-ins { status = "disabled"; };
++		otg_iddig_1: otg-iddig-1 { status = "disabled"; };
++		dsi_te: dsi-te { status = "disabled"; };
++		gpio_usage_mapping: gpio-usage-mapping { status = "disabled"; };
++		mt_pmic_vcama_ldo_reg: mt-pmic-vcama-ldo-reg { status = "disabled"; };
++		mt_pmic_vsim1_ldo_reg: mt-pmic-vsim1-ldo-reg { status = "disabled"; };
++		mt_pmic_vsim2_ldo_reg: mt-pmic-vsim2-ldo-reg { status = "disabled"; };
++		mt_pmic_vldo28_ldo_reg: mt-pmic-vldo28-ldo-reg { status = "disabled"; };
++		mt_pmic_vibr_ldo_reg: mt-pmic-vibr-ldo-reg { status = "disabled"; };
++		mt_pmic_vcamd_ldo_reg: mt-pmic-vcamd-ldo-reg { status = "disabled"; };
++		mt_pmic_vcamio_ldo_reg: mt-pmic-vcamio-ldo-reg { status = "disabled"; };
++		auxadc: auxadc { status = "disabled"; };
++		rf_clock_buffer_ctrl: rf-clock-buffer-ctrl { status = "disabled"; };
++		pmic_clock_buffer_ctrl: pmic-clock-buffer-ctrl { status = "disabled"; };
++		keypad: keypad { status = "disabled"; };
++	};
++
++	watchdog@10007000 {
++		compatible = "mediatek,mt6589-wdt";
++		/* stock reboot = AUTO_RESTART|EXTEN, else the preloader powers off */
++		mediatek,restart-bypass-pwrkey;
++		reg = <0 0x10007000 0 0x100>;
++	};
++};
++
++&{/timer} {
++	/* CNTFRQ is not reliably programmed by this firmware (stock DT sets it) */
++	clock-frequency = <13000000>;
++};
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 87a822e5c..8549ccac3 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -83,6 +83,30 @@
+ 	 *  x21        primary_entry() .. start_kernel()        FDT pointer passed at boot in x0
+ 	 */
+ SYM_CODE_START(primary_entry)
++#ifdef CONFIG_SERIAL_EARLYCON_RAM_FORCE
++	/* bring-up: prove we were entered; store magic, CurrentEL, SCTLR, x0-x3 */
++	movz	x9, #(CONFIG_SERIAL_EARLYCON_RAM_HEAD & 0xffff)
++	movk	x9, #((CONFIG_SERIAL_EARLYCON_RAM_HEAD >> 16) & 0xffff), lsl #16
++	movz	x10, #0x4548
++	movk	x10, #0x4441, lsl #16		/* "HEAD" */
++	mrs	x11, CurrentEL
++	stp	x10, x11, [x9]
++	stp	x0, x1, [x9, #16]
++	stp	x2, x3, [x9, #32]
++	adr	x10, primary_entry
++	str	x10, [x9, #48]
++	cmp	x11, #CurrentEL_EL2
++	b.ne	1f
++	mrs	x10, sctlr_el2
++	b	2f
++1:	mrs	x10, sctlr_el1
++2:	str	x10, [x9, #56]
++	dsb	sy
++	dc	civac, x9
++	add	x10, x9, #32
++	dc	civac, x10
++	dsb	sy
++#endif
+ 	bl	record_mmu_state
+ 	bl	preserve_boot_args
+ 
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 29c6100f0..9d74db34a 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -288,6 +288,13 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 
+ 	early_fixmap_init();
+ 	early_ioremap_init();
++#ifdef CONFIG_SERIAL_EARLYCON_RAM_FORCE
++	{
++		extern void __init ramcon_force(phys_addr_t base, unsigned long size,
++						u64 fdt, const u64 *args);
++		ramcon_force(CONFIG_SERIAL_EARLYCON_RAM_BASE, SZ_64K, __fdt_pointer, boot_args);
++	}
++#endif
+ 
+ 	setup_machine_fdt(__fdt_pointer);
+ 
+diff --git a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
+index cf7dba473..1bffa8e60 100644
+--- a/drivers/tty/serial/Kconfig
++++ b/drivers/tty/serial/Kconfig
+@@ -73,6 +73,20 @@ config SERIAL_AMBA_PL011_CONSOLE
+ 	  your boot loader (lilo or loadlin) about how to pass options to the
+ 	  kernel at boot time.)
+ 
++config SERIAL_EARLYCON_RAM_FORCE
++	bool "Force RAM console from the start of setup_arch (bring-up hack)"
++	depends on ARM64 && SERIAL_EARLYCON
++
++config SERIAL_EARLYCON_RAM_BASE
++	hex "Physical base of the forced RAM console (64K)"
++	depends on SERIAL_EARLYCON_RAM_FORCE
++	default 0x44490000
++
++config SERIAL_EARLYCON_RAM_HEAD
++	hex "Physical address of the kernel-entry marker (64 bytes)"
++	depends on SERIAL_EARLYCON_RAM_FORCE
++	default 0x44480000
++
+ config SERIAL_EARLYCON_SEMIHOST
+ 	bool "Early console using Arm compatible semihosting"
+ 	depends on ARM64 || ARM || RISCV
+diff --git a/drivers/tty/serial/Makefile b/drivers/tty/serial/Makefile
+index bba7b21a4..478aa7996 100644
+--- a/drivers/tty/serial/Makefile
++++ b/drivers/tty/serial/Makefile
+@@ -6,7 +6,7 @@
+ obj-$(CONFIG_SERIAL_CORE) += serial_base.o
+ serial_base-y := serial_core.o serial_base_bus.o serial_ctrl.o serial_port.o
+ 
+-obj-$(CONFIG_SERIAL_EARLYCON) += earlycon.o
++obj-$(CONFIG_SERIAL_EARLYCON) += earlycon.o earlycon-ram.o
+ obj-$(CONFIG_SERIAL_EARLYCON_SEMIHOST) += earlycon-semihost.o
+ obj-$(CONFIG_SERIAL_EARLYCON_RISCV_SBI) += earlycon-riscv-sbi.o
+ 
+diff --git a/drivers/tty/serial/earlycon-ram.c b/drivers/tty/serial/earlycon-ram.c
+new file mode 100644
+index 000000000..5c3dfe0e0
+--- /dev/null
++++ b/drivers/tty/serial/earlycon-ram.c
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * "ramcon" earlycon: writes the kernel log into a DRAM buffer mapped as
++ * device (uncached) memory, so it survives a watchdog reset that drops
++ * dirty cache lines. For bring-up of boards without a reachable UART;
++ * read it back from the boot ROM / DA (e.g. mtkclient "da peek").
++ *
++ *   earlycon=ramcon,<phys>[,<size>]   (size defaults to 64K)
++ *
++ * Layout: u32 magic 'RCON', u32 write offset (into data), u32 data size,
++ * u32 wrap count, then data (ring buffer).
++ */
++#include <linux/console.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/serial_core.h>
++#include <linux/string.h>
++#include <asm/early_ioremap.h>
++
++#define RAMCON_MAGIC	0x4e4f4352	/* "RCON" */
++#define RAMCON_HDR	16
++
++static void __iomem *ramcon_base;
++static phys_addr_t ramcon_phys;
++static u32 ramcon_size, ramcon_pos, ramcon_wraps;
++static bool ramcon_forced;
++
++static void ramcon_write(struct console *con, const char *s, unsigned int n)
++{
++	void __iomem *base = READ_ONCE(ramcon_base);
++
++	if (!base)
++		return;
++	while (n--) {
++		writeb_relaxed(*s++, base + RAMCON_HDR + ramcon_pos);
++		if (++ramcon_pos >= ramcon_size) {
++			ramcon_pos = 0;
++			ramcon_wraps++;
++			writel_relaxed(ramcon_wraps, base + 12);
++		}
++	}
++	writel(ramcon_pos, base + 4);
++}
++
++static int __init ramcon_setup(struct earlycon_device *dev, const char *opt)
++{
++	unsigned long size = SZ_64K;
++	char *p;
++
++	ramcon_phys = dev->port.mapbase;
++	if (!ramcon_phys)
++		return -ENODEV;
++	/* option after the address: "<size>" (lands in dev->options) */
++	if (dev->options[0]) {
++		size = simple_strtoul(dev->options, &p, 0);
++		if (size < SZ_4K)
++			size = SZ_64K;
++	}
++	ramcon_size = size - RAMCON_HDR;
++	ramcon_base = early_ioremap(ramcon_phys, size);
++	if (!ramcon_base)
++		return -ENOMEM;
++	ramcon_pos = 0;
++	ramcon_wraps = 0;
++	writel_relaxed(RAMCON_MAGIC, ramcon_base);
++	writel_relaxed(0, ramcon_base + 4);
++	writel_relaxed(ramcon_size, ramcon_base + 8);
++	writel_relaxed(0, ramcon_base + 12);
++	dev->con->write = ramcon_write;
++	return 0;
++}
++EARLYCON_DECLARE(ramcon, ramcon_setup);
++
++static struct console ramcon_console = {
++	.name	= "ramcon",
++	.write	= ramcon_write,
++	.flags	= CON_PRINTBUFFER | CON_BOOT | CON_ANYTIME,
++	.index	= -1,
++};
++
++/*
++ * Forced variant, called from setup_arch() before the FDT is parsed.
++ * Extra header words after the ring header (offsets 16..63 of the region,
++ * ring data then starts at 64): fdt pointer, boot_args[0..3], marker.
++ */
++void __init ramcon_force(phys_addr_t base, unsigned long size, u64 fdt, const u64 *args)
++{
++	void __iomem *b = early_ioremap(base, size);
++	int i;
++
++	if (!b)
++		return;
++	writeq_relaxed(0x2152454b52414d4dULL, b + 16);	/* "MMARKER!" */
++	writeq_relaxed(fdt, b + 24);
++	for (i = 0; i < 4; i++)
++		writeq_relaxed(args[i], b + 32 + 8 * i);
++	ramcon_phys = base + 64;
++	ramcon_size = size - 64 - RAMCON_HDR;
++	ramcon_base = b + 64;
++	ramcon_pos = 0;
++	ramcon_wraps = 0;
++	writel_relaxed(RAMCON_MAGIC, b);
++	writel_relaxed(ramcon_size, b + 8);
++	/* ring header lives at b+64 as well, keep both views consistent */
++	writel_relaxed(RAMCON_MAGIC, ramcon_base);
++	writel_relaxed(0, ramcon_base + 4);
++	writel_relaxed(ramcon_size, ramcon_base + 8);
++	writel_relaxed(0, ramcon_base + 12);
++	ramcon_forced = true;
++	register_console(&ramcon_console);
++
++#ifdef CONFIG_ARCH_MEDIATEK
++	/*
++	 * Bring-up: MT6755 preloader powers off after a watchdog reset unless
++	 * AUTO_RESTART ("bypass power key") is set in TOPRGU WDT_MODE. Set it
++	 * (plus EXTEN) right away so a hang that ends in a WDT timeout comes
++	 * back as a reboot instead of a power-off. Keeps EN/timeout as lk set.
++	 */
++	{
++		void __iomem *wdt = early_ioremap(0x10007000, 0x100);
++
++		if (wdt) {
++			u32 mode = readl(wdt);
++
++			writel((mode & 0xff) | 0x14 | 0x22000000, wdt);
++			writel_relaxed(mode, b + 4);
++			writel_relaxed(readl(wdt), b + 12);
++			early_iounmap(wdt, 0x100);
++		}
++	}
++#endif
++	pr_info("ramcon: forced at %pa, fdt=%llx x1..x3=%llx %llx %llx\n",
++		&base, fdt, args[1], args[2], args[3]);
++}
++
++/* swap the early_ioremap slot for a permanent device mapping */
++static int __init ramcon_remap(void)
++{
++	void __iomem *early = ramcon_base, *late;
++
++	if (!early)
++		return 0;
++	late = ioremap(ramcon_phys, ramcon_size + RAMCON_HDR);
++	if (!late)
++		return 0;
++	WRITE_ONCE(ramcon_base, late);
++	if (!ramcon_forced)
++		early_iounmap(early, ramcon_size + RAMCON_HDR);
++	pr_info("ramcon: log at %pa (+%u)\n", &ramcon_phys, ramcon_size);
++	return 0;
++}
++early_initcall(ramcon_remap);
+diff --git a/drivers/watchdog/mtk_wdt.c b/drivers/watchdog/mtk_wdt.c
+index d9c30e4c8..16020bd67 100644
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -75,6 +75,7 @@ struct mtk_wdt_dev {
+ 	spinlock_t lock; /* protects WDT_SWSYSRST reg */
+ 	struct reset_controller_dev rcdev;
+ 	bool disable_wdt_extrst;
++	bool restart_bypass_pwrkey;
+ 	bool reset_by_toprgu;
+ 	bool has_swsysrst_en;
+ };
+@@ -237,7 +238,17 @@ static int mtk_wdt_restart(struct watchdog_device *wdt_dev,
+ 	/* Enable reset in order to issue a system reset instead of an IRQ */
+ 	reg = readl(wdt_base + WDT_MODE);
+ 	reg &= ~WDT_MODE_IRQ_EN;
++	if (mtk_wdt->restart_bypass_pwrkey) {
++		/*
++		 * Older MediaTek preloaders (e.g. MT6755) treat AUTO_START as
++		 * "bypass power key": without it a SW reset ends in power-off.
++		 * Mirror the vendor kernel's wdt_arch_reset(1).
++		 */
++		reg &= ~(WDT_MODE_EN | WDT_MODE_DUAL_EN);
++		reg |= WDT_MODE_AUTO_START | WDT_MODE_EXRST_EN;
++	}
+ 	writel(reg | WDT_MODE_KEY, wdt_base + WDT_MODE);
++	udelay(100);
+ 
+ 	while (1) {
+ 		writel(WDT_SWRST_KEY, wdt_base + WDT_SWRST);
+@@ -462,6 +473,8 @@ static int mtk_wdt_probe(struct platform_device *pdev)
+ 
+ 	mtk_wdt->disable_wdt_extrst =
+ 		of_property_read_bool(dev->of_node, "mediatek,disable-extrst");
++	mtk_wdt->restart_bypass_pwrkey =
++		of_property_read_bool(dev->of_node, "mediatek,restart-bypass-pwrkey");
+ 
+ 	mtk_wdt->reset_by_toprgu =
+ 		of_property_read_bool(dev->of_node, "mediatek,reset-by-toprgu");
+-- 
+2.53.0
+

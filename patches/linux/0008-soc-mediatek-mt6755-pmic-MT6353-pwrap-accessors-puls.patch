@@ -1,0 +1,413 @@
+From 50c51448f8178acd8bc8834961e9a9b4c201f65b Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sat, 7 Nov 2026 22:11:58 +0000
+Subject: [PATCH 08/25] soc: mediatek: mt6755-pmic: MT6353 pwrap accessors,
+ pulse charger, AUXADC battery readout; dts: CONSYS/BTIF/WiFi nodes
+
+- mt6755_pmic_read/write/rmw (WACS2, mutex-serialized), exported for the connsys modules
+- charger: CHR_EN + 2 s WDT kick, CS_VTH 450 mA; sysfs /sys/kernel/mt6755_pmic
+- dts: consys reserved memory (1 MB), btif/apdma, consys@18070000, wifi@180f0000
+---
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts |  52 +++
+ drivers/soc/mediatek/Makefile                 |   2 +-
+ drivers/soc/mediatek/mt6755-pmic.c            | 308 ++++++++++++++++++
+ 3 files changed, 361 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/soc/mediatek/mt6755-pmic.c
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index cae08698a..910ccb2da 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -110,6 +110,15 @@ lk@46000000 {
+ 			no-map;
+ 		};
+ 
++		/* CONSYS (WiFi/BT/GPS) shared memory, dynamically placed as in stock */
++		consys_mem: consys-reserve-memory {
++			compatible = "mediatek,consys-reserve-memory";
++			no-map;
++			size = <0 0x100000>;
++			alignment = <0 0x200000>;
++			alloc-ranges = <0 0x40000000 0 0x60000000>;
++		};
++
+ 
+ 
+ 
+@@ -285,6 +294,49 @@ ssusb: usb@11271000 {
+ 		ranges;
+ 	};
+ 
++	/*
++	 * Connectivity (out-of-tree modules in mainline/connsys): BTIF + APDMA
++	 * channels, CONSYS (WMT), WiFi AHB window. Clock gates are on from boot
++	 * (INFRA_BTIF / INFRA_AP_DMA), so a fixed clock stands in for them.
++	 */
++	btif@1100c000 {
++		compatible = "mediatek,btif";
++		reg = <0 0x1100c000 0 0x1000>;
++		interrupts = <GIC_SPI 112 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&clk26m_ref>, <&clk26m_ref>;
++		clock-names = "btifc", "apdmac";
++	};
++
++	btif_tx@11000780 {
++		compatible = "mediatek,btif_tx";
++		reg = <0 0x11000780 0 0x80>;
++		interrupts = <GIC_SPI 111 IRQ_TYPE_LEVEL_LOW>;
++	};
++
++	btif_rx@11000800 {
++		compatible = "mediatek,btif_rx";
++		reg = <0 0x11000800 0 0x80>;
++		interrupts = <GIC_SPI 116 IRQ_TYPE_LEVEL_LOW>;
++	};
++
++	consys@18070000 {
++		compatible = "mediatek,mt6755-consys";
++		/* CONN MCU cfg, TOPRGU, TOPCKGEN+INFRACFG_AO, SPM */
++		reg = <0 0x18070000 0 0x200>, <0 0x10007000 0 0x100>,
++		      <0 0x10000000 0 0x2000>, <0 0x10006000 0 0x1000>;
++		interrupts = <GIC_SPI 237 IRQ_TYPE_LEVEL_LOW>,	/* BGF wakeup */
++			     <GIC_SPI 239 IRQ_TYPE_LEVEL_LOW>;	/* CONN WDT */
++		memory-region = <&consys_mem>;
++	};
++
++	wifi@180f0000 {
++		compatible = "mediatek,wifi";
++		reg = <0 0x180f0000 0 0x5c>;
++		interrupts = <GIC_SPI 238 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&clk26m_ref>;
++		clock-names = "wifi-dma";
++	};
++
+ 	watchdog@10007000 {
+ 		compatible = "mediatek,mt6589-wdt";
+ 		/* stock reboot = AUTO_RESTART|EXTEN, else the preloader powers off */
+diff --git a/drivers/soc/mediatek/Makefile b/drivers/soc/mediatek/Makefile
+index bb1fbb3d1..dc260551e 100644
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -9,4 +9,4 @@ obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
+ obj-$(CONFIG_MTK_SVS) += mtk-svs.o
+ obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
+-obj-$(CONFIG_ARCH_MEDIATEK) += mt6755-bringup.o
++obj-$(CONFIG_ARCH_MEDIATEK) += mt6755-bringup.o mt6755-pmic.o
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+new file mode 100644
+index 000000000..55dfaea61
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -0,0 +1,308 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6755/MT6750 + MT6353 PMIC bring-up helpers (k50v1 tablet), until the
++ * proper pwrap/MFD/regulator/charger drivers exist for this pair:
++ *
++ *  - mt6755_pmic_read()/mt6755_pmic_write()/mt6755_pmic_rmw(): serialised
++ *    access to the PMIC through the PMIC wrapper's WACS2 channel (already
++ *    initialised by the preloader). Every kernel user of the PMIC must go
++ *    through these, so that writes can never interleave.
++ *  - MT6353 pulse charger keep-alive (stock charging_hw_pmic.c sequence):
++ *    hw_init once, then every 2 s kick the 4 s charger watchdog and re-enable
++ *    CHR_EN if the hardware dropped it. Charge voltage is left at the PMIC
++ *    reset default (4.2 V for this trim), current is 450 mA (USB). The PMIC's
++ *    own VBAT over-voltage cut (4.3 V) and BATON check stay enabled.
++ *  - /sys/kernel/mt6755_pmic/{battery_mv,charge_ma,charging}: AUXADC readout
++ *    (BATSNS/ISENSE, 56 mOhm sense resistor).
++ */
++#include <linux/delay.h>
++#include <linux/export.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/kobject.h>
++#include <linux/moduleparam.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/printk.h>
++#include <linux/sysfs.h>
++#include <linux/workqueue.h>
++
++#define PWRAP_BASE		0x1000D000
++#define PWRAP_WACS2_CMD		0xA0
++#define PWRAP_WACS2_RDATA	0xA4
++#define PWRAP_WACS2_VLDCLR	0xA8
++#define WACS_FSM(x)		(((x) >> 16) & 7)
++#define WACS_FSM_IDLE		0
++#define WACS_FSM_WFVLDCLR	6
++
++static void __iomem *pwrap;
++static DEFINE_MUTEX(pmic_lock);
++
++static int pwrap_wait(u32 want, u32 *rdata)
++{
++	u32 v;
++
++	for (int i = 0; i < 100000; i++) {
++		v = readl(pwrap + PWRAP_WACS2_RDATA);
++		if (WACS_FSM(v) == want) {
++			if (rdata)
++				*rdata = v;
++			return 0;
++		}
++		cpu_relax();
++	}
++	return -ETIMEDOUT;
++}
++
++static int __pmic_read(u16 adr, u16 *val)
++{
++	u32 v;
++
++	if (pwrap_wait(WACS_FSM_IDLE, NULL))
++		return -ETIMEDOUT;
++	writel((u32)(adr >> 1) << 16, pwrap + PWRAP_WACS2_CMD);
++	if (pwrap_wait(WACS_FSM_WFVLDCLR, &v))
++		return -ETIMEDOUT;
++	*val = v & 0xffff;
++	writel(1, pwrap + PWRAP_WACS2_VLDCLR);
++	return 0;
++}
++
++static int __pmic_write(u16 adr, u16 val)
++{
++	if (pwrap_wait(WACS_FSM_IDLE, NULL))
++		return -ETIMEDOUT;
++	writel(BIT(31) | ((u32)(adr >> 1) << 16) | val, pwrap + PWRAP_WACS2_CMD);
++	return pwrap_wait(WACS_FSM_IDLE, NULL);
++}
++
++int mt6755_pmic_read(u16 adr, u16 *val)
++{
++	int ret;
++
++	if (!pwrap)
++		return -ENODEV;
++	mutex_lock(&pmic_lock);
++	ret = __pmic_read(adr, val);
++	mutex_unlock(&pmic_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt6755_pmic_read);
++
++int mt6755_pmic_write(u16 adr, u16 val)
++{
++	int ret;
++
++	if (!pwrap)
++		return -ENODEV;
++	mutex_lock(&pmic_lock);
++	ret = __pmic_write(adr, val);
++	mutex_unlock(&pmic_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt6755_pmic_write);
++
++/* read-modify-write of (mask << shift) */
++int mt6755_pmic_rmw(u16 adr, u16 mask, int shift, u16 val)
++{
++	u16 old;
++	int ret;
++
++	if (!pwrap)
++		return -ENODEV;
++	mutex_lock(&pmic_lock);
++	ret = __pmic_read(adr, &old);
++	if (!ret)
++		ret = __pmic_write(adr, (old & ~(mask << shift)) | ((val & mask) << shift));
++	mutex_unlock(&pmic_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt6755_pmic_rmw);
++
++/* ---------------- MT6353 charger ---------------- */
++#define CHR_CON0	0x0F8C	/* b0 VCDT_HV_EN, b3 CSDAC_EN, b4 CHR_EN, b5 RGS_CHRDET */
++#define CHR_CON2	0x0F90	/* b1 VBAT_CV_EN, b3 CS_EN */
++#define CHR_CON4	0x0F94	/* [3:0] CS_VTH */
++#define CHR_CON6	0x0F98	/* b0 VBAT_OV_EN, [4:2] VBAT_OV_VTH */
++#define CHR_CON7	0x0F9A	/* b0 BATON_EN */
++#define CHR_CON10	0x0FA0	/* b4 PCHR_FLAG_EN */
++#define CHR_CON13	0x0FA6	/* [3:0] CHRWDT_TD, b4 CHRWDT_EN, b8 CHRWDT_WR */
++#define CHR_CON15	0x0FAA	/* b0 CHRWDT_INT_EN, b1 CHRWDT_FLAG_WR */
++#define CHR_CON16	0x0FAC	/* b2 USBDL_RST, b3 USBDL_SET */
++#define CHR_CON20	0x0FB4	/* b0 BC11_BB_CTRL, b1 BC11_RST */
++#define CHR_CON22	0x0FB8	/* [2:0] CSDAC_STP_INC, [6:4] CSDAC_STP_DEC */
++#define CHR_CON23	0x0FBA	/* [2:0] CSDAC_DLY, [6:4] CSDAC_STP */
++#define CHR_CON24	0x0FBC	/* [5:0] LOW_ICH_DB */
++#define CHR_CON25	0x0FBE	/* b1 VCDT_MODE, b2 CSDAC_MODE, b6 HWCV_EN, b7 ULC_DET_EN */
++#define CS_VTH_450MA	12
++
++static bool charger = true;
++module_param(charger, bool, 0644);
++MODULE_PARM_DESC(charger, "keep the MT6353 charger enabled (default on)");
++
++static struct delayed_work chr_work;
++static bool chr_present;
++
++static void chr_hw_init(void)
++{
++	mt6755_pmic_rmw(CHR_CON13, 0xF, 0, 0);	/* CHRWDT_TD = 4 s */
++	mt6755_pmic_rmw(CHR_CON15, 1, 0, 1);	/* CHRWDT_INT_EN */
++	mt6755_pmic_rmw(CHR_CON13, 1, 4, 1);	/* CHRWDT_EN */
++	mt6755_pmic_rmw(CHR_CON13, 1, 8, 1);	/* CHRWDT_WR */
++	mt6755_pmic_rmw(CHR_CON25, 1, 1, 0);	/* VCDT_MODE */
++	mt6755_pmic_rmw(CHR_CON0, 1, 0, 1);	/* VCDT_HV_EN */
++	mt6755_pmic_rmw(CHR_CON16, 1, 3, 0);	/* USBDL_SET = 0 */
++	mt6755_pmic_rmw(CHR_CON16, 1, 2, 1);	/* USBDL_RST */
++	mt6755_pmic_rmw(CHR_CON20, 1, 0, 1);	/* BC11_BB_CTRL */
++	mt6755_pmic_rmw(CHR_CON20, 1, 1, 1);	/* BC11_RST */
++	mt6755_pmic_rmw(CHR_CON25, 1, 2, 1);	/* CSDAC_MODE */
++	mt6755_pmic_rmw(CHR_CON6, 1, 0, 1);	/* VBAT_OV_EN */
++	mt6755_pmic_rmw(CHR_CON6, 7, 2, 2);	/* VBAT_OV_VTH = 4.3 V */
++	mt6755_pmic_rmw(CHR_CON7, 1, 0, 1);	/* BATON_EN */
++	mt6755_pmic_rmw(CHR_CON25, 1, 7, 1);	/* ULC_DET_EN */
++	mt6755_pmic_rmw(CHR_CON24, 0x3F, 0, 1);	/* LOW_ICH_DB */
++}
++
++static void chr_kick(void)
++{
++	mt6755_pmic_rmw(CHR_CON13, 0xF, 0, 0);
++	mt6755_pmic_rmw(CHR_CON13, 1, 8, 1);	/* CHRWDT_WR */
++	mt6755_pmic_rmw(CHR_CON15, 1, 0, 1);
++	mt6755_pmic_rmw(CHR_CON13, 1, 4, 1);
++	mt6755_pmic_rmw(CHR_CON15, 1, 1, 1);	/* CHRWDT_FLAG_WR */
++}
++
++static void chr_enable(void)
++{
++	mt6755_pmic_rmw(CHR_CON4, 0xF, 0, CS_VTH_450MA);
++	mt6755_pmic_rmw(CHR_CON23, 7, 0, 4);	/* CSDAC_DLY */
++	mt6755_pmic_rmw(CHR_CON23, 7, 4, 1);	/* CSDAC_STP */
++	mt6755_pmic_rmw(CHR_CON22, 7, 0, 1);	/* CSDAC_STP_INC */
++	mt6755_pmic_rmw(CHR_CON22, 7, 4, 2);	/* CSDAC_STP_DEC */
++	mt6755_pmic_rmw(CHR_CON2, 1, 3, 1);	/* CS_EN */
++	mt6755_pmic_rmw(CHR_CON25, 1, 6, 1);	/* HWCV_EN */
++	mt6755_pmic_rmw(CHR_CON2, 1, 1, 1);	/* VBAT_CV_EN */
++	mt6755_pmic_rmw(CHR_CON0, 1, 3, 1);	/* CSDAC_EN */
++	mt6755_pmic_rmw(CHR_CON10, 1, 4, 1);	/* PCHR_FLAG_EN */
++	mt6755_pmic_rmw(CHR_CON0, 1, 4, 1);	/* CHR_EN */
++	mt6755_pmic_rmw(CHR_CON25, 1, 2, 1);	/* CSDAC_MODE */
++	mt6755_pmic_rmw(CHR_CON0, 1, 3, 1);	/* CSDAC_EN */
++}
++
++static void chr_work_fn(struct work_struct *w)
++{
++	u16 c0;
++
++	if (!charger || mt6755_pmic_read(CHR_CON0, &c0))
++		goto out;
++	if (c0 & BIT(5)) {			/* charger present */
++		if (!chr_present) {
++			chr_kick();		/* an expired charger WDT blocks CHR_EN */
++			chr_enable();
++			pr_info("mt6755-pmic: charger plugged, charging enabled\n");
++		}
++		chr_kick();
++		if (!(c0 & BIT(4)))
++			chr_enable();
++	} else if (chr_present) {
++		pr_info("mt6755-pmic: charger removed\n");
++	}
++	chr_present = !!(c0 & BIT(5));
++out:
++	queue_delayed_work(system_freezable_wq, &chr_work, 2 * HZ);
++}
++
++/* ---------------- AUXADC battery readout ---------------- */
++#define CLK_CKPDN_CON0_CLR	0x0272
++#define AUXADC_CON0		0x0EA4
++#define AUXADC_RQST0_SET	0x0E9A
++#define AUXADC_ADC23		0x0E2E	/* ch0 BATSNS: b15 rdy, [14:0] */
++#define AUXADC_ADC25		0x0E32	/* ch1 ISENSE */
++#define R_SENSE_MOHM		56
++
++static int auxadc_mv(u16 reg, int *mv)
++{
++	u16 v;
++
++	for (int i = 0; i < 100; i++) {
++		if (mt6755_pmic_read(reg, &v))
++			return -EIO;
++		if (v & 0x8000) {
++			*mv = (int)(v & 0x7fff) * 3 * 1800 / 32768;
++			return 0;
++		}
++		usleep_range(100, 200);
++	}
++	return -ETIMEDOUT;
++}
++
++static int battery_read(int *vbat, int *ichg)
++{
++	int isense, ret;
++
++	mt6755_pmic_write(CLK_CKPDN_CON0_CLR, BIT(11));
++	mt6755_pmic_rmw(AUXADC_CON0, 1, 15, 1);
++	mt6755_pmic_write(AUXADC_RQST0_SET, 0x3);
++	usleep_range(1000, 1500);
++	ret = auxadc_mv(AUXADC_ADC23, vbat);
++	if (!ret)
++		ret = auxadc_mv(AUXADC_ADC25, &isense);
++	if (!ret)
++		*ichg = (isense - *vbat) * 1000 / R_SENSE_MOHM;
++	return ret;
++}
++
++static ssize_t battery_mv_show(struct kobject *k, struct kobj_attribute *a, char *buf)
++{
++	int v, i;
++
++	return battery_read(&v, &i) ? -EIO : sysfs_emit(buf, "%d\n", v);
++}
++
++static ssize_t charge_ma_show(struct kobject *k, struct kobj_attribute *a, char *buf)
++{
++	int v, i;
++
++	return battery_read(&v, &i) ? -EIO : sysfs_emit(buf, "%d\n", i);
++}
++
++static ssize_t charging_show(struct kobject *k, struct kobj_attribute *a, char *buf)
++{
++	u16 c0;
++
++	if (mt6755_pmic_read(CHR_CON0, &c0))
++		return -EIO;
++	return sysfs_emit(buf, "chrdet=%d chr_en=%d\n", !!(c0 & BIT(5)), !!(c0 & BIT(4)));
++}
++
++static struct kobj_attribute battery_mv_attr = __ATTR_RO(battery_mv);
++static struct kobj_attribute charge_ma_attr = __ATTR_RO(charge_ma);
++static struct kobj_attribute charging_attr = __ATTR_RO(charging);
++static struct attribute *pmic_attrs[] = {
++	&battery_mv_attr.attr, &charge_ma_attr.attr, &charging_attr.attr, NULL,
++};
++static const struct attribute_group pmic_group = { .attrs = pmic_attrs };
++
++static int __init mt6755_pmic_init(void)
++{
++	struct kobject *kobj;
++	int vbat, ichg;
++
++	if (!of_machine_is_compatible("mediatek,k50v1-tablet"))
++		return 0;
++	pwrap = ioremap(PWRAP_BASE, 0x1000);
++	if (!pwrap)
++		return -ENOMEM;
++
++	kobj = kobject_create_and_add("mt6755_pmic", kernel_kobj);
++	if (kobj && sysfs_create_group(kobj, &pmic_group))
++		pr_warn("mt6755-pmic: sysfs group failed\n");
++
++	if (!battery_read(&vbat, &ichg))
++		pr_info("mt6755-pmic: battery %d mV, charge current %d mA\n", vbat, ichg);
++	chr_hw_init();
++	INIT_DELAYED_WORK(&chr_work, chr_work_fn);
++	queue_delayed_work(system_freezable_wq, &chr_work, 0);
++	return 0;
++}
++subsys_initcall(mt6755_pmic_init);
+-- 
+2.53.0
+

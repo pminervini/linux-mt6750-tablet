@@ -1,0 +1,44 @@
+From 5773c51bb12588c14cfd533ab19a99d2568164c8 Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Mon, 2 Jan 2023 08:24:30 +0400
+Subject: [PATCH] watchdog: mediatek: mt6755: add wdt support
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ drivers/watchdog/mtk_wdt.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/watchdog/mtk_wdt.c b/drivers/watchdog/mtk_wdt.c
+index 3e6212591e69..01f3f44ec253 100644
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <dt-bindings/reset/mt2712-resets.h>
++#include <dt-bindings/reset/mt6755-resets.h>
+ #include <dt-bindings/reset/mediatek,mt6795-resets.h>
+ #include <dt-bindings/reset/mt7986-resets.h>
+ #include <dt-bindings/reset/mt8183-resets.h>
+@@ -108,6 +109,10 @@ static const struct mtk_wdt_data mt8195_data = {
+ 	.toprgu_sw_rst_num = MT8195_TOPRGU_SW_RST_NUM,
+ };
+ 
++static const struct mtk_wdt_data mt6755_data = {
++	.toprgu_sw_rst_num = MT6755_TOPRGU_SW_RST_NUM,
++};
++
+ static int toprgu_reset_update(struct reset_controller_dev *rcdev,
+ 			       unsigned long id, bool assert)
+ {
+@@ -436,6 +441,7 @@ static int mtk_wdt_resume(struct device *dev)
+ static const struct of_device_id mtk_wdt_dt_ids[] = {
+ 	{ .compatible = "mediatek,mt2712-wdt", .data = &mt2712_data },
+ 	{ .compatible = "mediatek,mt6589-wdt" },
++	{ .compatible = "mediatek,mt6755-wdt", .data = &mt6755_data },
+ 	{ .compatible = "mediatek,mt6795-wdt", .data = &mt6795_data },
+ 	{ .compatible = "mediatek,mt7986-wdt", .data = &mt7986_data },
+ 	{ .compatible = "mediatek,mt8183-wdt", .data = &mt8183_data },
+-- 
+GitLab
+

@@ -1,0 +1,22 @@
+#!/bin/sh
+# tablet-bcb [get | set <command>] — bootloader-message command field (offset 0 of "para").
+# lk boots `recovery` (= mainline Debian) when it reads "boot-recovery" (persistent) or when the
+# one-shot RTC flag /sys/kernel/mt6755_pmic/boot_recovery is set (lk clears it; mainline re-arms
+# it once healthy, see mainline-default.service). The BCB only carries Android -> mainline:
+#   android-once     -> written by tablet-android; Android re-arms "boot-recovery" when up
+#   boot-recovery    -> next power-on: mainline; the mainline initramfs consumes it
+#   mainline-trying  -> consumed marker, ignored by lk
+set -e
+P=/dev/disk/by-partlabel/para
+[ -b $P ] || P=/dev/$(basename $(dirname $(grep -l "PARTNAME=para$" /sys/class/block/mmcblk0p*/uevent | head -1)))
+case "${1:-get}" in
+  get) dd if=$P bs=32 count=1 status=none | tr -d '\000'; echo ;;
+  set)
+    c=${2:?command}; [ ${#c} -lt 32 ] || { echo "too long" >&2; exit 2; }
+    ro=$(blockdev --getro $P)
+    blockdev --setrw $P
+    { printf '%s' "$c"; head -c $((32 - ${#c})) /dev/zero; } | dd of=$P bs=32 count=1 iflag=fullblock conv=notrunc,fsync status=none
+    [ "$ro" = 1 ] && blockdev --setro $P
+    echo "BCB: $(dd if=$P bs=32 count=1 status=none | tr -d '\000')" ;;
+  *) echo "usage: tablet-bcb [get | set <command>]" >&2; exit 2 ;;
+esac

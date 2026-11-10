@@ -1,0 +1,704 @@
+From abfcc162150c8d66f779d3cbcd0988c5dba32c0e Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sat, 7 Nov 2026 23:02:34 +0000
+Subject: [PATCH 09/25] soc: mediatek: mt6755-pmic: safe charging,
+ power_supply, RTC, boot-recovery flag, power-off; dts: DISP_PWM backlight
+
+- charge control: battery NTC (AUXADC ch3, 16.9k pull-up, 10k NTC), charge only 0..45 C
+  (resume 3..42 C), NTC open/short = no charging, full detection (>=4.15 V and <100 mA for
+  60 s, recharge <4.10 V), software VBAT cap 4.25 V; orderly power-off below 3.45 V
+- power_supply 'battery' (status/health/V/I/temp/capacity from the tablet's stock 25 C OCV
+  profile) and 'usb'
+- RTC class device for the MT6353 RTC (PMIC 0x4000, year base 1968), hctosys/systohc
+- /sys/kernel/mt6755_pmic/boot_recovery: RTC_PDN1 FAC_RESET, lk's one-shot recovery flag
+- pm power-off: RTC BBPU pwrdown as stock mt_power_off(), restart if a charger keeps us up
+- dts: DISP_PWM (mt8173-compatible) + pwm-backlight, 26 MHz stand-in clock reproduces lk's
+  clk_div 0 / period 1023
+---
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts |  22 +
+ drivers/soc/mediatek/mt6755-pmic.c            | 561 +++++++++++++++++-
+ 2 files changed, 556 insertions(+), 27 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index 910ccb2da..60e97e07f 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -294,6 +294,28 @@ ssusb: usb@11271000 {
+ 		ranges;
+ 	};
+ 
++	/*
++	 * LCD backlight: DISP_PWM (stock led_mode 5, CUST_BLS_PWM). lk leaves it
++	 * enabled at clk_div 0 / period 1023; with the 26 MHz stand-in clock a
++	 * 39385 ns period reproduces exactly those register values, so the
++	 * backlight driver IC sees the same PWM frequency as under stock.
++	 */
++	disp_pwm: pwm@1100e000 {
++		compatible = "mediatek,mt6595-disp-pwm";
++		reg = <0 0x1100e000 0 0x1000>;
++		#pwm-cells = <2>;
++		clocks = <&clk26m_ref>, <&clk26m_ref>;
++		clock-names = "main", "mm";
++	};
++
++	backlight: backlight {
++		compatible = "pwm-backlight";
++		pwms = <&disp_pwm 0 39385>;
++		brightness-levels = <0 1023>;
++		num-interpolated-steps = <1023>;
++		default-brightness-level = <300>;
++	};
++
+ 	/*
+ 	 * Connectivity (out-of-tree modules in mainline/connsys): BTIF + APDMA
+ 	 * channels, CONSYS (WMT), WiFi AHB window. Clock gates are on from boot
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index 55dfaea61..ccfd84d38 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -12,8 +12,21 @@
+  *    CHR_EN if the hardware dropped it. Charge voltage is left at the PMIC
+  *    reset default (4.2 V for this trim), current is 450 mA (USB). The PMIC's
+  *    own VBAT over-voltage cut (4.3 V) and BATON check stay enabled.
+- *  - /sys/kernel/mt6755_pmic/{battery_mv,charge_ma,charging}: AUXADC readout
+- *    (BATSNS/ISENSE, 56 mOhm sense resistor).
++ *  - /sys/kernel/mt6755_pmic/{battery_mv,charge_ma,charging,state}: AUXADC
++ *    readout (BATSNS/ISENSE, 56 mOhm sense resistor).
++ *  - charge control (sampled every 2 s): battery NTC on AUXADC ch3 (BATON,
++ *    16.9k pull-up to 1.8 V, 10k NTC, stock table), charging only inside
++ *    0..45 C (resume 3..42 C), stop when full (>= 4.15 V and < 100 mA taper
++ *    for 60 s, recharge below 4.10 V), software VBAT cap 4.25 V, NTC open/
++ *    short = no charging. Orderly power-off below 3.45 V when not charging.
++ *  - power_supply "battery" (status/health/voltage/current/temp/capacity,
++ *    capacity from the stock 25 C OCV profile of this tablet's 4.2 V cell)
++ *    and "usb" (online = charger detected).
++ *  - rtc: MT6353 RTC (MT6397 layout at PMIC 0x4000), year base 1968 as stock.
++ *  - /sys/kernel/mt6755_pmic/boot_recovery: RTC_PDN1 FAC_RESET, the flag stock
++ *    `reboot recovery` sets; lk boots `recovery` once and clears it.
++ *  - power-off: stock mt_power_off() (RTC BBPU pwrdown = PWRBB low); if a
++ *    charger keeps the PMIC up, restart instead (as stock does).
+  */
+ #include <linux/delay.h>
+ #include <linux/export.h>
+@@ -23,7 +36,11 @@
+ #include <linux/moduleparam.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/power_supply.h>
+ #include <linux/printk.h>
++#include <linux/reboot.h>
++#include <linux/rtc.h>
+ #include <linux/sysfs.h>
+ #include <linux/workqueue.h>
+ 
+@@ -141,7 +158,6 @@ module_param(charger, bool, 0644);
+ MODULE_PARM_DESC(charger, "keep the MT6353 charger enabled (default on)");
+ 
+ static struct delayed_work chr_work;
+-static bool chr_present;
+ 
+ static void chr_hw_init(void)
+ {
+@@ -189,35 +205,13 @@ static void chr_enable(void)
+ 	mt6755_pmic_rmw(CHR_CON0, 1, 3, 1);	/* CSDAC_EN */
+ }
+ 
+-static void chr_work_fn(struct work_struct *w)
+-{
+-	u16 c0;
+-
+-	if (!charger || mt6755_pmic_read(CHR_CON0, &c0))
+-		goto out;
+-	if (c0 & BIT(5)) {			/* charger present */
+-		if (!chr_present) {
+-			chr_kick();		/* an expired charger WDT blocks CHR_EN */
+-			chr_enable();
+-			pr_info("mt6755-pmic: charger plugged, charging enabled\n");
+-		}
+-		chr_kick();
+-		if (!(c0 & BIT(4)))
+-			chr_enable();
+-	} else if (chr_present) {
+-		pr_info("mt6755-pmic: charger removed\n");
+-	}
+-	chr_present = !!(c0 & BIT(5));
+-out:
+-	queue_delayed_work(system_freezable_wq, &chr_work, 2 * HZ);
+-}
+-
+ /* ---------------- AUXADC battery readout ---------------- */
+ #define CLK_CKPDN_CON0_CLR	0x0272
+ #define AUXADC_CON0		0x0EA4
+ #define AUXADC_RQST0_SET	0x0E9A
+ #define AUXADC_ADC23		0x0E2E	/* ch0 BATSNS: b15 rdy, [14:0] */
+ #define AUXADC_ADC25		0x0E32	/* ch1 ISENSE */
++#define AUXADC_ADC3		0x0E06	/* ch3 BATON: b15 rdy, [11:0] */
+ #define R_SENSE_MOHM		56
+ 
+ static int auxadc_mv(u16 reg, int *mv)
+@@ -236,10 +230,13 @@ static int auxadc_mv(u16 reg, int *mv)
+ 	return -ETIMEDOUT;
+ }
+ 
++static DEFINE_MUTEX(adc_lock);
++
+ static int battery_read(int *vbat, int *ichg)
+ {
+ 	int isense, ret;
+ 
++	mutex_lock(&adc_lock);
+ 	mt6755_pmic_write(CLK_CKPDN_CON0_CLR, BIT(11));
+ 	mt6755_pmic_rmw(AUXADC_CON0, 1, 15, 1);
+ 	mt6755_pmic_write(AUXADC_RQST0_SET, 0x3);
+@@ -249,6 +246,34 @@ static int battery_read(int *vbat, int *ichg)
+ 		ret = auxadc_mv(AUXADC_ADC25, &isense);
+ 	if (!ret)
+ 		*ichg = (isense - *vbat) * 1000 / R_SENSE_MOHM;
++	mutex_unlock(&adc_lock);
++	return ret;
++}
++
++/* BATON (NTC) voltage in mV, 12-bit channel */
++static int baton_read(int *mv)
++{
++	int ret = -ETIMEDOUT;
++	u16 v;
++
++	mutex_lock(&adc_lock);
++	mt6755_pmic_write(CLK_CKPDN_CON0_CLR, BIT(11));
++	mt6755_pmic_rmw(AUXADC_CON0, 1, 15, 1);
++	mt6755_pmic_write(AUXADC_RQST0_SET, BIT(3));
++	usleep_range(1000, 1500);
++	for (int i = 0; i < 100; i++) {
++		if (mt6755_pmic_read(AUXADC_ADC3, &v)) {
++			ret = -EIO;
++			break;
++		}
++		if (v & 0x8000) {
++			*mv = (int)(v & 0xfff) * 1800 / 4096;
++			ret = 0;
++			break;
++		}
++		usleep_range(100, 200);
++	}
++	mutex_unlock(&adc_lock);
+ 	return ret;
+ }
+ 
+@@ -275,14 +300,301 @@ static ssize_t charging_show(struct kobject *k, struct kobj_attribute *a, char *
+ 	return sysfs_emit(buf, "chrdet=%d chr_en=%d\n", !!(c0 & BIT(5)), !!(c0 & BIT(4)));
+ }
+ 
++static ssize_t state_show(struct kobject *k, struct kobj_attribute *a, char *buf);
++static struct kobj_attribute state_attr = __ATTR_RO(state);
+ static struct kobj_attribute battery_mv_attr = __ATTR_RO(battery_mv);
+ static struct kobj_attribute charge_ma_attr = __ATTR_RO(charge_ma);
+ static struct kobj_attribute charging_attr = __ATTR_RO(charging);
+ static struct attribute *pmic_attrs[] = {
+-	&battery_mv_attr.attr, &charge_ma_attr.attr, &charging_attr.attr, NULL,
++	&battery_mv_attr.attr, &charge_ma_attr.attr, &charging_attr.attr, &state_attr.attr, NULL,
+ };
+ static const struct attribute_group pmic_group = { .attrs = pmic_attrs };
+ 
++/* ---------------- charge control ---------------- */
++#define RBAT_PULL_UP_R		16900	/* ohm, to 1.8 V (stock MT6353 value) */
++#define RBAT_PULL_UP_MV		1800
++
++/* stock 10k NTC table: {deg C, ohm} */
++static const struct { s16 t; u32 r; } ntc_tbl[] = {
++	{-20, 68237}, {-15, 53650}, {-10, 42506}, { -5, 33892}, {  0, 27219},
++	{  5, 22021}, { 10, 17926}, { 15, 14674}, { 20, 12081}, { 25, 10000},
++	{ 30,  8315}, { 35,  6948}, { 40,  5834}, { 45,  4917}, { 50,  4161},
++	{ 55,  3535}, { 60,  3014},
++};
++
++/* this tablet's 25 C OCV profile (from the stock kernel): {DOD %, mV} */
++static const u16 ocv25[][2] = {
++	{0, 4177}, {1, 4138}, {2, 4117}, {4, 4093}, {6, 4078}, {8, 4067}, {10, 4059},
++	{12, 4053}, {15, 4046}, {18, 4042}, {21, 4040}, {25, 4038}, {29, 4036},
++	{32, 4035}, {34, 4033}, {36, 4028}, {38, 4016}, {40, 4004}, {42, 3999},
++	{45, 3992}, {48, 3974}, {50, 3960}, {52, 3942}, {54, 3923}, {56, 3907},
++	{58, 3892}, {60, 3882}, {62, 3875}, {64, 3872}, {68, 3867}, {71, 3859},
++	{74, 3846}, {76, 3837}, {78, 3828}, {80, 3818}, {82, 3805}, {84, 3790},
++	{86, 3776}, {88, 3758}, {90, 3748}, {92, 3740}, {94, 3728}, {95, 3717},
++	{96, 3687}, {97, 3643}, {98, 3589}, {99, 3518}, {100, 3418},
++};
++
++static bool ignore_temp;
++module_param(ignore_temp, bool, 0644);
++MODULE_PARM_DESC(ignore_temp, "charge regardless of battery temperature / NTC state (unsafe)");
++static int ntc_comp_mohm;	/* measured 2026-11-07: NTC voltage does not move with current */
++module_param(ntc_comp_mohm, int, 0644);
++MODULE_PARM_DESC(ntc_comp_mohm, "NTC ground-shift compensation (mV per A of battery current)");
++static int r_int_mohm = 150;
++module_param(r_int_mohm, int, 0644);
++MODULE_PARM_DESC(r_int_mohm, "battery internal resistance for the OCV estimate");
++static int lowbat_mv = 3450;
++module_param(lowbat_mv, int, 0644);
++MODULE_PARM_DESC(lowbat_mv, "power off below this battery voltage when not charging (0 = never)");
++
++enum chg_state { CHG_NONE, CHG_ON, CHG_FULL, CHG_HOT, CHG_COLD, CHG_OV, CHG_NTC, CHG_OFF };
++static const char * const chg_names[] = {
++	"no-charger", "charging", "full", "too-hot", "too-cold", "over-voltage", "ntc-fault", "disabled",
++};
++
++static struct {
++	int vbat, ibat, vntc, temp, cap16;	/* mV, mA (+ = charging), mV, 0.1 C, % x16 */
++	bool chr, ntc_ok, valid, hot, cold, ov;
++	enum chg_state st;
++	int full_cnt, low_cnt;
++} bs;
++static struct power_supply *bat_psy, *usb_psy;
++
++static int ntc_temp(int mv, int *t10)
++{
++	int n = ARRAY_SIZE(ntc_tbl), r;
++
++	if (mv < 40 || mv > 1750)		/* shorted / open (no battery NTC) */
++		return -ERANGE;
++	r = RBAT_PULL_UP_R * mv / (RBAT_PULL_UP_MV - mv);
++	if (r >= ntc_tbl[0].r) {
++		*t10 = ntc_tbl[0].t * 10;
++		return 0;
++	}
++	for (int i = 0; i < n - 1; i++) {
++		if (r >= ntc_tbl[i + 1].r) {
++			*t10 = ntc_tbl[i].t * 10 +
++			       (int)(ntc_tbl[i].r - r) * 50 / (int)(ntc_tbl[i].r - ntc_tbl[i + 1].r);
++			return 0;
++		}
++	}
++	*t10 = ntc_tbl[n - 1].t * 10;
++	return 0;
++}
++
++static int ocv_capacity(int ocv)
++{
++	int n = ARRAY_SIZE(ocv25);
++
++	if (ocv >= ocv25[0][1])
++		return 100;
++	for (int i = 0; i < n - 1; i++) {
++		if (ocv >= ocv25[i + 1][1]) {
++			int d0 = ocv25[i][0], d1 = ocv25[i + 1][0];
++			int v0 = ocv25[i][1], v1 = ocv25[i + 1][1];
++
++			return 100 - (d0 + (v0 - ocv) * (d1 - d0) / (v0 - v1));
++		}
++	}
++	return 0;
++}
++
++static void chr_disable(void)
++{
++	mt6755_pmic_rmw(CHR_CON0, 1, 4, 0);	/* CHR_EN */
++}
++
++static void chr_work_fn(struct work_struct *w)
++{
++	enum chg_state st = bs.st, old = bs.st;
++	int vbat, ibat, vntc, t, cap, oldcap = bs.cap16 / 16;
++	bool chr, oldchr = bs.chr;
++	u16 c0;
++
++	if (mt6755_pmic_read(CHR_CON0, &c0))
++		goto out;
++	chr = !!(c0 & BIT(5));
++	if (!battery_read(&vbat, &ibat)) {
++		bs.vbat = vbat;
++		bs.ibat = ibat;
++	}
++	if (!baton_read(&vntc)) {
++		bs.vntc = vntc;
++		bs.ntc_ok = !ntc_temp(vntc - bs.ibat * ntc_comp_mohm / 1000, &t);
++		if (bs.ntc_ok)
++			bs.temp = t;
++	}
++	bs.chr = chr;
++
++	/* hysteresis: 0..45 C allowed, resume at 3..42 C; VBAT cap 4.25 V, resume 4.15 V */
++	if (bs.temp > 450)
++		bs.hot = true;
++	else if (bs.temp <= 420)
++		bs.hot = false;
++	if (bs.temp < 0)
++		bs.cold = true;
++	else if (bs.temp >= 30)
++		bs.cold = false;
++	if (bs.vbat > 4250)
++		bs.ov = true;
++	else if (bs.vbat < 4150)
++		bs.ov = false;
++
++	if (!chr)
++		st = CHG_NONE;
++	else if (!charger)
++		st = CHG_OFF;
++	else if (!ignore_temp && !bs.ntc_ok)
++		st = CHG_NTC;
++	else if (!ignore_temp && bs.hot)
++		st = CHG_HOT;
++	else if (!ignore_temp && bs.cold)
++		st = CHG_COLD;
++	else if (bs.ov)
++		st = CHG_OV;
++	else if (st == CHG_FULL)
++		st = bs.vbat < 4100 ? CHG_ON : CHG_FULL;
++	else
++		st = CHG_ON;
++
++	if (st == CHG_ON && bs.vbat >= 4150 && bs.ibat < 100) {
++		if (++bs.full_cnt >= 30)
++			st = CHG_FULL;
++	} else {
++		bs.full_cnt = 0;
++	}
++
++	if (st == CHG_ON) {
++		chr_kick();			/* an expired charger WDT blocks CHR_EN */
++		if (!(c0 & BIT(4)))
++			chr_enable();
++	} else if (c0 & BIT(4)) {
++		chr_disable();
++	}
++	bs.st = st;
++
++	/* capacity: OCV estimate, smoothed (time constant ~16 s) */
++	cap = ocv_capacity(bs.vbat - bs.ibat * r_int_mohm / 1000);
++	if (st == CHG_FULL)
++		cap = 100;
++	if (!bs.valid)
++		bs.cap16 = cap * 16;
++	else
++		bs.cap16 += (cap * 16 - bs.cap16) / 8;
++	bs.valid = true;
++
++	/* low battery: orderly power-off before the eMMC browns out */
++	if (lowbat_mv && !chr && bs.vbat > 2500 && bs.vbat < lowbat_mv) {
++		if (++bs.low_cnt == 15) {
++			pr_crit("mt6755-pmic: battery %d mV < %d mV for 30 s, powering off\n",
++				bs.vbat, lowbat_mv);
++			orderly_poweroff(true);
++		}
++	} else {
++		bs.low_cnt = 0;
++	}
++
++	if (st != old)
++		pr_info("mt6755-pmic: %s -> %s (%d mV, %d mA, %d.%d C, ntc %d mV)\n",
++			chg_names[old], chg_names[st], bs.vbat, bs.ibat,
++			bs.temp / 10, abs(bs.temp % 10), bs.vntc);
++	if (bat_psy && (st != old || bs.cap16 / 16 != oldcap))
++		power_supply_changed(bat_psy);
++	if (usb_psy && chr != oldchr)
++		power_supply_changed(usb_psy);
++out:
++	queue_delayed_work(system_freezable_wq, &chr_work, 2 * HZ);
++}
++
++static ssize_t state_show(struct kobject *k, struct kobj_attribute *a, char *buf)
++{
++	return sysfs_emit(buf, "%s vbat=%d ibat=%d temp=%d ntc_mv=%d ntc_ok=%d cap=%d\n",
++			  chg_names[bs.st], bs.vbat, bs.ibat, bs.temp, bs.vntc, bs.ntc_ok,
++			  bs.cap16 / 16);
++}
++
++/* ---------------- power_supply ---------------- */
++static enum power_supply_property bat_props[] = {
++	POWER_SUPPLY_PROP_STATUS, POWER_SUPPLY_PROP_HEALTH, POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_TECHNOLOGY, POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_CURRENT_NOW, POWER_SUPPLY_PROP_TEMP, POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN, POWER_SUPPLY_PROP_SCOPE,
++};
++
++static int bat_get(struct power_supply *psy, enum power_supply_property psp,
++		   union power_supply_propval *val)
++{
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		val->intval = bs.st == CHG_ON ? POWER_SUPPLY_STATUS_CHARGING :
++			      bs.st == CHG_FULL ? POWER_SUPPLY_STATUS_FULL :
++			      bs.st == CHG_NONE ? POWER_SUPPLY_STATUS_DISCHARGING :
++			      POWER_SUPPLY_STATUS_NOT_CHARGING;
++		break;
++	case POWER_SUPPLY_PROP_HEALTH:
++		val->intval = bs.st == CHG_HOT ? POWER_SUPPLY_HEALTH_OVERHEAT :
++			      bs.st == CHG_COLD ? POWER_SUPPLY_HEALTH_COLD :
++			      bs.st == CHG_OV ? POWER_SUPPLY_HEALTH_OVERVOLTAGE :
++			      bs.st == CHG_NTC ? POWER_SUPPLY_HEALTH_UNSPEC_FAILURE :
++			      POWER_SUPPLY_HEALTH_GOOD;
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		break;
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		val->intval = bs.vbat * 1000;
++		break;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		val->intval = bs.ibat * 1000;
++		break;
++	case POWER_SUPPLY_PROP_TEMP:
++		val->intval = bs.temp;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		val->intval = bs.cap16 / 16;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		val->intval = 4200000;
++		break;
++	case POWER_SUPPLY_PROP_SCOPE:
++		val->intval = POWER_SUPPLY_SCOPE_SYSTEM;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static enum power_supply_property usb_props[] = { POWER_SUPPLY_PROP_ONLINE };
++
++static int usb_get(struct power_supply *psy, enum power_supply_property psp,
++		   union power_supply_propval *val)
++{
++	if (psp != POWER_SUPPLY_PROP_ONLINE)
++		return -EINVAL;
++	val->intval = bs.chr;
++	return 0;
++}
++
++static const struct power_supply_desc bat_desc = {
++	.name = "battery", .type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = bat_props, .num_properties = ARRAY_SIZE(bat_props),
++	.get_property = bat_get,
++};
++
++static char *usb_supplied_to[] = { "battery" };
++
++static const struct power_supply_desc usb_desc = {
++	.name = "usb", .type = POWER_SUPPLY_TYPE_USB,
++	.properties = usb_props, .num_properties = ARRAY_SIZE(usb_props),
++	.get_property = usb_get,
++};
++
++static struct kobject *pmic_kobj;
++
+ static int __init mt6755_pmic_init(void)
+ {
+ 	struct kobject *kobj;
+@@ -295,14 +607,209 @@ static int __init mt6755_pmic_init(void)
+ 		return -ENOMEM;
+ 
+ 	kobj = kobject_create_and_add("mt6755_pmic", kernel_kobj);
++	pmic_kobj = kobj;
+ 	if (kobj && sysfs_create_group(kobj, &pmic_group))
+ 		pr_warn("mt6755-pmic: sysfs group failed\n");
+ 
+ 	if (!battery_read(&vbat, &ichg))
+ 		pr_info("mt6755-pmic: battery %d mV, charge current %d mA\n", vbat, ichg);
++	bs.temp = 250;
+ 	chr_hw_init();
+ 	INIT_DELAYED_WORK(&chr_work, chr_work_fn);
+ 	queue_delayed_work(system_freezable_wq, &chr_work, 0);
+ 	return 0;
+ }
+ subsys_initcall(mt6755_pmic_init);
++
++/* ---------------- RTC ---------------- */
++#define RTC_BASE		0x4000
++#define RTC_BBPU		(RTC_BASE + 0x00)
++#define RTC_BBPU_PWREN		BIT(0)
++#define RTC_BBPU_AUTO		BIT(3)
++#define RTC_BBPU_RELOAD		BIT(5)
++#define RTC_BBPU_CBUSY		BIT(6)
++#define RTC_BBPU_KEY		(0x43 << 8)
++#define RTC_TC_SEC		(RTC_BASE + 0x0a)	/* SEC MIN HOU DOM DOW MTH YEA, 2 bytes apart */
++#define RTC_PDN1		(RTC_BASE + 0x2c)
++#define RTC_PDN1_FAC_RESET	BIT(4)
++#define RTC_PROT		(RTC_BASE + 0x36)
++#define RTC_WRTGR		(RTC_BASE + 0x3c)
++#define RTC_MIN_YEAR_OFFSET	(1968 - 1900)
++static const u16 rtc_tc_mask[7] = { 0x3f, 0x3f, 0x1f, 0x1f, 0x07, 0x0f, 0x7f };
++static DEFINE_MUTEX(rtc_lock);
++
++static int rtc_trigger(void)
++{
++	u16 v;
++
++	mt6755_pmic_write(RTC_WRTGR, 1);
++	for (int i = 0; i < 1000; i++) {
++		if (mt6755_pmic_read(RTC_BBPU, &v))
++			return -EIO;
++		if (!(v & RTC_BBPU_CBUSY))
++			return 0;
++		usleep_range(100, 200);
++	}
++	return -ETIMEDOUT;
++}
++
++static int rtc_get_tc(u16 *tc)
++{
++	for (int i = 0; i < 7; i++) {
++		if (mt6755_pmic_read(RTC_TC_SEC + 2 * i, &tc[i]))
++			return -EIO;
++		tc[i] &= rtc_tc_mask[i];
++	}
++	return 0;
++}
++
++static int mt6755_rtc_read_time(struct device *dev, struct rtc_time *tm)
++{
++	u16 bbpu, tc[7], sec;
++	int ret;
++
++	mutex_lock(&rtc_lock);
++	ret = mt6755_pmic_read(RTC_BBPU, &bbpu);
++	if (!ret) {
++		mt6755_pmic_write(RTC_BBPU, (bbpu & 0xff) | RTC_BBPU_KEY | RTC_BBPU_RELOAD);
++		ret = rtc_trigger();
++	}
++	if (!ret)
++		ret = rtc_get_tc(tc);
++	if (!ret && !mt6755_pmic_read(RTC_TC_SEC, &sec) && (sec & 0x3f) < tc[0])
++		ret = rtc_get_tc(tc);		/* seconds carried while reading */
++	mutex_unlock(&rtc_lock);
++	if (ret)
++		return ret;
++	tm->tm_sec = tc[0];
++	tm->tm_min = tc[1];
++	tm->tm_hour = tc[2];
++	tm->tm_mday = tc[3];
++	tm->tm_mon = tc[5] - 1;
++	tm->tm_year = tc[6] + RTC_MIN_YEAR_OFFSET;
++	return rtc_valid_tm(tm);
++}
++
++static int mt6755_rtc_set_time(struct device *dev, struct rtc_time *tm)
++{
++	int year = tm->tm_year - RTC_MIN_YEAR_OFFSET, ret;
++
++	if (year < 0 || year > 127)
++		return -EINVAL;
++	mutex_lock(&rtc_lock);
++	/* unlock the write interface (preloader normally leaves it unlocked) */
++	mt6755_pmic_write(RTC_PROT, 0x586a);
++	rtc_trigger();
++	mt6755_pmic_write(RTC_PROT, 0x9136);
++	rtc_trigger();
++	mt6755_pmic_write(RTC_TC_SEC + 2 * 6, year);
++	mt6755_pmic_write(RTC_TC_SEC + 2 * 5, tm->tm_mon + 1);
++	mt6755_pmic_write(RTC_TC_SEC + 2 * 3, tm->tm_mday);
++	mt6755_pmic_write(RTC_TC_SEC + 2 * 2, tm->tm_hour);
++	mt6755_pmic_write(RTC_TC_SEC + 2 * 1, tm->tm_min);
++	mt6755_pmic_write(RTC_TC_SEC, tm->tm_sec);
++	ret = rtc_trigger();
++	mutex_unlock(&rtc_lock);
++	return ret;
++}
++
++static ssize_t boot_recovery_show(struct kobject *k, struct kobj_attribute *a, char *buf)
++{
++	u16 v;
++
++	if (mt6755_pmic_read(RTC_PDN1, &v))
++		return -EIO;
++	return sysfs_emit(buf, "%d\n", !!(v & RTC_PDN1_FAC_RESET));
++}
++
++static ssize_t boot_recovery_store(struct kobject *k, struct kobj_attribute *a,
++				   const char *buf, size_t n)
++{
++	bool on;
++	int ret;
++
++	if (kstrtobool(buf, &on))
++		return -EINVAL;
++	mutex_lock(&rtc_lock);
++	mt6755_pmic_write(RTC_PROT, 0x586a);
++	rtc_trigger();
++	mt6755_pmic_write(RTC_PROT, 0x9136);
++	rtc_trigger();
++	ret = mt6755_pmic_rmw(RTC_PDN1, 1, 4, on);
++	if (!ret)
++		ret = rtc_trigger();
++	mutex_unlock(&rtc_lock);
++	return ret ? ret : n;
++}
++static struct kobj_attribute boot_recovery_attr = __ATTR_RW(boot_recovery);
++
++/* runs with IRQs off on one CPU: no mutex, no sleeping */
++static void rtc_trigger_atomic(void)
++{
++	u16 v;
++
++	__pmic_write(RTC_WRTGR, 1);
++	for (int i = 0; i < 10000; i++) {
++		if (__pmic_read(RTC_BBPU, &v) || !(v & RTC_BBPU_CBUSY))
++			return;
++		udelay(10);
++	}
++}
++
++static int mt6755_power_off(struct sys_off_data *data)
++{
++	pr_emerg("mt6755-pmic: power off (RTC BBPU pwrdown)\n");
++	__pmic_write(RTC_PROT, 0x586a);
++	rtc_trigger_atomic();
++	__pmic_write(RTC_PROT, 0x9136);
++	rtc_trigger_atomic();
++	__pmic_write(RTC_BBPU, RTC_BBPU_KEY | RTC_BBPU_AUTO | RTC_BBPU_PWREN);
++	rtc_trigger_atomic();
++	mdelay(2000);
++	/* still here: the charger keeps the PMIC on -> restart like stock ("charger") */
++	pr_emerg("mt6755-pmic: still powered (charger?), restarting\n");
++	do_kernel_restart(NULL);
++	return NOTIFY_DONE;
++}
++
++static const struct rtc_class_ops mt6755_rtc_ops = {
++	.read_time = mt6755_rtc_read_time,
++	.set_time = mt6755_rtc_set_time,
++};
++
++static int __init mt6755_battery_init(void)
++{
++	struct power_supply_config cfg = {};
++	struct platform_device *pdev;
++
++	if (!pwrap)
++		return 0;
++	pdev = platform_device_register_simple("mt6755-pmic", -1, NULL, 0);
++	if (IS_ERR(pdev))
++		return PTR_ERR(pdev);
++	{
++		struct rtc_device *rtc = devm_rtc_device_register(&pdev->dev, "mt6755-rtc",
++								  &mt6755_rtc_ops, THIS_MODULE);
++		if (IS_ERR(rtc))
++			pr_warn("mt6755-pmic: rtc: %ld\n", PTR_ERR(rtc));
++		if (pmic_kobj && sysfs_create_file(pmic_kobj, &boot_recovery_attr.attr))
++			pr_warn("mt6755-pmic: boot_recovery attr failed\n");
++		if (IS_ERR(register_sys_off_handler(SYS_OFF_MODE_POWER_OFF, SYS_OFF_PRIO_DEFAULT,
++						    mt6755_power_off, NULL)))
++			pr_warn("mt6755-pmic: power-off handler failed\n");
++	}
++	bat_psy = power_supply_register(&pdev->dev, &bat_desc, &cfg);
++	if (IS_ERR(bat_psy)) {
++		pr_warn("mt6755-pmic: battery psy: %ld\n", PTR_ERR(bat_psy));
++		bat_psy = NULL;
++	}
++	cfg.supplied_to = usb_supplied_to;
++	cfg.num_supplicants = ARRAY_SIZE(usb_supplied_to);
++	usb_psy = power_supply_register(&pdev->dev, &usb_desc, &cfg);
++	if (IS_ERR(usb_psy)) {
++		pr_warn("mt6755-pmic: usb psy: %ld\n", PTR_ERR(usb_psy));
++		usb_psy = NULL;
++	}
++	return 0;
++}
++device_initcall(mt6755_battery_init);
+-- 
+2.53.0
+

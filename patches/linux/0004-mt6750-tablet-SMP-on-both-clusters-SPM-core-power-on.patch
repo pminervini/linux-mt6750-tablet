@@ -1,0 +1,107 @@
+From c373ec6b704f0055ce4e96be18755b71c283b103 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sat, 7 Nov 2026 09:25:13 +0000
+Subject: [PATCH 04/25] mt6750 tablet: SMP on both clusters (SPM core power-on,
+ CCI-400 SI3 snoop for MP1)
+
+---
+ drivers/soc/mediatek/mt6755-bringup.c | 53 ++++++++++++++++++++++++---
+ 1 file changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mt6755-bringup.c b/drivers/soc/mediatek/mt6755-bringup.c
+index 87263352b..10eec9d19 100644
+--- a/drivers/soc/mediatek/mt6755-bringup.c
++++ b/drivers/soc/mediatek/mt6755-bringup.c
+@@ -8,6 +8,7 @@
+ #include <linux/delay.h>
+ #include <linux/init.h>
+ #include <linux/iopoll.h>
++#include <linux/moduleparam.h>
+ #include <linux/spinlock.h>
+ #include <asm/cputype.h>
+ #include <linux/io.h>
+@@ -88,10 +89,48 @@ static bool mt6755_spm_cpu_ok(void)
+ 	return spm;
+ }
+ 
++/* MP1 (cluster 1): needs CCI-400 SI3 snoop enabled first (done below). Disable with
++ * mt6755_bringup.mp1=0 */
++static bool mp1 = true;
++module_param(mp1, bool, 0644);
++
++#define CCI400_BASE		0x10390000
++#define  CCI400_STATUS		0x00c
++#define  CCI400_SI_SNOOP(s)	(0x1000 * (s) + 0x1000)
++#define  CCI_SNOOP_DVM_EN	(BIT(0) | BIT(1))
++#define MP1_CPUTOP_STA		BIT(15)
++
++/* cluster 1 sits on CCI slave interface 3; the boot loader only enables SI4 */
++static int mt6755_cci_enable_mp1(void)
++{
++	void __iomem *cci = ioremap(CCI400_BASE, 0x10000);
++	u32 v;
++	int ret = 0;
++
++	if (!cci)
++		return -ENOMEM;
++	v = readl(cci + CCI400_SI_SNOOP(3));
++	if ((v & CCI_SNOOP_DVM_EN) != CCI_SNOOP_DVM_EN) {
++		writel(v | CCI_SNOOP_DVM_EN, cci + CCI400_SI_SNOOP(3));
++		ret = readl_poll_timeout_atomic(cci + CCI400_STATUS, v, !(v & BIT(0)), 1, 10000);
++		pr_info("mt6755-bringup: CCI SI3 snoop %08x -> %08x (%d)\n", v,
++			readl(cci + CCI400_SI_SNOOP(3)), ret);
++	}
++	iounmap(cci);
++	return ret;
++}
++
+ int mtk_spm_cpu_can_boot(u64 mpidr)
+ {
+ 	if (!mt6755_spm_cpu_ok())
+ 		return 0;
++	if (MPIDR_AFFINITY_LEVEL(mpidr, 1) == 1) {
++		if (!mp1)
++			return -EOPNOTSUPP;
++		if (!(readl(spm + SPM_PWR_STATUS) & MP1_CPUTOP_STA))
++			return -ENODEV;
++		return mt6755_cci_enable_mp1();
++	}
+ 	if (MPIDR_AFFINITY_LEVEL(mpidr, 1) != 0)
+ 		return -EOPNOTSUPP;
+ 	if (!(readl(spm + SPM_PWR_STATUS) & MP0_CPUTOP_STA))
+@@ -107,23 +146,27 @@ static void spm_rmw(u32 off, u32 clr, u32 set)
+ int mtk_spm_cpu_power_on(u64 mpidr)
+ {
+ 	unsigned int n = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+-	u32 con = SPM_MP0_CPU_PWR_CON(n), pdn = SPM_MP0_CPU_L1_PDN(n), v;
++	unsigned int cl = MPIDR_AFFINITY_LEVEL(mpidr, 1);
++	/* MP1: PWR_CON 0x21c.., L1_PDN 0x260.., status bits 16.. */
++	u32 con = cl ? 0x21c + 4 * n : SPM_MP0_CPU_PWR_CON(n);
++	u32 pdn = cl ? 0x260 + 4 * n : SPM_MP0_CPU_L1_PDN(n);
++	u32 sta = cl ? BIT(16 + n) : MP0_CPU_STA(n), v;
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	if (!mt6755_spm_cpu_ok() || MPIDR_AFFINITY_LEVEL(mpidr, 1) != 0 || n > 3)
++	if (!mt6755_spm_cpu_ok() || cl > 1 || n > 3)
+ 		return 0;
+-	if (readl(spm + SPM_PWR_STATUS) & MP0_CPU_STA(n))
++	if (readl(spm + SPM_PWR_STATUS) & sta)
+ 		return 0;	/* already powered */
+ 
+ 	raw_spin_lock_irqsave(&spm_cpu_lock, flags);
+ 	writel((SPM_PROJECT_CODE << 16) | BIT(0), spm + SPM_POWERON_CONFIG_EN);
+ 	spm_rmw(con, 0, PWR_ON);
+ 	spm_rmw(con, 0, PWR_ON_2ND);
+-	ret = readl_poll_timeout_atomic(spm + SPM_PWR_STATUS, v, v & MP0_CPU_STA(n), 1, 1000);
++	ret = readl_poll_timeout_atomic(spm + SPM_PWR_STATUS, v, v & sta, 1, 1000);
+ 	if (!ret)
+ 		ret = readl_poll_timeout_atomic(spm + SPM_PWR_STATUS_2ND, v,
+-						v & MP0_CPU_STA(n), 1, 1000);
++						v & sta, 1, 1000);
+ 	if (!ret) {
+ 		spm_rmw(con, PWR_ISO, 0);
+ 		spm_rmw(pdn, L1_SRAM_PDN, 0);
+-- 
+2.53.0
+

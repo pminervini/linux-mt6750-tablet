@@ -1,0 +1,30 @@
+From ce56eae87d108854e99699666be566897661107a Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Mon, 2 Jan 2023 23:36:58 +0400
+Subject: [PATCH] arm64: dts: mediatek: mt6755: Drop infracfg_ao
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ arch/arm64/boot/dts/mediatek/mt6755.dtsi | 6 ------
+ 1 file changed, 6 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6755.dtsi b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+index 1577c111d0d2..49e7f2f0e5fd 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6755.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+@@ -105,12 +105,6 @@ topckgen: clock-controller@10000000 {
+ 		#clock-cells = <1>;
+ 	};
+ 
+-	infracfg_ao: clock-controller@10001000 {
+-		compatible = "mediatek,infracfg_ao", "syscon";
+-		reg = <0x10001000 0x1000>;
+-		interrupts = <GIC_SPI 136 IRQ_TYPE_EDGE_RISING>;
+-	};
+-
+ 	infrasys: clock-controller@10001000 {
+ 		compatible = "mediatek,mt6755-infrasys";
+ 		reg = <0x10001000 0x1000>;
+-- 
+GitLab
+

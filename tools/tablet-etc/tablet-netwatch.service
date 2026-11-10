@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep the tablet reachable over Wi-Fi (escalating recovery: reassociate, supplicant, driver, reboot)
+After=mt6755-wifi.service wpa_supplicant@wlan0.service systemd-networkd.service
+Wants=mt6755-wifi.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/tablet-netwatch
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

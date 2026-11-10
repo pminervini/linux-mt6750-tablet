@@ -1,0 +1,1 @@
+ACTION=="add|change", KERNEL=="event*", ATTRS{name}=="silead_ts", ENV{LIBINPUT_CALIBRATION_MATRIX}="1.0956 0 -0.0061 0 1.0142 0.0005 0 0 1"

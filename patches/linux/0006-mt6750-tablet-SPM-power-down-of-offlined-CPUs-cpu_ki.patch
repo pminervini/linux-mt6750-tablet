@@ -1,0 +1,88 @@
+From 6ec8ac238a9a6ab45ec654af9f11861641334c97 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sat, 7 Nov 2026 16:54:16 +0000
+Subject: [PATCH 06/25] mt6750 tablet: SPM power-down of offlined CPUs
+ (cpu_kill), needed for kexec/hotplug
+
+---
+ arch/arm64/kernel/psci.c              |  6 ++++
+ drivers/soc/mediatek/mt6755-bringup.c | 42 +++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/arch/arm64/kernel/psci.c b/arch/arm64/kernel/psci.c
+index 52afe0100..f30a4ebb0 100644
+--- a/arch/arm64/kernel/psci.c
++++ b/arch/arm64/kernel/psci.c
+@@ -43,6 +43,7 @@ static int __init cpu_psci_cpu_prepare(unsigned int cpu)
+  */
+ int __weak mtk_spm_cpu_can_boot(u64 mpidr) { return 0; }
+ int __weak mtk_spm_cpu_power_on(u64 mpidr) { return 0; }
++int __weak mtk_spm_cpu_power_off(u64 mpidr) { return -EOPNOTSUPP; }
+ 
+ static int cpu_psci_cpu_boot(unsigned int cpu)
+ {
+@@ -97,6 +98,11 @@ static int cpu_psci_cpu_kill(unsigned int cpu)
+ 	int err;
+ 	unsigned long start, end;
+ 
++	/* MT6755: the firmware leaves an offlined core powered in WFI; cut it via SPM */
++	err = mtk_spm_cpu_power_off(cpu_logical_map(cpu));
++	if (err != -EOPNOTSUPP)
++		return err;
++
+ 	if (!psci_ops.affinity_info)
+ 		return 0;
+ 	/*
+diff --git a/drivers/soc/mediatek/mt6755-bringup.c b/drivers/soc/mediatek/mt6755-bringup.c
+index 10eec9d19..209ae84b8 100644
+--- a/drivers/soc/mediatek/mt6755-bringup.c
++++ b/drivers/soc/mediatek/mt6755-bringup.c
+@@ -185,3 +185,45 @@ int mtk_spm_cpu_power_on(u64 mpidr)
+ 		       n, readl(spm + con));
+ 	return ret;
+ }
++
++#define SPM_CPU_IDLE_STA	0x174
++#define  CPU_STANDBYWFI(cl, n)	BIT(10 + 4 * (cl) + (n))
++
++/* stock spm_mtcmos_ctrl_cpuN(STA_POWER_DOWN), without the cluster power-down */
++int mtk_spm_cpu_power_off(u64 mpidr)
++{
++	unsigned int n = MPIDR_AFFINITY_LEVEL(mpidr, 0);
++	unsigned int cl = MPIDR_AFFINITY_LEVEL(mpidr, 1);
++	u32 con = cl ? 0x21c + 4 * n : SPM_MP0_CPU_PWR_CON(n);
++	u32 pdn = cl ? 0x260 + 4 * n : SPM_MP0_CPU_L1_PDN(n);
++	u32 sta = cl ? BIT(16 + n) : MP0_CPU_STA(n), v;
++	unsigned long flags;
++	int ret;
++
++	if (!mt6755_spm_cpu_ok() || cl > 1 || n > 3)
++		return -EOPNOTSUPP;
++	/* the dying core must have reached WFI inside the firmware's CPU_OFF */
++	ret = readl_poll_timeout(spm + SPM_CPU_IDLE_STA, v, v & CPU_STANDBYWFI(cl, n), 10, 100000);
++	if (ret) {
++		pr_err("mt6755-bringup: CPU%u.%u not in WFI, leaving it powered\n", cl, n);
++		return ret;
++	}
++	raw_spin_lock_irqsave(&spm_cpu_lock, flags);
++	writel((SPM_PROJECT_CODE << 16) | BIT(0), spm + SPM_POWERON_CONFIG_EN);
++	spm_rmw(con, 0, PWR_ISO);
++	spm_rmw(con, 0, SRAM_CKISO);
++	spm_rmw(con, SRAM_ISOINT_B, 0);
++	spm_rmw(pdn, 0, L1_SRAM_PDN);
++	ret = readl_poll_timeout_atomic(spm + pdn, v, v & L1_SRAM_PDN_ACK, 1, 1000);
++	spm_rmw(con, PWR_RST_B, 0);
++	spm_rmw(con, 0, PWR_CLK_DIS);
++	spm_rmw(con, PWR_ON, 0);
++	spm_rmw(con, PWR_ON_2ND, 0);
++	if (!ret)
++		ret = readl_poll_timeout_atomic(spm + SPM_PWR_STATUS, v, !(v & sta), 1, 1000);
++	raw_spin_unlock_irqrestore(&spm_cpu_lock, flags);
++	if (ret)
++		pr_err("mt6755-bringup: SPM power-off of CPU%u.%u timed out (con=%08x)\n",
++		       cl, n, readl(spm + con));
++	return ret;
++}
+-- 
+2.53.0
+

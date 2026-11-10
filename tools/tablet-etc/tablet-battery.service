@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep the fuel-gauge charge across reboots (restore at boot, save every 5 min and at shutdown)
+
+[Service]
+Type=simple
+StateDirectory=tablet-battery
+ExecStartPre=-/bin/sh -c 'f=/var/lib/tablet-battery/charge_uah; [ -s $f ] && cat $f > /sys/kernel/mt6755_pmic/charge_uah && echo "restored $(cat $f) uAh" || echo "no usable saved charge, gauge keeps its OCV start"'
+ExecStart=/bin/sh -c 'while sleep 300; do cat /sys/kernel/mt6755_pmic/charge_uah > /var/lib/tablet-battery/charge_uah.new && mv /var/lib/tablet-battery/charge_uah.new /var/lib/tablet-battery/charge_uah; done'
+ExecStop=/bin/sh -c 'cat /sys/kernel/mt6755_pmic/charge_uah > /var/lib/tablet-battery/charge_uah'
+
+[Install]
+WantedBy=multi-user.target

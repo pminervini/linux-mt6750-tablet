@@ -1,0 +1,588 @@
+From 4881d9c715033eef5943c2265b53ccc1e31210ab Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sat, 7 Nov 2026 09:09:00 +0000
+Subject: [PATCH 03/25] mt6750 tablet: eMMC (mtk-sd), USB gadget (mtu3 + t-phy
+ force-vbus, PHY at 0x11290000), SPM CPU power-on for cluster 0
+
+---
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts | 131 +++++++++++++++-
+ arch/arm64/kernel/head.S                      |   9 ++
+ arch/arm64/kernel/psci.c                      |  17 ++-
+ drivers/mmc/host/mtk-sd.c                     |  28 +++-
+ drivers/phy/mediatek/phy-mtk-tphy.c           |  17 +++
+ drivers/soc/mediatek/Makefile                 |   1 +
+ drivers/soc/mediatek/mt6755-bringup.c         | 144 ++++++++++++++++++
+ drivers/tty/serial/Kconfig                    |   4 +-
+ drivers/usb/mtu3/mtu3_plat.c                  |   3 +
+ drivers/watchdog/mtk_wdt.c                    |   2 +
+ 10 files changed, 341 insertions(+), 15 deletions(-)
+ create mode 100644 drivers/soc/mediatek/mt6755-bringup.c
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index 3dabc3660..cae08698a 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -13,6 +13,7 @@
+ /dts-v1/;
+ 
+ #include "mt6755.dtsi"
++#include <dt-bindings/phy/phy.h>
+ 
+ / {
+ 	model = "MT6750 tablet k50v1";
+@@ -74,20 +75,22 @@ ram_console@44400000 {
+ 		};
+ 
+ 		/*
+-		 * Inside the stock pstore region (which survives the BROM/DA readback);
+-		 * the upper part is the bring-up entry marker + RAM console.
++		 * Exactly the stock 3.18 ramoops parameters (mem 0xe0000, record 4K,
++		 * console 256K, ftrace 4K, pmsg 64K, ecc 0): both kernels place the
++		 * console zone at 0x4449f000, so after a reboot into stock Android our
++		 * log shows up as /sys/fs/pstore/console-ramoops.
+ 		 */
+ 		ramoops@44410000 {
+ 			compatible = "ramoops";
+-			reg = <0x0 0x44410000 0x0 0x70000>;
++			reg = <0x0 0x44410000 0x0 0xe0000>;
+ 			record-size = <0x1000>;
+ 			console-size = <0x40000>;
+ 			ftrace-size = <0x1000>;
+ 			pmsg-size = <0x10000>;
+ 		};
+ 
+-		bringup-ramcon@44480000 {
+-			reg = <0x0 0x44480000 0x0 0x20000>;
++		bringup-ramcon@b00c0000 {
++			reg = <0x0 0xb00c0000 0x0 0x40000>;
+ 			no-map;
+ 		};
+ 
+@@ -164,6 +167,124 @@ lk-overlay-sink {
+ 		keypad: keypad { status = "disabled"; };
+ 	};
+ 
++	/*
++	 * Stage 2: no clock/PMIC drivers yet. Describe the clocks and supplies
++	 * exactly as lk/preloader left them (fixed, always on, values from the
++	 * stock kernel's clk_summary) so mtk-sd / mtu3 / t-phy can probe.
++	 */
++	msdc0_src_clk: msdc0-src-clk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		/* stock: msdcpll 383.5 MHz; declared high so the divider never overclocks */
++		clock-frequency = <400000000>;
++	};
++
++	msdc0_hclk: msdc0-hclk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <273000000>;
++	};
++
++	ssusb_sys_clk: ssusb-sys-clk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <124800000>;
++	};
++
++	clk26m_ref: clk26m-ref {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <26000000>;
++	};
++
++	vemc_fixed: regulator-vemc {
++		compatible = "regulator-fixed";
++		regulator-name = "vemc33";
++		regulator-min-microvolt = <3000000>;
++		regulator-max-microvolt = <3000000>;
++		regulator-always-on;
++	};
++
++	vio18_fixed: regulator-vio18 {
++		compatible = "regulator-fixed";
++		regulator-name = "vio18";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		regulator-always-on;
++	};
++
++	vusb33_fixed: regulator-vusb33 {
++		compatible = "regulator-fixed";
++		regulator-name = "vusb33";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++	};
++
++	mmc0: mmc@11230000 {
++		compatible = "mediatek,mt6755-mmc", "mediatek,mt2701-mmc";
++		reg = <0 0x11230000 0 0x1000>;
++		interrupts = <GIC_SPI 79 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&msdc0_src_clk>, <&msdc0_hclk>;
++		clock-names = "source", "hclk";
++		bus-width = <8>;
++		/* bring-up: legacy timing only, no HS200/HS400 tuning yet */
++		max-frequency = <25000000>;
++		cap-mmc-highspeed;
++		non-removable;
++		no-sd;
++		no-sdio;
++		vmmc-supply = <&vemc_fixed>;
++		vqmmc-supply = <&vio18_fixed>;
++		/* bring-up: no pinctrl driver yet, keep lk's pin setup */
++		mediatek,pins-preset;
++	};
++
++	/* PHY ("ssusb_sif2" in stock DT) is at 0x11290000; 0x11280000 is the IPPC/SIF of the MAC. */
++	/* T-PHY v1 (vendor mu3phy: SPLLC 0x0, FMREG 0x100, IPPC/CHIP 0x700, U2 0x800, U3 0x900) */
++	u3phy: t-phy@11290000 {
++		compatible = "mediatek,mt6755-tphy", "mediatek,generic-tphy-v1";
++		/* shared SPLLC/FMREG banks only; IPPC at +0x700 belongs to mtu3 */
++		reg = <0 0x11290000 0 0x800>;
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		u2port0: usb-phy@11290800 {
++			reg = <0 0x11290800 0 0x100>;
++			clocks = <&clk26m_ref>;
++			clock-names = "ref";
++			#phy-cells = <1>;
++			/* MT6755: VBUS is sensed by the PMIC; stock forces the session */
++			mediatek,force-vbus;
++		};
++
++		/* U3 PHY banks (PHYD/PHYD_B2/PHYA/PHYA_DA): its PLL feeds SSUSB sys125/syspll */
++		u3port0: usb-phy@11290900 {
++			reg = <0 0x11290900 0 0x700>;
++			clocks = <&clk26m_ref>;
++			clock-names = "ref";
++			#phy-cells = <1>;
++		};
++	};
++
++	ssusb: usb@11271000 {
++		compatible = "mediatek,mt6755-mtu3", "mediatek,mtu3";
++		reg = <0 0x11271000 0 0x2e00>, <0 0x11280700 0 0x100>;
++		reg-names = "mac", "ippc";
++		interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_LOW>;
++		phys = <&u2port0 PHY_TYPE_USB2>;
++		mediatek,u3p-dis-msk = <1>;
++		clocks = <&ssusb_sys_clk>;
++		clock-names = "sys_ck";
++		vusb33-supply = <&vusb33_fixed>;
++		dr_mode = "peripheral";
++		maximum-speed = "high-speed";
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++	};
++
+ 	watchdog@10007000 {
+ 		compatible = "mediatek,mt6589-wdt";
+ 		/* stock reboot = AUTO_RESTART|EXTEN, else the preloader powers off */
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 23ac1e064..154bd5476 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -149,6 +149,15 @@ SYM_CODE_START(primary_entry)
+ 	movz	w12, #0xc242
+ 	movk	w12, #0x8545, lsl #16		/* VEMC on */
+ 	bl	bringup_pwrap_write
++	/*
++	 * MT6353 TOP_RST_MISC_SET (0x02aa) = 1: RG_WDTRSTB_EN. Make the PMIC
++	 * power-cycle all rails on a SoC watchdog reset (WDT_MODE EXTEN), as the
++	 * stock kernel's PMIC init does; without it a WDT reset leaves the board
++	 * half-reset and the boot ROM loops in download mode, then powers off.
++	 */
++	movz	w12, #0x0001
++	movk	w12, #0x8155, lsl #16
++	bl	bringup_pwrap_write
+ 	movz	x9, #0x7000
+ 	movk	x9, #0x1000, lsl #16		/* TOPRGU WDT_MODE */
+ 	ldr	w10, [x9]
+diff --git a/arch/arm64/kernel/psci.c b/arch/arm64/kernel/psci.c
+index fabd732d0..52afe0100 100644
+--- a/arch/arm64/kernel/psci.c
++++ b/arch/arm64/kernel/psci.c
+@@ -36,10 +36,25 @@ static int __init cpu_psci_cpu_prepare(unsigned int cpu)
+ 	return 0;
+ }
+ 
++/*
++ * MediaTek MT6755-class firmware: PSCI CPU_ON only records the entry point;
++ * the kernel must power the core up through the SPM afterwards (stock
++ * "mt-boot" enable-method). Overridden by drivers/soc/mediatek/mt6755-bringup.c.
++ */
++int __weak mtk_spm_cpu_can_boot(u64 mpidr) { return 0; }
++int __weak mtk_spm_cpu_power_on(u64 mpidr) { return 0; }
++
+ static int cpu_psci_cpu_boot(unsigned int cpu)
+ {
+ 	phys_addr_t pa_secondary_entry = __pa_symbol(secondary_entry);
+-	int err = psci_ops.cpu_on(cpu_logical_map(cpu), pa_secondary_entry);
++	int err;
++
++	err = mtk_spm_cpu_can_boot(cpu_logical_map(cpu));
++	if (err)
++		return err;
++	err = psci_ops.cpu_on(cpu_logical_map(cpu), pa_secondary_entry);
++	if (!err)
++		err = mtk_spm_cpu_power_on(cpu_logical_map(cpu));
+ 	if (err && err != -EPERM)
+ 		pr_err("failed to boot CPU%d (%d)\n", cpu, err);
+ 
+diff --git a/drivers/mmc/host/mtk-sd.c b/drivers/mmc/host/mtk-sd.c
+index 5b160fdad..d91325a52 100644
+--- a/drivers/mmc/host/mtk-sd.c
++++ b/drivers/mmc/host/mtk-sd.c
+@@ -921,6 +921,12 @@ static u64 msdc_timeout_cal(struct msdc_host *host, u64 ns, u64 clks)
+ }
+ 
+ /* clock control primitives */
++static void msdc_pin_select(struct msdc_host *host, struct pinctrl_state *st)
++{
++	if (host->pinctrl && !IS_ERR_OR_NULL(st))
++		pinctrl_select_state(host->pinctrl, st);
++}
++
+ static void msdc_set_timeout(struct msdc_host *host, u64 ns, u64 clks)
+ {
+ 	u64 timeout;
+@@ -1681,9 +1687,9 @@ static int msdc_ops_switch_volt(struct mmc_host *mmc, struct mmc_ios *ios)
+ 
+ 		/* Apply different pinctrl settings for different signal voltage */
+ 		if (ios->signal_voltage == MMC_SIGNAL_VOLTAGE_180)
+-			pinctrl_select_state(host->pinctrl, host->pins_uhs);
++			msdc_pin_select(host, host->pins_uhs);
+ 		else
+-			pinctrl_select_state(host->pinctrl, host->pins_default);
++			msdc_pin_select(host, host->pins_default);
+ 	}
+ 	return 0;
+ }
+@@ -1753,7 +1759,7 @@ static void msdc_enable_sdio_irq(struct mmc_host *mmc, int enb)
+ 			 * Since the current pinstate is pins_uhs, to ensure pinctrl select take
+ 			 * affect successfully, we change the pinstate to pins_eint firstly.
+ 			 */
+-			pinctrl_select_state(host->pinctrl, host->pins_eint);
++			msdc_pin_select(host, host->pins_eint);
+ 			ret = dev_pm_set_dedicated_wake_irq_reverse(host->dev, host->eint_irq);
+ 
+ 			if (ret) {
+@@ -1764,7 +1770,7 @@ static void msdc_enable_sdio_irq(struct mmc_host *mmc, int enb)
+ 				dev_dbg(host->dev, "SDIO eint irq: %d!\n", host->eint_irq);
+ 			}
+ 
+-			pinctrl_select_state(host->pinctrl, host->pins_uhs);
++			msdc_pin_select(host, host->pins_uhs);
+ 		} else {
+ 			dev_pm_clear_wake_irq(host->dev);
+ 		}
+@@ -3039,10 +3045,17 @@ static int msdc_drv_probe(struct platform_device *pdev)
+ 		return host->irq;
+ 
+ 	host->pinctrl = devm_pinctrl_get(&pdev->dev);
+-	if (IS_ERR(host->pinctrl))
++	if (PTR_ERR_OR_ZERO(host->pinctrl) == -ENODEV &&
++	    of_property_read_bool(pdev->dev.of_node, "mediatek,pins-preset")) {
++		/* bring-up: no pinctrl driver yet, pins left configured by the bootloader */
++		dev_warn(&pdev->dev, "no pinctrl, using bootloader pin setup\n");
++		host->pinctrl = NULL;
++	} else if (IS_ERR(host->pinctrl)) {
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(host->pinctrl),
+ 				     "Cannot find pinctrl");
++	}
+ 
++	if (host->pinctrl) {
+ 	host->pins_default = pinctrl_lookup_state(host->pinctrl, "default");
+ 	if (IS_ERR(host->pins_default)) {
+ 		dev_err(&pdev->dev, "Cannot find pinctrl default!\n");
+@@ -3054,6 +3067,7 @@ static int msdc_drv_probe(struct platform_device *pdev)
+ 		dev_err(&pdev->dev, "Cannot find pinctrl uhs!\n");
+ 		return PTR_ERR(host->pins_uhs);
+ 	}
++	}
+ 
+ 	/* Support for SDIO eint irq ? */
+ 	if ((mmc->pm_caps & MMC_PM_WAKE_SDIO_IRQ) && (mmc->pm_caps & MMC_PM_KEEP_POWER)) {
+@@ -3314,7 +3328,7 @@ static int msdc_runtime_suspend(struct device *dev)
+ 	if (sdio_irq_claimed(mmc)) {
+ 		if (host->pins_eint) {
+ 			disable_irq(host->irq);
+-			pinctrl_select_state(host->pinctrl, host->pins_eint);
++			msdc_pin_select(host, host->pins_eint);
+ 		}
+ 
+ 		__msdc_enable_sdio_irq(host, 0);
+@@ -3340,7 +3354,7 @@ static int msdc_runtime_resume(struct device *dev)
+ 	msdc_restore_reg(host);
+ 
+ 	if (sdio_irq_claimed(mmc) && host->pins_eint) {
+-		pinctrl_select_state(host->pinctrl, host->pins_uhs);
++		msdc_pin_select(host, host->pins_uhs);
+ 		enable_irq(host->irq);
+ 	}
+ 
+diff --git a/drivers/phy/mediatek/phy-mtk-tphy.c b/drivers/phy/mediatek/phy-mtk-tphy.c
+index acf506529..207c8f7ce 100644
+--- a/drivers/phy/mediatek/phy-mtk-tphy.c
++++ b/drivers/phy/mediatek/phy-mtk-tphy.c
+@@ -111,9 +111,14 @@
+ 
+ #define U3P_U2PHYDTM1		0x06C
+ #define P2C_RG_UART_EN			BIT(16)
++#define P2C_FORCE_VBUSVALID		BIT(13)
++#define P2C_FORCE_SESSEND		BIT(12)
++#define P2C_FORCE_BVALID		BIT(11)
++#define P2C_FORCE_AVALID		BIT(10)
+ #define P2C_FORCE_IDDIG		BIT(9)
+ #define P2C_RG_VBUSVALID		BIT(5)
+ #define P2C_RG_SESSEND			BIT(4)
++#define P2C_RG_BVALID			BIT(3)
+ #define P2C_RG_AVALID			BIT(2)
+ #define P2C_RG_IDDIG			BIT(1)
+ 
+@@ -333,6 +338,7 @@ struct mtk_phy_instance {
+ 	int discth;
+ 	int pre_emphasis;
+ 	bool bc12_en;
++	bool force_vbus;
+ 	bool type_force_mode;
+ };
+ 
+@@ -878,6 +884,16 @@ static void u2_phy_instance_power_on(struct mtk_tphy *tphy,
+ 
+ 	mtk_phy_clear_bits(com + U3P_U2PHYDTM1, P2C_RG_SESSEND);
+ 
++	/*
++	 * SoCs whose VBUS is sensed by the PMIC/charger rather than the PHY
++	 * comparator (e.g. MT6755) never see a session unless it is forced.
++	 */
++	if (instance->force_vbus)
++		mtk_phy_set_bits(com + U3P_U2PHYDTM1,
++				 P2C_FORCE_VBUSVALID | P2C_FORCE_SESSEND |
++				 P2C_FORCE_BVALID | P2C_FORCE_AVALID |
++				 P2C_RG_VBUSVALID | P2C_RG_BVALID | P2C_RG_AVALID);
++
+ 	if (tphy->pdata->avoid_rx_sen_degradation && index) {
+ 		mtk_phy_set_bits(com + U3D_U2PHYDCR0, P2C_RG_SIF_U2PLL_FORCE_ON);
+ 
+@@ -1133,6 +1149,7 @@ static void phy_parse_property(struct mtk_tphy *tphy,
+ 		return;
+ 
+ 	instance->bc12_en = device_property_read_bool(dev, "mediatek,bc12");
++	instance->force_vbus = device_property_read_bool(dev, "mediatek,force-vbus");
+ 	device_property_read_u32(dev, "mediatek,eye-src",
+ 				 &instance->eye_src);
+ 	device_property_read_u32(dev, "mediatek,eye-vrt",
+diff --git a/drivers/soc/mediatek/Makefile b/drivers/soc/mediatek/Makefile
+index 0665573e3..bb1fbb3d1 100644
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -9,3 +9,4 @@ obj-$(CONFIG_MTK_MMSYS) += mtk-mmsys.o
+ obj-$(CONFIG_MTK_MMSYS) += mtk-mutex.o
+ obj-$(CONFIG_MTK_SVS) += mtk-svs.o
+ obj-$(CONFIG_MTK_SOCINFO) += mtk-socinfo.o
++obj-$(CONFIG_ARCH_MEDIATEK) += mt6755-bringup.o
+diff --git a/drivers/soc/mediatek/mt6755-bringup.c b/drivers/soc/mediatek/mt6755-bringup.c
+new file mode 100644
+index 000000000..87263352b
+--- /dev/null
++++ b/drivers/soc/mediatek/mt6755-bringup.c
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MT6755/MT6750 bring-up helper (until a real clock driver is wired up):
++ * ungate the clocks the boot loader leaves off but our fixed-clock DT
++ * nodes assume running. Values from the stock kernel's clk_summary and the
++ * MT6755 clock tables (topckgen CLK_CFG_7, infracfg PDN2).
++ */
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/iopoll.h>
++#include <linux/spinlock.h>
++#include <asm/cputype.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/printk.h>
++
++#define TOPCKGEN		0x10000000
++#define  CLK_CFG_UPDATE		0x004
++#define  CLK_CFG_7		0x0b0
++#define  CLK_CFG_7_SET		0x0b4
++#define  CLK_CFG_7_CLR		0x0b8
++#define INFRACFG		0x10001000
++#define  INFRA_PDN_CLR2		0x0a8
++#define  INFRA_PDN_STA2		0x0ac
++
++static int __init mt6755_bringup_clocks(void)
++{
++	void __iomem *top, *infra;
++
++	if (!of_machine_is_compatible("mediatek,k50v1-tablet"))
++		return 0;
++	top = ioremap(TOPCKGEN, 0x1000);
++	infra = ioremap(INFRACFG, 0x1000);
++	if (!top || !infra)
++		return -ENOMEM;
++
++	pr_info("mt6755-bringup: before CLK_CFG_7=%08x INFRA_PDN_STA2=%08x\n",
++		readl(top + CLK_CFG_7), readl(infra + INFRA_PDN_STA2));
++	/* ssusb_top_sys_sel: parent univpll3_d2 (124.8 MHz, bit 8), ungate (pdn bit 15) */
++	writel(BIT(8), top + CLK_CFG_7_SET);
++	writel(BIT(15), top + CLK_CFG_7_CLR);
++	writel(BIT(28), top + CLK_CFG_UPDATE);
++	/* infra_ssusbtop (PDN2 bit 1) */
++	writel(BIT(1), infra + INFRA_PDN_CLR2);
++	pr_info("mt6755-bringup: after  CLK_CFG_7=%08x INFRA_PDN_STA2=%08x\n",
++		readl(top + CLK_CFG_7), readl(infra + INFRA_PDN_STA2));
++	iounmap(top);
++	iounmap(infra);
++	return 0;
++}
++arch_initcall(mt6755_bringup_clocks);
++
++/*
++ * Secondary CPU power-up through the SPM (stock mt_spm_mtcmos.c
++ * spm_mtcmos_ctrl_cpuN, STA_POWER_ON). Only cluster 0 (MP0) for now: MP1
++ * cores power up but never reach the kernel entry (cluster coherency /
++ * ATF state still missing), so they are refused before PSCI CPU_ON.
++ */
++#define SPM_BASE		0x10006000
++#define  SPM_POWERON_CONFIG_EN	0x000
++#define  SPM_PROJECT_CODE	0xb16
++#define  SPM_PWR_STATUS		0x180
++#define  SPM_PWR_STATUS_2ND	0x184
++#define  SPM_MP0_CPUTOP_PWR_CON	0x204
++#define  SPM_MP0_CPU_PWR_CON(n)	(0x208 + 4 * (n))
++#define  SPM_MP0_CPU_L1_PDN(n)	(0x248 + 4 * (n))
++#define  MP0_CPUTOP_STA		BIT(8)
++#define  MP0_CPU_STA(n)		BIT(9 + (n))
++#define PWR_RST_B		BIT(0)
++#define PWR_ISO			BIT(1)
++#define PWR_ON			BIT(2)
++#define PWR_ON_2ND		BIT(3)
++#define PWR_CLK_DIS		BIT(4)
++#define SRAM_CKISO		BIT(5)
++#define SRAM_ISOINT_B		BIT(6)
++#define L1_SRAM_PDN		BIT(0)
++#define L1_SRAM_PDN_ACK		BIT(8)
++
++static void __iomem *spm;
++static DEFINE_RAW_SPINLOCK(spm_cpu_lock);
++
++static bool mt6755_spm_cpu_ok(void)
++{
++	if (!of_machine_is_compatible("mediatek,k50v1-tablet"))
++		return false;
++	if (!spm)
++		spm = ioremap(SPM_BASE, 0x1000);
++	return spm;
++}
++
++int mtk_spm_cpu_can_boot(u64 mpidr)
++{
++	if (!mt6755_spm_cpu_ok())
++		return 0;
++	if (MPIDR_AFFINITY_LEVEL(mpidr, 1) != 0)
++		return -EOPNOTSUPP;
++	if (!(readl(spm + SPM_PWR_STATUS) & MP0_CPUTOP_STA))
++		return -ENODEV;
++	return 0;
++}
++
++static void spm_rmw(u32 off, u32 clr, u32 set)
++{
++	writel((readl(spm + off) & ~clr) | set, spm + off);
++}
++
++int mtk_spm_cpu_power_on(u64 mpidr)
++{
++	unsigned int n = MPIDR_AFFINITY_LEVEL(mpidr, 0);
++	u32 con = SPM_MP0_CPU_PWR_CON(n), pdn = SPM_MP0_CPU_L1_PDN(n), v;
++	unsigned long flags;
++	int ret;
++
++	if (!mt6755_spm_cpu_ok() || MPIDR_AFFINITY_LEVEL(mpidr, 1) != 0 || n > 3)
++		return 0;
++	if (readl(spm + SPM_PWR_STATUS) & MP0_CPU_STA(n))
++		return 0;	/* already powered */
++
++	raw_spin_lock_irqsave(&spm_cpu_lock, flags);
++	writel((SPM_PROJECT_CODE << 16) | BIT(0), spm + SPM_POWERON_CONFIG_EN);
++	spm_rmw(con, 0, PWR_ON);
++	spm_rmw(con, 0, PWR_ON_2ND);
++	ret = readl_poll_timeout_atomic(spm + SPM_PWR_STATUS, v, v & MP0_CPU_STA(n), 1, 1000);
++	if (!ret)
++		ret = readl_poll_timeout_atomic(spm + SPM_PWR_STATUS_2ND, v,
++						v & MP0_CPU_STA(n), 1, 1000);
++	if (!ret) {
++		spm_rmw(con, PWR_ISO, 0);
++		spm_rmw(pdn, L1_SRAM_PDN, 0);
++		ret = readl_poll_timeout_atomic(spm + pdn, v, !(v & L1_SRAM_PDN_ACK), 1, 1000);
++	}
++	if (!ret) {
++		udelay(1);
++		spm_rmw(con, 0, SRAM_ISOINT_B);
++		spm_rmw(con, SRAM_CKISO, 0);
++		spm_rmw(con, PWR_CLK_DIS, 0);
++		spm_rmw(con, 0, PWR_RST_B);
++	}
++	raw_spin_unlock_irqrestore(&spm_cpu_lock, flags);
++	if (ret)
++		pr_err("mt6755-bringup: SPM power-on of CPU%u timed out (con=%08x)\n",
++		       n, readl(spm + con));
++	return ret;
++}
+diff --git a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
+index 1bffa8e60..c298572de 100644
+--- a/drivers/tty/serial/Kconfig
++++ b/drivers/tty/serial/Kconfig
+@@ -80,12 +80,12 @@ config SERIAL_EARLYCON_RAM_FORCE
+ config SERIAL_EARLYCON_RAM_BASE
+ 	hex "Physical base of the forced RAM console (64K)"
+ 	depends on SERIAL_EARLYCON_RAM_FORCE
+-	default 0x44490000
++	default 0xb00d0000
+ 
+ config SERIAL_EARLYCON_RAM_HEAD
+ 	hex "Physical address of the kernel-entry marker (64 bytes)"
+ 	depends on SERIAL_EARLYCON_RAM_FORCE
+-	default 0x44480000
++	default 0xb00c0000
+ 
+ config SERIAL_EARLYCON_SEMIHOST
+ 	bool "Early console using Arm compatible semihosting"
+diff --git a/drivers/usb/mtu3/mtu3_plat.c b/drivers/usb/mtu3/mtu3_plat.c
+index b4f4c776a..b3a695529 100644
+--- a/drivers/usb/mtu3/mtu3_plat.c
++++ b/drivers/usb/mtu3/mtu3_plat.c
+@@ -110,6 +110,9 @@ static int ssusb_phy_power_on(struct ssusb_mtk *ssusb)
+ 		ret = phy_power_on(ssusb->phys[i]);
+ 		if (ret)
+ 			goto power_off_phy;
++		/* peripheral-only: let the PHY force IDDIG to device */
++		if (ssusb->dr_mode == USB_DR_MODE_PERIPHERAL)
++			phy_set_mode(ssusb->phys[i], PHY_MODE_USB_DEVICE);
+ 	}
+ 	return 0;
+ 
+diff --git a/drivers/watchdog/mtk_wdt.c b/drivers/watchdog/mtk_wdt.c
+index d14f3849d..ec7e2e864 100644
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -283,6 +283,8 @@ static void mtk_wdt_cycle_vemc(void __iomem *pw)
+ 	mdelay(100);
+ 	mtk_wdt_pwrap_rw(pw, true, MT6353_VEMC33_CON0, v | MT6353_VEMC33_EN, NULL);
+ 	mdelay(10);
++	/* TOP_RST_MISC_SET: RG_WDTRSTB_EN, PMIC full reset on WDT (EXTEN) */
++	mtk_wdt_pwrap_rw(pw, true, 0x02aa, 0x0001, NULL);
+ }
+ 
+ static int mtk_wdt_restart(struct watchdog_device *wdt_dev,
+-- 
+2.53.0
+

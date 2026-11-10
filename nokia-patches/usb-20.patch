@@ -1,0 +1,102 @@
+From dd51fb6e24d4302b62ebafda1face354ce521844 Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Sat, 7 Jan 2023 09:45:22 +0400
+Subject: [PATCH] arm64: dts: mediatek: mt6755: Add USB
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ arch/arm64/boot/dts/mediatek/mt6755.dtsi | 71 ++++++++++++++++++++++++
+ 1 file changed, 71 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6755.dtsi b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+index 4bb9edc7c3ae..31f2faf79277 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6755.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+@@ -6,6 +6,8 @@
+ 
+ #include <dt-bindings/interrupt-controller/irq.h>
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/clock/mediatek,mt6755-clk.h>
++#include <dt-bindings/phy/phy.h>
+ 
+ / {
+ 	compatible = "mediatek,mt6755";
+@@ -140,6 +142,75 @@ apmixedsys: clock-controller@1000c000 {
+ 			#clock-cells = <1>;
+ 		};
+ 
++		ssusb: usb@11271000 {
++			compatible = "mediatek,mt6755-mtu3", "mediatek,mtu3";
++			reg = <0 0x11271000 0 0x2e00>,
++				  <0 0x11280700 0 0x0100>;
++			reg-names = "mac", "ippc";
++			interrupts = <GIC_SPI 123 IRQ_TYPE_LEVEL_LOW>;
++			phys = <&usb2port0 PHY_TYPE_USB2>,
++				   <&usb2port1 PHY_TYPE_USB2>,
++				   <&usb2port2 PHY_TYPE_USB2>,
++				   <&usb2port3 PHY_TYPE_USB2>;
++			clocks = <&infrasys CLK_INFRA_ICUSB>,
++					 <&infrasys CLK_INFRA_SSUSB_TOP>;
++			clock-names = "sys_ck", "ref_ck";
++			#address-cells = <2>;
++			#size-cells = <2>;
++			ranges;
++			status = "disabled";
++
++			usb_host: usb@11270000 {
++				compatible = "mediatek,mt6755-xhci",
++							 "mediatek,mtk-xhci";
++				reg = <0 0x11270000 0 0x1000>;
++				reg-names = "mac";
++				interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_LOW>,
++							 <GIC_SPI 73 IRQ_TYPE_LEVEL_LOW>;
++				clocks = <&infrasys CLK_INFRA_ICUSB>,
++						 <&infrasys CLK_INFRA_SSUSB_TOP>;
++				clock-names = "sys_ck", "ref_ck";
++				status = "disabled";
++			};
++		};
++
++		usb3phy: t-phy@11280000 {
++			compatible = "mediatek,mt6755-tphy",
++						 "mediatek,generic-tphy-v2";
++			#address-cells = <1>;
++			#size-cells = <1>;
++			ranges = <0 0 0x11280000 0x1000>;
++			status = "disabled";
++
++			usb2port0: usb-phy@11280800 {
++				reg = <0 0x11280800 0 0x100>;
++				clocks = <&infrasys CLK_INFRA_SSUSB_TOP>;
++				clock-names = "ref";
++				#phy-cells = <1>;
++			};
++
++			usb2port1: usb-phy@11280900 {
++				reg = <0 0x11280900 0 0x100>;
++				clocks = <&infrasys CLK_INFRA_SSUSB_TOP>;
++				clock-names = "ref";
++				#phy-cells = <1>;
++			};
++
++			usb2port2: usb-phy@11280a00 {
++				reg = <0 0x11280a00 0 0x100>;
++				clocks = <&infrasys CLK_INFRA_SSUSB_TOP>;
++				clock-names = "ref";
++				#phy-cells = <1>;
++			};
++
++			usb2port3: usb-phy@11280b00 {
++				reg = <0 0x11280b00 0 0x100>;
++				clocks = <&infrasys CLK_INFRA_SSUSB_TOP>;
++				clock-names = "ref";
++				#phy-cells = <1>;
++			};
++		};
++
+ 		sysirq: intpol-controller@10200620 {
+ 			compatible = "mediatek,mt6755-sysirq",
+ 				     	 "mediatek,mt6577-sysirq";
+-- 
+GitLab
+

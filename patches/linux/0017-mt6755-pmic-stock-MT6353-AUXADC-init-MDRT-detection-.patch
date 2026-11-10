@@ -1,0 +1,62 @@
+From c66f03af3a5348ee47c40984b5e0c46c3f94842e Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Mon, 9 Nov 2026 07:06:33 +0000
+Subject: [PATCH 17/25] mt6755-pmic: stock MT6353 AUXADC init (MDRT detection
+ on) - GPS core starts
+
+PMIC_WRAP's ADC channel feeds AUXADC_ADC_OUT_MDRT to the connsys GPS core for co-TSX
+(DCXO temperature). With AUXADC_MDRT_DET_EN off (mainline default) the GPS core never
+leaves its start handshake after the firmware download. Values from the stock 3.18
+PMIC_INIT_SETTING_V1 (pmic/mt6353/pmic_initial_setting.c).
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index f61b29b4c..c4602ba12 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -756,6 +756,32 @@ static const struct power_supply_desc usb_desc = {
+ 
+ static struct kobject *pmic_kobj;
+ 
++/*
++ * AUXADC part of the stock MT6353 PMIC_INIT_SETTING_V1 (3.18 pmic/mt6353/pmic_initial_setting.c).
++ * Not cosmetic: AUXADC_MDRT_DET_EN starts the periodic "modem real-time" conversion whose
++ * result (AUXADC_ADC_OUT_MDRT, 0x0e40) is what PMIC_WRAP's ADC channel hands to the connsys
++ * GPS core for co-TSX (DCXO crystal temperature). Without it the GPS core waits forever after
++ * the firmware download (no 0xFE42 from mnld's point of view).
++ */
++static const struct { u16 adr, mask; u8 shift; u16 val; } auxadc_init_tbl[] = {
++	{ 0x0EB4, 0xfff, 4, 0x955 },	/* AUXADC_TRIM_CH2..7_SEL = 1,1,1,1,1,2 */
++	{ 0x0EB6, 0xff, 0, 0x55 },	/* AUXADC_TRIM_CH8..11_SEL = 1 */
++	{ 0x0EC8, 1, 14, 1 },		/* AUXADC_START_SHADE_EN */
++	{ 0x0F18, 0x3ff, 0, 0xc },	/* AUXADC_MDBG_DET_PRD */
++	{ 0x0F1E, 0x3ff, 0, 0xc },	/* AUXADC_MDRT_DET_PRD */
++	{ 0x0F1E, 1, 15, 1 },		/* AUXADC_MDRT_DET_EN */
++	{ 0x0F22, 1, 2, 1 },		/* AUXADC_MDRT_DET_WKUP_EN */
++};
++
++static void auxadc_hw_init(void)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(auxadc_init_tbl); i++)
++		mt6755_pmic_rmw(auxadc_init_tbl[i].adr, auxadc_init_tbl[i].mask,
++				auxadc_init_tbl[i].shift, auxadc_init_tbl[i].val);
++}
++
+ static int __init mt6755_pmic_init(void)
+ {
+ 	struct kobject *kobj;
+@@ -777,6 +803,7 @@ static int __init mt6755_pmic_init(void)
+ 	bs.temp = 250;
+ 	/* touch controller supply (stock vtouch = VLDO28, fixed 2.8 V): LDO_SHARE_VLDO28_CON0 b1 */
+ 	mt6755_pmic_rmw(0x0A16, 1, 1, 1);
++	auxadc_hw_init();
+ 	chr_hw_init();
+ 	INIT_DELAYED_WORK(&chr_work, chr_work_fn);
+ 	queue_delayed_work(system_freezable_wq, &chr_work, 0);
+-- 
+2.53.0
+

@@ -1,0 +1,327 @@
+From 8a6d342827520e3604c6c9247f45197d419ae1ff Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sun, 8 Nov 2026 00:19:44 +0000
+Subject: [PATCH 12/25] soc: mediatek: mt6755-pmic: coulomb-counting fuel gauge
+ (MT6353 FGADC)
+
+- FGADC latch/read/clear as stock fgauge_read_columb/current; R_FG 10 mOhm, CAR_TUNE 118
+  (stock DT; charger current = system load + battery current balances with them)
+- remaining charge integrated from CAR, started from the OCV table once the boot load
+  drops below 300 mA, anchored at 100 % on termination and 3 % near empty;
+  capacity/charge_now/charge_full/current_now (real battery current) in power_supply
+- termination on gauge current (< 60 mA at >= 4.15 V): the ISENSE path also feeds the
+  system, so it never tapered; recharge below 4.05 V (param recharge_mv)
+- /sys/kernel/mt6755_pmic/charge_uah: save/restore across reboots, restores more than
+  25 % away from the OCV estimate are refused
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 194 +++++++++++++++++++++++++----
+ 1 file changed, 170 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index 7242802e5..885b1e52e 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -19,8 +19,12 @@
+  *    0..45 C (resume 3..42 C), stop when full (>= 4.15 V and < 100 mA taper
+  *    for 60 s, recharge below 4.10 V), software VBAT cap 4.25 V, NTC open/
+  *    short = no charging. Orderly power-off below 3.45 V when not charging.
+- *  - power_supply "battery" (status/health/voltage/current/temp/capacity,
+- *    capacity from the stock 25 C OCV profile of this tablet's 4.2 V cell)
++ *  - fuel gauge: MT6353 FGADC coulomb counter (R_FG 10 mOhm, CAR_TUNE 118, both
++ *    from the stock DT and confirmed by charger-current = load + battery-current),
++ *    started from the OCV table at boot, anchored at 100 % on charge termination
++ *    and near empty; current_now is the real battery current (the charger ISENSE
++ *    path also feeds the system). charge_uah can be restored across reboots.
++ *  - power_supply "battery" (status/health/voltage/current/temp/capacity/charge)
+  *    and "usb" (online = charger detected).
+  *  - rtc: MT6353 RTC (MT6397 layout at PMIC 0x4000), year base 1968 as stock.
+  *  - /sys/kernel/mt6755_pmic/boot_recovery: RTC_PDN1 FAC_RESET, the flag stock
+@@ -308,11 +312,13 @@ static ssize_t charging_show(struct kobject *k, struct kobj_attribute *a, char *
+ 
+ static ssize_t state_show(struct kobject *k, struct kobj_attribute *a, char *buf);
+ static struct kobj_attribute state_attr = __ATTR_RO(state);
++static struct kobj_attribute charge_uah_attr;
+ static struct kobj_attribute battery_mv_attr = __ATTR_RO(battery_mv);
+ static struct kobj_attribute charge_ma_attr = __ATTR_RO(charge_ma);
+ static struct kobj_attribute charging_attr = __ATTR_RO(charging);
+ static struct attribute *pmic_attrs[] = {
+-	&battery_mv_attr.attr, &charge_ma_attr.attr, &charging_attr.attr, &state_attr.attr, NULL,
++	&battery_mv_attr.attr, &charge_ma_attr.attr, &charging_attr.attr, &state_attr.attr,
++	&charge_uah_attr.attr, NULL,
+ };
+ static const struct attribute_group pmic_group = { .attrs = pmic_attrs };
+ 
+@@ -349,6 +355,12 @@ MODULE_PARM_DESC(ntc_comp_mohm, "NTC ground-shift compensation (mV per A of batt
+ static int r_int_mohm = 150;
+ module_param(r_int_mohm, int, 0644);
+ MODULE_PARM_DESC(r_int_mohm, "battery internal resistance for the OCV estimate");
++static int qmax_mah = 2707;	/* stock DT q_max_pos_25; calibrate with a full discharge */
++module_param(qmax_mah, int, 0644);
++MODULE_PARM_DESC(qmax_mah, "usable battery capacity (mAh)");
++static int recharge_mv = 4050;
++module_param(recharge_mv, int, 0644);
++MODULE_PARM_DESC(recharge_mv, "after charge termination, resume charging below this voltage");
+ static int lowbat_mv = 3450;
+ module_param(lowbat_mv, int, 0644);
+ MODULE_PARM_DESC(lowbat_mv, "power off below this battery voltage when not charging (0 = never)");
+@@ -359,10 +371,12 @@ static const char * const chg_names[] = {
+ };
+ 
+ static struct {
+-	int vbat, ibat, vntc, temp, cap16;	/* mV, mA (+ = charging), mV, 0.1 C, % x16 */
+-	bool chr, ntc_ok, valid, hot, cold, ov;
++	int vbat, ibat, vntc, temp;	/* mV, charger mA, mV, 0.1 C */
++	int fg_ma, last_car, cap;	/* battery mA (+ = charging), raw CAR, % */
++	s64 q_nah;			/* remaining charge, nAh */
++	bool chr, ntc_ok, q_valid, car_valid, hot, cold, ov;
+ 	enum chg_state st;
+-	int full_cnt, low_cnt;
++	int full_cnt, low_cnt, start_wait;
+ } bs;
+ static struct power_supply *bat_psy, *usb_psy;
+ 
+@@ -405,6 +419,113 @@ static int ocv_capacity(int ocv)
+ 	return 0;
+ }
+ 
++/* ---------------- fuel gauge ---------------- */
++#define FGADC_CON0	0x0CA4	/* [15:8] cmd: 0x02 latch, 0x08 clear; b10 latched; [7:0] cfg (0x29 on) */
++#define FGADC_CON1	0x0CA6	/* CAR[34:19], b15 = sign */
++#define FGADC_CON2	0x0CA8	/* CAR[18:3] */
++#define FGADC_CON11	0x0CBA	/* FG_CURRENT_OUT, signed */
++#define CLK_CKPDN_CON2_CLR 0x027E /* b9 FGADC_ANA, b10 FGADC_DIG clock power-down */
++#define R_FG_MOHM	10
++#define CAR_TUNE	118
++/* stock LSBs at 20 mOhm: CAR 359.86 uAh / 8 (OSR), current 158.122 uA */
++#define CAR_NAH		(359860LL * 20 * CAR_TUNE / (8 * R_FG_MOHM * 100))
++#define CUR_NA		(158122LL * 20 * CAR_TUNE / (R_FG_MOHM * 100))
++
++static int fg_wait(bool latched)
++{
++	u16 v;
++
++	for (int i = 0; i < 400; i++) {
++		if (mt6755_pmic_read(FGADC_CON0, &v))
++			return -EIO;
++		if (!!(v & BIT(10)) == latched)
++			return 0;
++		udelay(50);
++	}
++	return -ETIMEDOUT;
++}
++
++/* stock fgauge_read_columb/current: latch, read, clear, restore */
++static int fg_read(int *car, int *ma)
++{
++	u16 c0, c1 = 0, c2 = 0, ci = 0;
++	int ret, raw;
++
++	mutex_lock(&adc_lock);
++	ret = mt6755_pmic_read(FGADC_CON0, &c0);
++	if (ret)
++		goto out;
++	c0 &= 0xff;
++	if (!(c0 & BIT(0))) {			/* gauge off (e.g. after a cold power-up): start it */
++		mt6755_pmic_write(CLK_CKPDN_CON2_CLR, BIT(9) | BIT(10));
++		mt6755_pmic_write(FGADC_CON0, 0x28);
++		mt6755_pmic_write(FGADC_CON0, 0x29);
++		c0 = 0x29;
++		pr_info("mt6755-pmic: fuel gauge started\n");
++	}
++	mt6755_pmic_write(FGADC_CON0, 0x0200 | c0);
++	ret = fg_wait(true);
++	if (!ret) {
++		mt6755_pmic_read(FGADC_CON1, &c1);
++		mt6755_pmic_read(FGADC_CON2, &c2);
++		mt6755_pmic_read(FGADC_CON11, &ci);
++	}
++	mt6755_pmic_write(FGADC_CON0, 0x0800 | c0);
++	fg_wait(false);
++	mt6755_pmic_write(FGADC_CON0, c0);
++out:
++	mutex_unlock(&adc_lock);
++	if (ret)
++		return ret;
++	raw = (c2 >> 11) | ((c1 & 0x0fff) << 5);
++	if (c1 & 0x8000)
++		raw -= 0x1ffff;
++	*car = raw;
++	*ma = div_s64((s64)(s16)ci * CUR_NA, 1000000);
++	return 0;
++}
++
++static s64 ocv_q_nah(void)
++{
++	return (s64)ocv_capacity(bs.vbat - bs.fg_ma * r_int_mohm / 1000) * qmax_mah * 10000;
++}
++
++static void fg_update(void)
++{
++	s64 qmax = (s64)qmax_mah * 1000000;
++	int car, ma, d;
++
++	if (!fg_read(&car, &ma)) {
++		bs.fg_ma = ma;
++		if (bs.car_valid) {
++			d = car - bs.last_car;
++			if (abs(d) < 5000)	/* else the counter was reset under us */
++				bs.q_nah += d * CAR_NAH;
++		}
++		bs.last_car = car;
++		bs.car_valid = true;
++	}
++	/* start from the OCV table, but not under a boot-time load spike (< 300 mA or after 30 s) */
++	if (!bs.q_valid && (abs(bs.fg_ma) < 300 || ++bs.start_wait > 15)) {
++		bs.q_nah = ocv_q_nah();
++		bs.q_valid = true;
++		pr_info("mt6755-pmic: gauge start %lld mAh (%d mV, %d mA)\n",
++			div_s64(bs.q_nah, 1000000), bs.vbat, bs.fg_ma);
++	}
++	if (bs.st == CHG_FULL)
++		bs.q_nah = qmax;
++	else if (!bs.chr && bs.vbat > 2500 && bs.vbat < 3500 && bs.q_nah > qmax * 3 / 100)
++		bs.q_nah = qmax * 3 / 100;	/* empty anchor */
++	if (!bs.q_valid) {
++		bs.q_nah = ocv_q_nah();		/* provisional until the real start */
++		bs.q_nah = clamp(bs.q_nah, 0LL, qmax);
++		bs.cap = (int)div64_s64(bs.q_nah * 100 + qmax / 2, qmax);
++		return;
++	}
++	bs.q_nah = clamp(bs.q_nah, 0LL, qmax);
++	bs.cap = (int)div64_s64(bs.q_nah * 100 + qmax / 2, qmax);	/* qmax > 2^31 nAh */
++}
++
+ static void chr_disable(void)
+ {
+ 	mt6755_pmic_rmw(CHR_CON0, 1, 4, 0);	/* CHR_EN */
+@@ -413,7 +534,7 @@ static void chr_disable(void)
+ static void chr_work_fn(struct work_struct *w)
+ {
+ 	enum chg_state st = bs.st, old = bs.st;
+-	int vbat, ibat, vntc, t, cap, oldcap = bs.cap16 / 16;
++	int vbat, ibat, vntc, t, oldcap = bs.cap;
+ 	bool chr, oldchr = bs.chr;
+ 	u16 c0;
+ 
+@@ -431,6 +552,7 @@ static void chr_work_fn(struct work_struct *w)
+ 			bs.temp = t;
+ 	}
+ 	bs.chr = chr;
++	fg_update();
+ 
+ 	/* hysteresis: 0..45 C allowed, resume at 3..42 C; VBAT cap 4.25 V, resume 4.15 V */
+ 	if (bs.temp > 450)
+@@ -459,11 +581,12 @@ static void chr_work_fn(struct work_struct *w)
+ 	else if (bs.ov)
+ 		st = CHG_OV;
+ 	else if (st == CHG_FULL)
+-		st = bs.vbat < 4100 ? CHG_ON : CHG_FULL;
++		st = bs.vbat < recharge_mv ? CHG_ON : CHG_FULL;
+ 	else
+ 		st = CHG_ON;
+ 
+-	if (st == CHG_ON && bs.vbat >= 4150 && bs.ibat < 100) {
++	/* termination: at CV and the battery itself takes < 60 mA (gauge, not charger, current) */
++	if (st == CHG_ON && bs.vbat >= 4150 && bs.fg_ma < 60) {
+ 		if (++bs.full_cnt >= 30)
+ 			st = CHG_FULL;
+ 	} else {
+@@ -479,15 +602,8 @@ static void chr_work_fn(struct work_struct *w)
+ 	}
+ 	bs.st = st;
+ 
+-	/* capacity: OCV estimate, smoothed (time constant ~16 s) */
+-	cap = ocv_capacity(bs.vbat - bs.ibat * r_int_mohm / 1000);
+ 	if (st == CHG_FULL)
+-		cap = 100;
+-	if (!bs.valid)
+-		bs.cap16 = cap * 16;
+-	else
+-		bs.cap16 += (cap * 16 - bs.cap16) / 8;
+-	bs.valid = true;
++		fg_update();		/* re-anchor at 100 % in the same tick */
+ 
+ 	/* low battery: orderly power-off before the eMMC browns out */
+ 	if (lowbat_mv && !chr && bs.vbat > 2500 && bs.vbat < lowbat_mv) {
+@@ -502,9 +618,9 @@ static void chr_work_fn(struct work_struct *w)
+ 
+ 	if (st != old)
+ 		pr_info("mt6755-pmic: %s -> %s (%d mV, %d mA, %d.%d C, ntc %d mV)\n",
+-			chg_names[old], chg_names[st], bs.vbat, bs.ibat,
++			chg_names[old], chg_names[st], bs.vbat, bs.fg_ma,
+ 			bs.temp / 10, abs(bs.temp % 10), bs.vntc);
+-	if (bat_psy && (st != old || bs.cap16 / 16 != oldcap))
++	if (bat_psy && (st != old || bs.cap != oldcap))
+ 		power_supply_changed(bat_psy);
+ 	if (usb_psy && chr != oldchr)
+ 		power_supply_changed(usb_psy);
+@@ -514,17 +630,40 @@ static void chr_work_fn(struct work_struct *w)
+ 
+ static ssize_t state_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+ {
+-	return sysfs_emit(buf, "%s vbat=%d ibat=%d temp=%d ntc_mv=%d ntc_ok=%d cap=%d\n",
+-			  chg_names[bs.st], bs.vbat, bs.ibat, bs.temp, bs.vntc, bs.ntc_ok,
+-			  bs.cap16 / 16);
++	return sysfs_emit(buf, "%s vbat=%d ibat=%d chr_ma=%d temp=%d ntc_mv=%d ntc_ok=%d cap=%d q_mah=%lld ocv_cap=%d\n",
++			  chg_names[bs.st], bs.vbat, bs.fg_ma, bs.ibat, bs.temp, bs.vntc, bs.ntc_ok,
++			  bs.cap, div_s64(bs.q_nah, 1000000),
++			  ocv_capacity(bs.vbat - bs.fg_ma * r_int_mohm / 1000));
+ }
+ 
++/* save/restore the gauge across reboots; a restore far from the OCV estimate is refused */
++static ssize_t charge_uah_show(struct kobject *k, struct kobj_attribute *a, char *buf)
++{
++	return sysfs_emit(buf, "%lld\n", div_s64(bs.q_nah, 1000));
++}
++
++static ssize_t charge_uah_store(struct kobject *k, struct kobj_attribute *a, const char *buf, size_t n)
++{
++	s64 v, qmax = (s64)qmax_mah * 1000000;
++
++	if (kstrtos64(buf, 10, &v) || v < 0 || v * 1000 > qmax)
++		return -EINVAL;
++	if (abs(v * 1000 - ocv_q_nah()) > qmax / 4)
++		return -ERANGE;
++	bs.q_nah = v * 1000;
++	pr_info("mt6755-pmic: gauge restored to %lld mAh\n", div_s64(v, 1000));
++	return n;
++}
++static struct kobj_attribute charge_uah_attr = __ATTR(charge_uah, 0644, charge_uah_show, charge_uah_store);
++
+ /* ---------------- power_supply ---------------- */
+ static enum power_supply_property bat_props[] = {
+ 	POWER_SUPPLY_PROP_STATUS, POWER_SUPPLY_PROP_HEALTH, POWER_SUPPLY_PROP_PRESENT,
+ 	POWER_SUPPLY_PROP_TECHNOLOGY, POWER_SUPPLY_PROP_VOLTAGE_NOW,
+ 	POWER_SUPPLY_PROP_CURRENT_NOW, POWER_SUPPLY_PROP_TEMP, POWER_SUPPLY_PROP_CAPACITY,
+ 	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN, POWER_SUPPLY_PROP_SCOPE,
++	POWER_SUPPLY_PROP_CHARGE_NOW, POWER_SUPPLY_PROP_CHARGE_FULL,
++	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+ };
+ 
+ static int bat_get(struct power_supply *psy, enum power_supply_property psp,
+@@ -554,13 +693,20 @@ static int bat_get(struct power_supply *psy, enum power_supply_property psp,
+ 		val->intval = bs.vbat * 1000;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CURRENT_NOW:
+-		val->intval = bs.ibat * 1000;
++		val->intval = bs.fg_ma * 1000;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_NOW:
++		val->intval = (int)div_s64(bs.q_nah, 1000);
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_FULL:
++	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
++		val->intval = qmax_mah * 1000;
+ 		break;
+ 	case POWER_SUPPLY_PROP_TEMP:
+ 		val->intval = bs.temp;
+ 		break;
+ 	case POWER_SUPPLY_PROP_CAPACITY:
+-		val->intval = bs.cap16 / 16;
++		val->intval = bs.cap;
+ 		break;
+ 	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
+ 		val->intval = 4200000;
+-- 
+2.53.0
+

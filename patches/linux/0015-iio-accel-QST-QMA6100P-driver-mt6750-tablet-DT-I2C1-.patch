@@ -1,0 +1,408 @@
+From 811a2f24843646757dfecd21c472108c6e1896db Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sun, 8 Nov 2026 11:30:51 +0000
+Subject: [PATCH 15/25] iio: accel: QST QMA6100P driver; mt6750 tablet DT: I2C1
+ + accelerometer@12, drop the bogus Goodix node (touch is a GSL1680 that does
+ not answer)
+
+---
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts |  30 +-
+ drivers/iio/accel/Kconfig                     |   7 +
+ drivers/iio/accel/Makefile                    |   1 +
+ drivers/iio/accel/qma6100p.c                  | 313 ++++++++++++++++++
+ 4 files changed, 343 insertions(+), 8 deletions(-)
+ create mode 100644 drivers/iio/accel/qma6100p.c
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index 9d0972b94..fabdf6b54 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -333,14 +333,28 @@ i2c_0: i2c@11007000 {
+ 
+ 		/* 0x3e: LCD bias (NT50358), programmed by lk: leave alone */
+ 
+-		touchscreen@5d {
+-			compatible = "goodix,gt911";
+-			reg = <0x5d>;
+-			interrupts-extended = <&gpio 1 IRQ_TYPE_EDGE_FALLING>;
+-			irq-gpios = <&gpio 1 GPIO_ACTIVE_HIGH>;
+-			reset-gpios = <&gpio 10 GPIO_ACTIVE_HIGH>;
+-			touchscreen-size-x = <800>;
+-			touchscreen-size-y = <1280>;
++		/*
++		 * Touch: Silead GSL1680 at 0x40 (stock gslX68X driver; the 0x5d cap_touch node in the
++		 * stock DT is MediaTek's generic placeholder). It does not answer under mainline yet
++		 * (nothing on this bus ACKs, see tools/regdiff), so no node for now.
++		 */
++	};
++
++	/* I2C1 (SDA1/SCL1 = GPIO91/94, mode 1 from lk): accelerometer */
++	i2c_1: i2c@11008000 {
++		compatible = "mediatek,mt6755-i2c";
++		reg = <0 0x11008000 0 0x1000>, <0 0x11000180 0 0x80>;
++		interrupts = <GIC_SPI 85 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&i2c_src_clk>, <&clk26m_ref>;
++		clock-names = "main", "dma";
++		clock-div = <10>;
++		clock-frequency = <100000>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		accelerometer@12 {
++			compatible = "qst,qma6100p";
++			reg = <0x12>;
+ 		};
+ 	};
+ 
+diff --git a/drivers/iio/accel/Kconfig b/drivers/iio/accel/Kconfig
+index 4094299e2..8c887def7 100644
+--- a/drivers/iio/accel/Kconfig
++++ b/drivers/iio/accel/Kconfig
+@@ -656,6 +656,13 @@ config MXC6255
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called mxc6255.
+ 
++config QMA6100P
++	tristate "QST QMA6100P 3-axis accelerometer"
++	depends on I2C
++	help
++	  Say yes here to build support for the QST QMA6100P accelerometer
++	  (as found in MT6750 tablets).
++
+ config SCA3000
+ 	select IIO_BUFFER
+ 	select IIO_KFIFO_BUF
+diff --git a/drivers/iio/accel/Makefile b/drivers/iio/accel/Makefile
+index fa440a859..51242c482 100644
+--- a/drivers/iio/accel/Makefile
++++ b/drivers/iio/accel/Makefile
+@@ -72,6 +72,7 @@ obj-$(CONFIG_MSA311)		+= msa311.o
+ obj-$(CONFIG_MXC4005)		+= mxc4005.o
+ obj-$(CONFIG_MXC6255)		+= mxc6255.o
+ 
++obj-$(CONFIG_QMA6100P)	+= qma6100p.o
+ obj-$(CONFIG_SCA3000)		+= sca3000.o
+ obj-$(CONFIG_SCA3300)		+= sca3300.o
+ 
+diff --git a/drivers/iio/accel/qma6100p.c b/drivers/iio/accel/qma6100p.c
+new file mode 100644
+index 000000000..e55e1caa1
+--- /dev/null
++++ b/drivers/iio/accel/qma6100p.c
+@@ -0,0 +1,313 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * QST QMA6100P 3-axis accelerometer (I2C).
++ *
++ * 14-bit samples, little endian, left aligned in DATA 0x01..0x06 (bit 0 of
++ * each LSB is a new-data flag). Range 2/4/8/16/32 g via FSR (0x0F). The
++ * start-up sequence (soft reset, then the 0x4a/0x56/0x5f writes) is QST's
++ * reference init, as used by the stock MT6750 tablet kernel.
++ */
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/iio/iio.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/pm.h>
++
++#define QMA6100P_CHIP_ID	0x00
++#define QMA6100P_CHIP_ID_VAL	0x90
++#define QMA6100P_DATA		0x01
++#define QMA6100P_FSR		0x0f
++#define QMA6100P_BW		0x10
++#define QMA6100P_PM		0x11
++#define QMA6100P_PM_ACTIVE	BIT(7)
++#define QMA6100P_RESET		0x36
++#define QMA6100P_RESET_VAL	0xb6
++
++/* FSR register value -> range; 14-bit two's complement over +-range */
++static const struct {
++	u8 fsr;
++	int micro_g_per_lsb;	/* scale in m/s^2 is derived from this */
++} qma6100p_ranges[] = {
++	{ 0x01, 244 },		/*  2 g: 4096 LSB/g */
++	{ 0x02, 488 },		/*  4 g */
++	{ 0x04, 977 },		/*  8 g */
++	{ 0x08, 1953 },		/* 16 g */
++};
++
++struct qma6100p {
++	struct i2c_client *client;
++	struct mutex lock;	/* range changes vs reads */
++	struct iio_mount_matrix orientation;
++	int range;		/* index into qma6100p_ranges */
++};
++
++static const struct iio_mount_matrix *
++qma6100p_get_mount_matrix(const struct iio_dev *indio_dev,
++			  const struct iio_chan_spec *chan)
++{
++	struct qma6100p *data = iio_priv(indio_dev);
++
++	return &data->orientation;
++}
++
++static const struct iio_chan_spec_ext_info qma6100p_ext_info[] = {
++	IIO_MOUNT_MATRIX(IIO_SHARED_BY_DIR, qma6100p_get_mount_matrix),
++	{ }
++};
++
++#define QMA6100P_CHANNEL(_axis, _idx) {					\
++	.type = IIO_ACCEL,						\
++	.modified = 1,							\
++	.channel2 = IIO_MOD_##_axis,					\
++	.address = _idx,						\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),			\
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),		\
++	.info_mask_shared_by_type_available = BIT(IIO_CHAN_INFO_SCALE),	\
++	.ext_info = qma6100p_ext_info,					\
++}
++
++static const struct iio_chan_spec qma6100p_channels[] = {
++	QMA6100P_CHANNEL(X, 0),
++	QMA6100P_CHANNEL(Y, 1),
++	QMA6100P_CHANNEL(Z, 2),
++};
++
++/* scale = micro_g_per_lsb * 9.80665 m/s^2 / 1e6, as IIO_VAL_INT_PLUS_NANO */
++static int qma6100p_scale_nano(int range)
++{
++	return DIV_ROUND_CLOSEST(qma6100p_ranges[range].micro_g_per_lsb * 980665, 100);
++}
++
++static int qma6100p_write(struct qma6100p *data, u8 reg, u8 val)
++{
++	return i2c_smbus_write_byte_data(data->client, reg, val);
++}
++
++static int qma6100p_set_range(struct qma6100p *data, int range)
++{
++	int ret;
++
++	/* FSR is only taken while not sampling */
++	ret = qma6100p_write(data, QMA6100P_PM, 0);
++	if (!ret)
++		ret = qma6100p_write(data, QMA6100P_FSR, qma6100p_ranges[range].fsr);
++	if (!ret)
++		ret = qma6100p_write(data, QMA6100P_PM, QMA6100P_PM_ACTIVE);
++	if (!ret) {
++		data->range = range;
++		msleep(20);
++	}
++	return ret;
++}
++
++static int qma6100p_init(struct qma6100p *data)
++{
++	static const u8 seq[][2] = {
++		{ QMA6100P_PM, 0x80 }, { QMA6100P_PM, 0x84 },
++		{ 0x4a, 0x20 }, { 0x56, 0x01 }, { 0x5f, 0x80 },
++	};
++	int ret, i;
++
++	ret = qma6100p_write(data, QMA6100P_RESET, QMA6100P_RESET_VAL);
++	if (ret)
++		return ret;
++	usleep_range(10000, 11000);
++	ret = qma6100p_write(data, QMA6100P_RESET, 0);
++	if (ret)
++		return ret;
++	usleep_range(10000, 11000);
++	for (i = 0; i < ARRAY_SIZE(seq); i++) {
++		ret = qma6100p_write(data, seq[i][0], seq[i][1]);
++		if (ret)
++			return ret;
++	}
++	usleep_range(2000, 3000);
++	ret = qma6100p_write(data, 0x5f, 0x00);
++	if (ret)
++		return ret;
++	usleep_range(10000, 11000);
++	ret = qma6100p_write(data, QMA6100P_BW, 0x05);
++	if (ret)
++		return ret;
++	return qma6100p_set_range(data, data->range);
++}
++
++static int qma6100p_read_raw(struct iio_dev *indio_dev,
++			     struct iio_chan_spec const *chan,
++			     int *val, int *val2, long mask)
++{
++	struct qma6100p *data = iio_priv(indio_dev);
++	__le16 buf[3];
++	int ret;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++		mutex_lock(&data->lock);
++		ret = i2c_smbus_read_i2c_block_data(data->client, QMA6100P_DATA,
++						    sizeof(buf), (u8 *)buf);
++		mutex_unlock(&data->lock);
++		if (ret < 0)
++			return ret;
++		if (ret != sizeof(buf))
++			return -EIO;
++		*val = sign_extend32(le16_to_cpu(buf[chan->address]) >> 2, 13);
++		return IIO_VAL_INT;
++	case IIO_CHAN_INFO_SCALE:
++		*val = 0;
++		*val2 = qma6100p_scale_nano(data->range);
++		return IIO_VAL_INT_PLUS_NANO;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int qma6100p_read_avail(struct iio_dev *indio_dev,
++			       struct iio_chan_spec const *chan,
++			       const int **vals, int *type, int *length,
++			       long mask)
++{
++	static int scales[ARRAY_SIZE(qma6100p_ranges) * 2];
++	int i;
++
++	if (mask != IIO_CHAN_INFO_SCALE)
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(qma6100p_ranges); i++) {
++		scales[2 * i] = 0;
++		scales[2 * i + 1] = qma6100p_scale_nano(i);
++	}
++	*vals = scales;
++	*type = IIO_VAL_INT_PLUS_NANO;
++	*length = ARRAY_SIZE(scales);
++	return IIO_AVAIL_LIST;
++}
++
++static int qma6100p_write_raw(struct iio_dev *indio_dev,
++			      struct iio_chan_spec const *chan,
++			      int val, int val2, long mask)
++{
++	struct qma6100p *data = iio_priv(indio_dev);
++	int i, ret = -EINVAL;
++
++	if (mask != IIO_CHAN_INFO_SCALE || val != 0)
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(qma6100p_ranges); i++) {
++		if (qma6100p_scale_nano(i) == val2) {
++			mutex_lock(&data->lock);
++			ret = qma6100p_set_range(data, i);
++			mutex_unlock(&data->lock);
++			break;
++		}
++	}
++	return ret;
++}
++
++static int qma6100p_write_raw_get_fmt(struct iio_dev *indio_dev,
++				      struct iio_chan_spec const *chan, long mask)
++{
++	return IIO_VAL_INT_PLUS_NANO;
++}
++
++static const struct iio_info qma6100p_info = {
++	.read_raw = qma6100p_read_raw,
++	.read_avail = qma6100p_read_avail,
++	.write_raw = qma6100p_write_raw,
++	.write_raw_get_fmt = qma6100p_write_raw_get_fmt,
++};
++
++static void qma6100p_power_down(void *arg)
++{
++	struct qma6100p *data = arg;
++
++	qma6100p_write(data, QMA6100P_PM, 0);
++}
++
++static int qma6100p_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct iio_dev *indio_dev;
++	struct qma6100p *data;
++	int ret;
++
++	indio_dev = devm_iio_device_alloc(dev, sizeof(*data));
++	if (!indio_dev)
++		return -ENOMEM;
++	data = iio_priv(indio_dev);
++	data->client = client;
++	data->range = 0;
++	mutex_init(&data->lock);
++	i2c_set_clientdata(client, indio_dev);
++
++	ret = i2c_smbus_read_byte_data(client, QMA6100P_CHIP_ID);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "cannot read chip id\n");
++	if (ret != QMA6100P_CHIP_ID_VAL)
++		return dev_err_probe(dev, -ENODEV, "unexpected chip id 0x%02x\n", ret);
++
++	ret = iio_read_mount_matrix(dev, &data->orientation);
++	if (ret)
++		return ret;
++
++	ret = qma6100p_init(data);
++	if (ret)
++		return dev_err_probe(dev, ret, "init failed\n");
++	ret = devm_add_action_or_reset(dev, qma6100p_power_down, data);
++	if (ret)
++		return ret;
++
++	indio_dev->name = "qma6100p";
++	indio_dev->info = &qma6100p_info;
++	indio_dev->modes = INDIO_DIRECT_MODE;
++	indio_dev->channels = qma6100p_channels;
++	indio_dev->num_channels = ARRAY_SIZE(qma6100p_channels);
++
++	return devm_iio_device_register(dev, indio_dev);
++}
++
++static int qma6100p_suspend(struct device *dev)
++{
++	struct qma6100p *data = iio_priv(dev_get_drvdata(dev));
++
++	return qma6100p_write(data, QMA6100P_PM, 0);
++}
++
++static int qma6100p_resume(struct device *dev)
++{
++	struct qma6100p *data = iio_priv(dev_get_drvdata(dev));
++	int ret;
++
++	mutex_lock(&data->lock);
++	ret = qma6100p_set_range(data, data->range);
++	mutex_unlock(&data->lock);
++	return ret;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(qma6100p_pm_ops, qma6100p_suspend, qma6100p_resume);
++
++static const struct of_device_id qma6100p_of_match[] = {
++	{ .compatible = "qst,qma6100p" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, qma6100p_of_match);
++
++static const struct i2c_device_id qma6100p_id[] = {
++	{ "qma6100p" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, qma6100p_id);
++
++static struct i2c_driver qma6100p_driver = {
++	.driver = {
++		.name = "qma6100p",
++		.of_match_table = qma6100p_of_match,
++		.pm = pm_sleep_ptr(&qma6100p_pm_ops),
++	},
++	.probe = qma6100p_probe,
++	.id_table = qma6100p_id,
++};
++module_i2c_driver(qma6100p_driver);
++
++MODULE_DESCRIPTION("QST QMA6100P accelerometer");
++MODULE_LICENSE("GPL");
+-- 
+2.53.0
+

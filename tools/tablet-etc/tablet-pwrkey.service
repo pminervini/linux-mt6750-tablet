@@ -1,0 +1,11 @@
+[Unit]
+Description=Power key toggles the LCD backlight; screen off 2 min after it was switched on
+After=systemd-udevd.service
+
+[Service]
+ExecStart=/usr/local/sbin/tablet-pwrkey
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

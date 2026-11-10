@@ -1,0 +1,7 @@
+#!/bin/sh
+# Reboot into stock Android once. Android (Magisk service.d) re-arms mainline as the default.
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+echo 0 > /sys/kernel/mt6755_pmic/boot_recovery
+/usr/local/sbin/tablet-bcb set android-once
+sync
+systemctl reboot

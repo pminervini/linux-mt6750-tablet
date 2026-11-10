@@ -1,0 +1,8 @@
+#!/bin/sh
+# OpenVPN --dns-updown wrapper. The stock /usr/libexec/openvpn/dns-updown inserts a
+# "### openvpn <dev> begin/end ###" block into /etc/resolv.conf on up, but only a clean
+# down removes it; Android kills the Debian chroot's openvpn without a down, so blocks
+# piled up (64 nameserver lines). Drop any stale block for this device first.
+[ -n "$dev" ] && [ -f /etc/resolv.conf ] &&
+	sed -i "/### openvpn ${dev} begin ###/,/### openvpn ${dev} end ###/d" /etc/resolv.conf
+exec /usr/libexec/openvpn/dns-updown "$@"

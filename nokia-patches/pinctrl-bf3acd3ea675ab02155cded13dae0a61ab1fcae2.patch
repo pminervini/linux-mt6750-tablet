@@ -1,0 +1,52 @@
+From bf3acd3ea675ab02155cded13dae0a61ab1fcae2 Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Thu, 20 Jul 2023 03:13:06 +0400
+Subject: [PATCH] arm64: dts: mediatek: mt6755: Add pinctrl
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ arch/arm64/boot/dts/mediatek/mt6755.dtsi | 28 ++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6755.dtsi b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+index 2fdfb73f7199..feacb6d4706a 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6755.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+@@ -101,6 +101,34 @@ uart_clk: dummy26m {
+ 		#clock-cells = <0>;
+ 	};
+ 
++	pio: pin-controller@10211000 {
++		compatible = "mediatek,mt6755-pinctrl";
++		reg = <0 0x10002000 0 0x200>,
++		      <0 0x10002200 0 0x200>,
++		      <0 0x10002400 0 0x200>,
++		      <0 0x10002600 0 0x200>,
++		      <0 0x10002800 0 0x200>,
++		      <0 0x10002a00 0 0x200>,
++		      <0 0x10005000 0 0x1000>;
++		reg-names = "gpio",
++		      "iocfg0",
++		      "iocfg1",
++		      "iocfg2",
++		      "iocfg3",
++		      "iocfg4",
++		      "iocfg5",
++		      "eint";
++
++		interrupts = <GIC_SPI 155 IRQ_TYPE_LEVEL_HIGH>;
++
++		gpio-controller;
++		#gpio-cells = <2>;
++		gpio-ranges = <&pio 0 0 189>;
++
++		interrupt-controller;
++		#interrupt-cells = <2>;
++	};
++
+ 	timer {
+ 		compatible = "arm,armv8-timer";
+ 		interrupt-parent = <&gic>;
+-- 
+GitLab
+

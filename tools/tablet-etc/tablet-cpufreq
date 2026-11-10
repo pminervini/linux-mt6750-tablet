@@ -1,0 +1,113 @@
+#!/usr/bin/python3
+"""Minimal CPU DVFS for the MT6750 tablet on mainline (no cpufreq driver for MT6755 yet).
+
+Two operating points, chosen by load (polled once a second from /proc/stat):
+  HIGH: what lk/preloader leave: big ARMBPLL 871 MHz, little ARMSPLL 689 MHz, VPROC 1.00 V
+  LOW : big 286 MHz, little 156 MHz, VPROC 0.90 V (stock OPP table: both need 0.80 V there;
+        VSRAM_PROC stays at 1.10 V, within stock's VSRAM - VPROC <= 0.2 V)
+Measured with the screen off: 157 mA -> 130 mA system load.
+
+Switching: up = voltage first, then clocks; down = clocks first, then voltage. A PLL is retuned
+with its cluster's CPU clock parked on the 26 MHz crystal (TOP_CKMUXSEL), as stock does.
+Load = the busiest CPU's. Go LOW after DOWN_SECS below DOWN_LOAD; HIGH as soon as one second
+exceeds UP_LOAD.
+On SIGTERM the HIGH point is restored.
+"""
+import mmap, os, signal, struct, sys, time
+
+UP_LOAD, DOWN_LOAD, DOWN_SECS = 0.50, 0.20, 5
+PMIC_REG = "/sys/kernel/mt6755_pmic/reg"
+VPROC_VOSEL = 0x060a                    # MT6353 BUCK_VPROC_VOSEL (SW mode): 0.6 V + 6.25 mV * n
+CLUSTERS = (("big", 0x200, 4), ("little", 0x210, 8))  # ARM PLL base in APMIXED, CKMUXSEL shift
+LOW = {"big": 0x020b0000, "little": 0x030c0000, "vproc": 0x30}
+BOOT = {"big": 0x0110c000, "little": 0x010d4000, "vproc": 0x40}   # lk/preloader values
+
+fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+infra = mmap.mmap(fd, 0x1000, offset=0x10001000)
+apmix = mmap.mmap(fd, 0x1000, offset=0x1000c000)
+
+
+def rd(m, o):
+    return struct.unpack_from("<I", m, o)[0]
+
+
+def wr(m, o, v):
+    struct.pack_into("<I", m, o, v)
+
+
+def pmic(addr, val=None):
+    with open(PMIC_REG, "w") as f:
+        f.write(f"{addr:#x}" if val is None else f"{addr:#x} {val:#x}")
+    if val is None:
+        with open(PMIC_REG) as f:
+            return int(f.read().split()[1], 16)
+
+
+def retune(base, shift, con1):
+    if rd(apmix, base + 4) & 0x07ffffff == con1 & 0x07ffffff:
+        return
+    wr(infra, 0, rd(infra, 0) & ~(3 << shift))                   # cluster clock -> 26 MHz
+    time.sleep(0.0005)
+    wr(apmix, base + 4, (1 << 31) | (con1 & 0x07ffffff))
+    time.sleep(0.0005)                                           # PLL settles in ~20 us
+    wr(infra, 0, (rd(infra, 0) & ~(3 << shift)) | (1 << shift))  # -> ARM PLL
+
+
+def apply(opp, going_up):
+    if going_up:
+        pmic(VPROC_VOSEL, opp["vproc"])
+        time.sleep(0.001)                                        # ~12.5 mV/us slew, 100 mV
+    for name, base, shift in CLUSTERS:
+        retune(base, shift, opp[name])
+    if not going_up:
+        pmic(VPROC_VOSEL, opp["vproc"])
+
+
+def cpu_times():
+    """(busy, total) jiffies per online CPU"""
+    out = {}
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("cpu") and line[3].isdigit():
+                n, *v = line.split()
+                v = [int(x) for x in v]
+                idle = v[3] + v[4]
+                out[n] = (sum(v) - idle, sum(v))
+    return out
+
+
+def main():
+    high = {name: rd(apmix, base + 4) & 0x07ffffff for name, base, _ in CLUSTERS}
+    high["vproc"] = pmic(VPROC_VOSEL)
+    if high["vproc"] <= LOW["vproc"] or high["big"] == LOW["big"]:
+        high = dict(BOOT)           # restarted while at LOW: HIGH = the boot point
+    print(f"tablet-cpufreq: HIGH big=0x{high['big']:08x} little=0x{high['little']:08x} "
+          f"vproc=0x{high['vproc']:02x}", flush=True)
+
+    def stop(*_):
+        apply(high, True)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    state, quiet = "HIGH", 0
+    prev = cpu_times()
+    while True:
+        time.sleep(1)
+        cur = cpu_times()
+        # busiest CPU decides: one single-threaded job must get the fast clock
+        load = max(((b - prev[c][0]) / max(1, t - prev[c][1])
+                    for c, (b, t) in cur.items() if c in prev), default=0)
+        prev = cur
+        if state == "LOW" and load > UP_LOAD:
+            apply(high, True)
+            state, quiet = "HIGH", 0
+        elif state == "HIGH":
+            quiet = quiet + 1 if load < DOWN_LOAD else 0
+            if quiet >= DOWN_SECS:
+                apply(LOW, False)
+                state = "LOW"
+
+
+if __name__ == "__main__":
+    main()

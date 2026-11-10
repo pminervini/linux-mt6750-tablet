@@ -1,0 +1,15 @@
+[Unit]
+Description=MediaTek CONSYS Bluetooth -> BlueZ (VHCI bridge)
+After=mt6755-wifi.service
+Requires=mt6755-wifi.service
+Before=bluetooth.service
+
+[Service]
+ExecStartPre=/bin/sh -c 'lsmod | grep -q mtk_stp_bt_soc || insmod /root/connsys/mtk_stp_bt_soc.ko; [ -c /dev/stpbt ] || mknod /dev/stpbt c 192 0; modprobe hci_vhci'
+ExecStartPre=-/bin/sh -c 'mkdir -p /run/tablet-nvdata; mountpoint -q /run/tablet-nvdata || mount -o ro /dev/disk/by-partlabel/nvdata /run/tablet-nvdata'
+ExecStart=/usr/local/sbin/tablet-btbridge
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

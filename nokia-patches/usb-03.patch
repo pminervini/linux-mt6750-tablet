@@ -1,0 +1,71 @@
+From f45562fcc3ba0d4cc1fa4848a9276822863efeda Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Sun, 1 Jan 2023 22:58:17 +0400
+Subject: [PATCH] arm64: dts: mediatek: Add initial support for Nokia 3.1
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ arch/arm64/boot/dts/mediatek/Makefile         |  1 +
+ .../boot/dts/mediatek/mt6755-nokia-es2.dts    | 39 +++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts
+
+diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
+index 813e735c5b96..4391e49638fa 100644
+--- a/arch/arm64/boot/dts/mediatek/Makefile
++++ b/arch/arm64/boot/dts/mediatek/Makefile
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt2712-evb.dtb
++dtb-$(CONFIG_ARCH_MEDIATEK) += mt6755-nokia-es2.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6755-evb.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6779-evb.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6795-evb.dtb
+diff --git a/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts b/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts
+new file mode 100644
+index 000000000000..ff836c50e1de
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6755-nokia-es2.dts
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Device Tree Source for Nokia 3.1 (ES2)
++ *
++ * Copyright (C) 2023 Arseniy Velikanov <adomerlee@gmail.com>
++ */
++
++/dts-v1/;
++
++#include "mt6755.dtsi"
++
++/ {
++	/* NOTE: if /model is defined the bootloader replaces it with "MT6750*" forcefully */
++	model = "Nokia 3.1";
++	compatible = "nokia,es2", "mediatek,mt6755";
++
++	alieases {
++		serial0 = &uart0;
++	};
++
++	chosen {
++		bootargs = "earlycon";
++		stdout-path = "serial0:921600n8";
++	};
++
++	/* /reserved-memory has to exist even if practically empty or bootloader will be unhappy */
++	reserved-memory {
++		ranges;
++	};
++
++	memory@40000000 {
++		device_type = "memory";
++		reg = <0x0 0x40000000 0x0 0x80000000>;
++	};
++};
++
++&uart0 {
++	status = "okay";
++};
+-- 
+GitLab
+

@@ -1,0 +1,105 @@
+#!/usr/bin/python3
+"""Bridge MediaTek CONSYS Bluetooth (/dev/stpbt, H4 framing) to BlueZ via /dev/vhci.
+
+At start: open /dev/stpbt (WMT powers the BT function), HCI reset, program the
+BD address from Android's NVRAM (APCFG/APRDEB/BT_Addr, bytes 0..5, MSB first)
+with MediaTek's vendor command 0xFC1A, then create a VHCI primary controller and
+shuttle packets both ways. /dev/stpbt may return several or partial packets per
+read, so that direction is re-framed; /dev/vhci reads/writes are one packet each.
+"""
+import os, select, struct, sys, time
+
+STPBT = "/dev/stpbt"
+STPBT_MAX = 2048                                           # BT_BUFFER_SIZE in stp_chrdev_bt.c (larger reads are clamped and logged)
+NVRAM = ["/run/tablet-nvdata/APCFG/APRDEB/BT_Addr", "/var/lib/tablet-bt/BT_Addr"]
+CMD, ACL, SCO, EVT = 1, 2, 3, 4
+
+
+def log(*a):
+    print("tablet-btbridge:", *a, flush=True)
+
+
+def h4_len(buf):
+    """Total length of the H4 packet at the start of buf, or None if incomplete."""
+    if not buf:
+        return None
+    t = buf[0]
+    if t == EVT and len(buf) >= 3:
+        return 3 + buf[2]
+    if t == ACL and len(buf) >= 5:
+        return 5 + struct.unpack_from("<H", buf, 3)[0]
+    if t == SCO and len(buf) >= 4:
+        return 4 + buf[3]
+    if t in (EVT, ACL, SCO):
+        return None
+    raise ValueError(f"bad H4 type 0x{t:02x}")
+
+
+def read_event(fd, opcode, timeout=3):
+    buf, end = b"", time.time() + timeout
+    while time.time() < end:
+        if select.select([fd], [], [], 0.2)[0]:
+            buf += os.read(fd, STPBT_MAX)
+        while buf and (n := h4_len(buf)) and len(buf) >= n:
+            pkt, buf = buf[:n], buf[n:]
+            if pkt[1] == 0x0e and struct.unpack_from("<H", pkt, 4)[0] == opcode:
+                return pkt
+    raise TimeoutError(f"no Command Complete for 0x{opcode:04x}")
+
+
+def hci(fd, opcode, params=b""):
+    os.write(fd, bytes([CMD]) + struct.pack("<HB", opcode, len(params)) + params)
+    return read_event(fd, opcode)
+
+
+def nvram_addr():
+    for p in NVRAM:
+        try:
+            a = open(p, "rb").read(6)
+        except OSError:
+            continue
+        if len(a) == 6 and a not in (b"\0" * 6, b"\xff" * 6):
+            return a
+    return None
+
+
+def main():
+    bt = os.open(STPBT, os.O_RDWR)
+    hci(bt, 0x0C03)                                        # HCI_Reset
+    addr = nvram_addr()
+    if addr:
+        os.makedirs("/var/lib/tablet-bt", exist_ok=True)   # keep a copy for boots without nvdata
+        open("/var/lib/tablet-bt/BT_Addr", "wb").write(addr)
+        hci(bt, 0xFC1A, addr[::-1])                        # MediaTek: set local BD_ADDR
+        hci(bt, 0x0C03)
+    r = hci(bt, 0x1009)                                    # Read_BD_ADDR
+    log("controller up, BD_ADDR", ":".join(f"{b:02X}" for b in r[7:13][::-1]))
+
+    vh = os.open("/dev/vhci", os.O_RDWR)
+    os.write(vh, bytes([0xFF, 0x00]))                      # create primary controller
+    pkt = os.read(vh, 16)                                  # vendor event: ff 00 <index le16>
+    log("vhci controller hci%d" % struct.unpack_from("<H", pkt, 2)[0])
+
+    buf = b""
+    while True:
+        for fd in select.select([bt, vh], [], [])[0]:
+            if fd == vh:
+                p = os.read(vh, 2048)
+                if p and p[0] in (CMD, ACL, SCO):
+                    os.write(bt, p)
+            else:
+                d = os.read(bt, STPBT_MAX)
+                if not d:
+                    raise EOFError("stpbt closed (chip reset?)")
+                buf += d
+                while buf and (n := h4_len(buf)) and len(buf) >= n:
+                    os.write(vh, buf[:n])
+                    buf = buf[n:]
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log("exiting:", repr(e))
+        sys.exit(1)

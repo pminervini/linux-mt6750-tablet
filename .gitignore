@@ -1,0 +1,15 @@
+# kernel tree (separate repo; content exported to patches/linux) and build output
+/linux/
+/out/
+/release/
+# downloads / upstream reference clones
+/dl/
+/ref/
+# generated
+/initramfs/root/
+/initramfs/initramfs.cpio.gz
+*.o
+*.ko
+*.img
+*.img.zst
+/*.log

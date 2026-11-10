@@ -1,0 +1,11 @@
+#!/bin/sh
+# tablet-screen on|off|<0-1023>|status  — LCD backlight (DISP_PWM) on the MT6750 tablet, mainline
+B=/sys/class/backlight/backlight
+case "${1:-status}" in
+  on)     /usr/local/sbin/tablet-panel on
+          echo "${SCREEN_ON_LEVEL:-300}" > $B/brightness ;;
+  off)    echo 0 > $B/brightness; /usr/local/sbin/tablet-panel off ;;
+  status) echo "brightness $(cat $B/actual_brightness)/$(cat $B/max_brightness)"; exit 0 ;;
+  *[!0-9]*) echo "usage: tablet-screen on|off|<0-1023>|status" >&2; exit 2 ;;
+  *)      echo "$1" > $B/brightness ;;
+esac

@@ -1,0 +1,133 @@
+From 6ac2a262bc88dd969f7e9a85133bd439b159522c Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 07:50:52 +0000
+Subject: [PATCH 22/25] mt6755-pmic: stop pausing MDRT (it got stuck); filter
+ the BATON contamination instead
+
+Switching AUXADC_MDRT_DET_EN off/on around every AP conversion (715b3c394)
+left the MDRT conversion stuck after ~30 min: result register frozen at one
+value with the ready bit clear, and the connsys GPS core no longer starts
+(no FE42) until a reboot. MDRT is no longer touched after init.
+
+The MDRT result still lands in the BATON output register about one sample
+in four (~1.15 V = 0 C). A battery cannot move > 60 mV (~3 C) in 2 s, so a
+far BATON sample is accepted only after persisting for 15 samples (30 s);
+an NTC open/short still gets through. 0 of 150 samples glitched, MDRT
+alive at 10 of 10 checks, GPS fixes continue. Image s7c.
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 53 +++++++++++-------------------
+ 1 file changed, 20 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index 685d509bd..cc01fb285 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -246,38 +246,17 @@ static int auxadc_mv(u16 reg, int *mv)
+ static DEFINE_MUTEX(adc_lock);
+ 
+ /*
+- * The periodic "modem real-time" conversion (AUXADC_MDRT_DET_EN, needed by the connsys GPS
+- * core, see auxadc_init_tbl) stores its result (~1.15 V here) in the channel-3 output register
+- * as well, i.e. on top of BATON: measured 13 of 60 register samples, none with MDRT off. Pause
+- * it around AP conversions (adc_lock held): stop, let a conversion in flight finish, convert,
+- * read, restart. ~3 ms every 2 s; the GPS core keeps the last MDRT value meanwhile.
++ * Do not touch AUXADC_MDRT_DET_EN after init: the periodic "modem real-time" conversion feeds the
++ * connsys GPS core (co-TSX), and switching it off/on around our reads (tried in 715b3c394) left
++ * it stuck after ~30 min (result register frozen, GPS core no longer starts). Its result also
++ * lands in the BATON register now and then; that is filtered in chr_work_fn instead.
+  */
+-#define AUXADC_MDRT_0		0x0F1E	/* b15 MDRT_DET_EN */
+-
+-static bool mdrt_pause(void)
+-{
+-	u16 v;
+-
+-	if (mt6755_pmic_read(AUXADC_MDRT_0, &v) || !(v & BIT(15)))
+-		return false;
+-	mt6755_pmic_rmw(AUXADC_MDRT_0, 1, 15, 0);
+-	usleep_range(1000, 1500);
+-	return true;
+-}
+-
+-static void mdrt_resume(bool was_on)
+-{
+-	if (was_on)
+-		mt6755_pmic_rmw(AUXADC_MDRT_0, 1, 15, 1);
+-}
+ 
+ static int battery_read(int *vbat, int *ichg)
+ {
+ 	int isense, ret;
+-	bool mdrt;
+ 
+ 	mutex_lock(&adc_lock);
+-	mdrt = mdrt_pause();
+ 	mt6755_pmic_write(CLK_CKPDN_CON0_CLR, BIT(11));
+ 	mt6755_pmic_rmw(AUXADC_CON0, 1, 15, 1);
+ 	mt6755_pmic_write(AUXADC_RQST0_SET, 0x3);
+@@ -287,7 +266,6 @@ static int battery_read(int *vbat, int *ichg)
+ 		ret = auxadc_mv(AUXADC_ADC25, &isense);
+ 	if (!ret)
+ 		*ichg = (isense - *vbat) * 1000 / R_SENSE_MOHM;
+-	mdrt_resume(mdrt);
+ 	mutex_unlock(&adc_lock);
+ 	return ret;
+ }
+@@ -296,11 +274,9 @@ static int battery_read(int *vbat, int *ichg)
+ static int baton_read(int *mv)
+ {
+ 	int ret = -ETIMEDOUT;
+-	bool mdrt;
+ 	u16 v;
+ 
+ 	mutex_lock(&adc_lock);
+-	mdrt = mdrt_pause();
+ 	mt6755_pmic_write(CLK_CKPDN_CON0_CLR, BIT(11));
+ 	mt6755_pmic_rmw(AUXADC_CON0, 1, 15, 1);
+ 	mt6755_pmic_write(AUXADC_RQST0_SET, BIT(3));
+@@ -317,7 +293,6 @@ static int baton_read(int *mv)
+ 		}
+ 		usleep_range(100, 200);
+ 	}
+-	mdrt_resume(mdrt);
+ 	mutex_unlock(&adc_lock);
+ 	return ret;
+ }
+@@ -422,6 +397,8 @@ static struct {
+ 	enum chg_state st;
+ 	int full_cnt, low_cnt, start_wait, lim_cnt, hot_cnt, cold_cnt;
+ 	bool limited;			/* charge limit reached; survives hot/cold/unplug interruptions */
++	bool vntc_valid;
++	int ntc_jump;			/* consecutive BATON samples far from the accepted value */
+ } bs;
+ static struct power_supply *bat_psy, *usb_psy;
+ 
+@@ -588,11 +565,21 @@ static void chr_work_fn(struct work_struct *w)
+ 		bs.vbat = vbat;
+ 		bs.ibat = ibat;
+ 	}
++	/*
++	 * BATON plausibility: the GPS co-TSX (MDRT) conversion lands in the same output register
++	 * about one sample in four (~1.15 V, reads as 0 C). A battery cannot change by > 60 mV
++	 * (~3 C) in 2 s, so a far sample counts only once it persists for 15 samples (30 s; a
++	 * real NTC open/short still gets through).
++	 */
+ 	if (!baton_read(&vntc)) {
+-		bs.vntc = vntc;
+-		bs.ntc_ok = !ntc_temp(vntc - bs.ibat * ntc_comp_mohm / 1000, &t);
+-		if (bs.ntc_ok)
+-			bs.temp = t;
++		if (!bs.vntc_valid || abs(vntc - bs.vntc) <= 60 || ++bs.ntc_jump >= 15) {
++			bs.vntc = vntc;
++			bs.vntc_valid = true;
++			bs.ntc_jump = 0;
++			bs.ntc_ok = !ntc_temp(vntc - bs.ibat * ntc_comp_mohm / 1000, &t);
++			if (bs.ntc_ok)
++				bs.temp = t;
++		}
+ 	}
+ 	bs.chr = chr;
+ 	fg_update();
+-- 
+2.53.0
+

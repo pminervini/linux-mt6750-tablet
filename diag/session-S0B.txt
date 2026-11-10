@@ -1,0 +1,6 @@
+da peek 0x44410000 0xe0000 --filename out/s0b-pstore.bin
+da peek 0x41380000 0x100000 --filename out/s0b-logbuf-area.bin
+da peek 0x40080000 0x1000 --filename out/s0b-kernel-head.bin
+da peek 0x44000000 0x40000 --filename out/s0b-tags-dtb.bin
+da peek 0x45000000 0x1000 --filename out/s0b-initrd-head.bin
+reset

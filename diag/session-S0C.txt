@@ -1,0 +1,3 @@
+da peek 0x444f0000 0x10000 --filename out/s0c-ramcon.bin
+da peek 0x44410000 0xe0000 --filename out/s0c-pstore.bin
+reset

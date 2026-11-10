@@ -1,0 +1,400 @@
+From 3bbde271f3ddf382043a60870a7f715fcccc5153 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Fri, 6 Nov 2026 15:37:23 +0000
+Subject: [PATCH 02/25] MT6750 tablet: early VEMC power-cycle + breadcrumbs,
+ lk-compatible reserved-memory; first boot to userspace
+
+---
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts | 40 ++-------
+ arch/arm64/kernel/head.S                      | 81 +++++++++++++++++++
+ arch/arm64/kernel/setup.c                     | 14 ++++
+ drivers/watchdog/mtk_wdt.c                    | 64 +++++++++++++++
+ init/main.c                                   |  3 +
+ 5 files changed, 169 insertions(+), 33 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index 4f5522e23..3dabc3660 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -57,6 +57,11 @@ memory@40000000 {
+ 		reg = <0x0 0x40000000 0x0 0x80000000>;
+ 	};
+ 
++	/*
++	 * Only the static regions the stock DTB has: lk appends its own
++	 * mblock reservations (ATF, framebuffer, log_store, ccci, ...) and
++	 * hangs in reserved_memory_conflict_check() if we pre-declare them.
++	 */
+ 	reserved-memory {
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+@@ -91,10 +96,6 @@ minirdump@444f0000 {
+ 			no-map;
+ 		};
+ 
+-		atf@44600000 {
+-			reg = <0x0 0x44600000 0x0 0x40000>;
+-			no-map;
+-		};
+ 
+ 		preloader@44800000 {
+ 			reg = <0x0 0x44800000 0x0 0x100000>;
+@@ -106,41 +107,12 @@ lk@46000000 {
+ 			no-map;
+ 		};
+ 
+-		framebuffer@7f190000 {
+-			reg = <0x0 0x7f190000 0x0 0xdb0000>;
+-			no-map;
+-		};
+ 
+-		atf-log@7ff40000 {
+-			reg = <0x0 0x7ff40000 0x0 0x40000>;
+-			no-map;
+-		};
+ 
+-		log-store@7ff80000 {
+-			reg = <0x0 0x7ff80000 0x0 0x80000>;
+-			no-map;
+-		};
+ 
+-		/* modem / ccci, consys, spm placed by lk on the stock boot */
+-		ccci@8e000000 {
+-			reg = <0x0 0x8e000000 0x0 0xa000000>;
+-			no-map;
+-		};
+ 
+-		ccci-share@98000000 {
+-			reg = <0x0 0x98000000 0x0 0x20000>;
+-			no-map;
+-		};
+ 
+-		consys@9fe00000 {
+-			reg = <0x0 0x9fe00000 0x0 0x100000>;
+-			no-map;
+-		};
+ 
+-		spm@9ffe0000 {
+-			reg = <0x0 0x9ffe0000 0x0 0x20000>;
+-			no-map;
+-		};
+ 	};
+ 
+ 
+@@ -196,6 +168,8 @@ watchdog@10007000 {
+ 		compatible = "mediatek,mt6589-wdt";
+ 		/* stock reboot = AUTO_RESTART|EXTEN, else the preloader powers off */
+ 		mediatek,restart-bypass-pwrkey;
++		/* power-cycle eMMC (MT6353 VEMC33) before reset, else BROM loop */
++		mediatek,restart-cycle-vemc;
+ 		reg = <0 0x10007000 0 0x100>;
+ 	};
+ };
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 8549ccac3..23ac1e064 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -82,6 +82,26 @@
+ 	 *  x20        primary_entry() .. __primary_switch()    CPU boot mode
+ 	 *  x21        primary_entry() .. start_kernel()        FDT pointer passed at boot in x0
+ 	 */
++#ifdef CONFIG_SERIAL_EARLYCON_RAM_FORCE
++	/* bring-up breadcrumb: last stage reached, pushed to PoC (survives WDT reset) */
++	.macro	BMARK, n
++	adr_l	x16, bringup_trace
++	mov	x17, #\n
++	str	x17, [x16]
++	dsb	sy
++	dc	civac, x16
++	dsb	sy
++	.endm
++
++	.pushsection ".data", "aw"
++	.balign	64
++SYM_DATA(bringup_trace, .fill 8, 8, 0)
++	.popsection
++#else
++	.macro	BMARK, n
++	.endm
++#endif
++
+ SYM_CODE_START(primary_entry)
+ #ifdef CONFIG_SERIAL_EARLYCON_RAM_FORCE
+ 	/* bring-up: prove we were entered; store magic, CurrentEL, SCTLR, x0-x3 */
+@@ -106,6 +126,39 @@ SYM_CODE_START(primary_entry)
+ 	add	x10, x9, #32
+ 	dc	civac, x10
+ 	dsb	sy
++
++	/*
++	 * Bring-up (MT6755/MT6353): power-cycle the eMMC supply VEMC33 via the
++	 * PMIC wrapper (initialised by the preloader) and set WDT_MODE
++	 * AUTO_RESTART|EXTEN, so that if we hang the lk-armed watchdog reboots
++	 * cleanly (boot ROM can read a freshly powered eMMC) instead of
++	 * looping in BROM and powering off.
++	 */
++	movz	x9, #0xd000
++	movk	x9, #0x1000, lsl #16		/* PWRAP base 0x1000d000 */
++	movz	w12, #0xc240
++	movk	w12, #0x8545, lsl #16		/* WACS2 write 0x0a8a = 0xc240 (VEMC off) */
++	bl	bringup_pwrap_write
++	mrs	x13, cntpct_el0
++	movz	x14, #0xd640
++	movk	x14, #0x13, lsl #16		/* 1.3M ticks @13MHz = 100ms */
++3:	mrs	x15, cntpct_el0
++	sub	x15, x15, x13
++	cmp	x15, x14
++	b.lo	3b
++	movz	w12, #0xc242
++	movk	w12, #0x8545, lsl #16		/* VEMC on */
++	bl	bringup_pwrap_write
++	movz	x9, #0x7000
++	movk	x9, #0x1000, lsl #16		/* TOPRGU WDT_MODE */
++	ldr	w10, [x9]
++	and	w10, w10, #0xff
++	movz	w11, #0x0014
++	movk	w11, #0x2200, lsl #16		/* KEY | AUTO_RESTART | EXTEN */
++	orr	w10, w10, w11
++	str	w10, [x9]
++	dsb	sy
++	BMARK	1
+ #endif
+ 	bl	record_mmu_state
+ 	bl	preserve_boot_args
+@@ -116,6 +169,7 @@ SYM_CODE_START(primary_entry)
+ 	adrp	x0, __pi_init_idmap_pg_dir
+ 	mov	x1, xzr
+ 	bl	__pi_create_init_idmap
++	BMARK	2
+ 
+ 	/*
+ 	 * If the page tables have been populated with non-cacheable
+@@ -143,6 +197,7 @@ SYM_CODE_START(primary_entry)
+ 1:	mov	x0, x19
+ 	bl	init_kernel_el			// w0=cpu_boot_mode
+ 	mov	x20, x0
++	BMARK	3
+ 
+ 	/*
+ 	 * The following calls CPU setup code, see arch/arm64/mm/proc.S for
+@@ -151,9 +206,31 @@ SYM_CODE_START(primary_entry)
+ 	 * the TCR will have been set.
+ 	 */
+ 	bl	__cpu_setup			// initialise processor
++	BMARK	4
+ 	b	__primary_switch
+ SYM_CODE_END(primary_entry)
+ 
++#ifdef CONFIG_SERIAL_EARLYCON_RAM_FORCE
++SYM_CODE_START_LOCAL(bringup_pwrap_write)
++	mov	x11, #0x100000			/* timeout */
++1:	ldr	w10, [x9, #0xa4]		/* WACS2_RDATA */
++	ubfx	w10, w10, #16, #3		/* FSM */
++	cbz	w10, 2f
++	subs	x11, x11, #1
++	b.ne	1b
++	ret
++2:	str	w12, [x9, #0xa0]		/* WACS2_CMD */
++	dsb	sy
++	mov	x11, #0x100000
++3:	ldr	w10, [x9, #0xa4]
++	ubfx	w10, w10, #16, #3
++	cbz	w10, 4f
++	subs	x11, x11, #1
++	b.ne	3b
++4:	ret
++SYM_CODE_END(bringup_pwrap_write)
++#endif
++
+ 	__INIT
+ SYM_CODE_START_LOCAL(record_mmu_state)
+ 	mrs	x19, CurrentEL
+@@ -242,6 +319,7 @@ SYM_CODE_END(preserve_boot_args)
+  *   x0 = __pa(KERNEL_START)
+  */
+ SYM_FUNC_START_LOCAL(__primary_switched)
++	BMARK	7
+ 	adr_l	x4, init_task
+ 	init_cpu_task x4, x5, x6
+ 
+@@ -267,6 +345,7 @@ SYM_FUNC_START_LOCAL(__primary_switched)
+ 	mov	x0, x20
+ 	bl	finalise_el2			// Prefer VHE if possible
+ 	ldp	x29, x30, [sp], #16
++	BMARK	8
+ 	bl	start_kernel
+ 	ASM_BUG()
+ SYM_FUNC_END(__primary_switched)
+@@ -533,6 +612,7 @@ SYM_FUNC_START_LOCAL(__primary_switch)
+ 	adrp	x1, reserved_pg_dir
+ 	adrp	x2, __pi_init_idmap_pg_dir
+ 	bl	__enable_mmu
++	BMARK	5
+ 
+ 	adrp	x1, early_init_stack
+ 	mov	sp, x1
+@@ -540,6 +620,7 @@ SYM_FUNC_START_LOCAL(__primary_switch)
+ 	mov	x0, x20				// pass the full boot status
+ 	mov	x1, x21				// pass the FDT
+ 	bl	__pi_early_map_kernel		// Map and relocate the kernel
++	BMARK	6
+ 
+ 	ldr	x8, =__primary_switched
+ 	adrp	x0, KERNEL_START		// __pa(KERNEL_START)
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 9d74db34a..4e6b148a1 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -87,6 +87,15 @@ static struct resource mem_res[] = {
+  */
+ u64 __cacheline_aligned boot_args[4];
+ 
++#ifdef CONFIG_SERIAL_EARLYCON_RAM_FORCE
++extern u64 bringup_trace[];
++void bringup_mark(u64 n)
++{
++	WRITE_ONCE(bringup_trace[0], n);
++	asm volatile("dsb sy; dc civac, %0; dsb sy" :: "r"(bringup_trace) : "memory");
++}
++#endif
++
+ void __init smp_setup_processor_id(void)
+ {
+ 	u64 mpidr = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
+@@ -280,6 +289,9 @@ u64 cpu_logical_map(unsigned int cpu)
+ 
+ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ {
++#ifdef CONFIG_SERIAL_EARLYCON_RAM_FORCE
++	bringup_mark(20);
++#endif
+ 	setup_initial_init_mm(_text, _etext, _edata, _end);
+ 
+ 	*cmdline_p = boot_command_line;
+@@ -289,11 +301,13 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 	early_fixmap_init();
+ 	early_ioremap_init();
+ #ifdef CONFIG_SERIAL_EARLYCON_RAM_FORCE
++	bringup_mark(21);
+ 	{
+ 		extern void __init ramcon_force(phys_addr_t base, unsigned long size,
+ 						u64 fdt, const u64 *args);
+ 		ramcon_force(CONFIG_SERIAL_EARLYCON_RAM_BASE, SZ_64K, __fdt_pointer, boot_args);
+ 	}
++	bringup_mark(22);
+ #endif
+ 
+ 	setup_machine_fdt(__fdt_pointer);
+diff --git a/drivers/watchdog/mtk_wdt.c b/drivers/watchdog/mtk_wdt.c
+index 16020bd67..d14f3849d 100644
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -76,6 +76,7 @@ struct mtk_wdt_dev {
+ 	struct reset_controller_dev rcdev;
+ 	bool disable_wdt_extrst;
+ 	bool restart_bypass_pwrkey;
++	void __iomem *pwrap;	/* bring-up: eMMC VEMC power-cycle before reset */
+ 	bool reset_by_toprgu;
+ 	bool has_swsysrst_en;
+ };
+@@ -226,6 +227,64 @@ static int toprgu_register_reset_controller(struct platform_device *pdev,
+ 	return ret;
+ }
+ 
++/*
++ * Bring-up hack for MT6755/MT6353 boards: the boot ROM cannot load the
++ * preloader from an eMMC left in HS mode by the previous OS, so (like the
++ * vendor msdc shutdown path) power-cycle VEMC33 through the PMIC wrapper
++ * WACS2 port before resetting. Polled, no locks: restart context only.
++ */
++#define PWRAP_WACS2_CMD		0xa0
++#define PWRAP_WACS2_RDATA	0xa4
++#define PWRAP_WACS2_VLDCLR	0xa8
++#define WACS2_FSM(x)		(((x) >> 16) & 0x7)
++#define MT6353_VEMC33_CON0	0x0a8a
++#define MT6353_VEMC33_EN	BIT(1)
++
++static int mtk_wdt_pwrap_wait(void __iomem *pw, u32 state, u32 *rdata)
++{
++	int i;
++
++	for (i = 0; i < 10000; i++) {
++		u32 v = readl(pw + PWRAP_WACS2_RDATA);
++
++		if (WACS2_FSM(v) == state) {
++			if (rdata)
++				*rdata = v;
++			return 0;
++		}
++		udelay(1);
++	}
++	return -ETIMEDOUT;
++}
++
++static int mtk_wdt_pwrap_rw(void __iomem *pw, bool wr, u16 adr, u16 wdata, u16 *rdata)
++{
++	u32 v;
++
++	if (mtk_wdt_pwrap_wait(pw, 0, NULL))
++		return -ETIMEDOUT;
++	writel(((u32)wr << 31) | ((u32)(adr >> 1) << 16) | wdata, pw + PWRAP_WACS2_CMD);
++	if (wr)
++		return 0;
++	if (mtk_wdt_pwrap_wait(pw, 6, &v))	/* WFVLDCLR */
++		return -ETIMEDOUT;
++	*rdata = v & 0xffff;
++	writel(1, pw + PWRAP_WACS2_VLDCLR);
++	return 0;
++}
++
++static void mtk_wdt_cycle_vemc(void __iomem *pw)
++{
++	u16 v;
++
++	if (mtk_wdt_pwrap_rw(pw, false, MT6353_VEMC33_CON0, 0, &v))
++		return;
++	mtk_wdt_pwrap_rw(pw, true, MT6353_VEMC33_CON0, v & ~MT6353_VEMC33_EN, NULL);
++	mdelay(100);
++	mtk_wdt_pwrap_rw(pw, true, MT6353_VEMC33_CON0, v | MT6353_VEMC33_EN, NULL);
++	mdelay(10);
++}
++
+ static int mtk_wdt_restart(struct watchdog_device *wdt_dev,
+ 			   unsigned long action, void *data)
+ {
+@@ -236,6 +295,9 @@ static int mtk_wdt_restart(struct watchdog_device *wdt_dev,
+ 	wdt_base = mtk_wdt->wdt_base;
+ 
+ 	/* Enable reset in order to issue a system reset instead of an IRQ */
++	if (mtk_wdt->pwrap)
++		mtk_wdt_cycle_vemc(mtk_wdt->pwrap);
++
+ 	reg = readl(wdt_base + WDT_MODE);
+ 	reg &= ~WDT_MODE_IRQ_EN;
+ 	if (mtk_wdt->restart_bypass_pwrkey) {
+@@ -475,6 +537,8 @@ static int mtk_wdt_probe(struct platform_device *pdev)
+ 		of_property_read_bool(dev->of_node, "mediatek,disable-extrst");
+ 	mtk_wdt->restart_bypass_pwrkey =
+ 		of_property_read_bool(dev->of_node, "mediatek,restart-bypass-pwrkey");
++	if (of_property_read_bool(dev->of_node, "mediatek,restart-cycle-vemc"))
++		mtk_wdt->pwrap = devm_ioremap(dev, 0x1000d000, 0x1000);
+ 
+ 	mtk_wdt->reset_by_toprgu =
+ 		of_property_read_bool(dev->of_node, "mediatek,reset-by-toprgu");
+diff --git a/init/main.c b/init/main.c
+index 31f2bf549..c79b6c964 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1006,6 +1006,9 @@ void start_kernel(void)
+ 	boot_cpu_init();
+ 	page_address_init();
+ 	pr_notice("%s", linux_banner);
++#ifdef CONFIG_SERIAL_EARLYCON_RAM_FORCE
++	{ extern void bringup_mark(u64 n); bringup_mark(10); }
++#endif
+ 	setup_arch(&command_line);
+ 	mm_core_init_early();
+ 	/* Static keys and static calls are needed by LSMs */
+-- 
+2.53.0
+

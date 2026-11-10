@@ -1,0 +1,73 @@
+#!/bin/sh
+# tablet-netwatch: keep the MT6750 tablet reachable over Wi-Fi (mainline, headless node).
+#
+# Every minute: healthy = wlan0 exists, wpa_supplicant is associated and the default gateway answers
+# a ping. While unhealthy, escalate (minutes offline):
+#   3  wpa_cli reassociate
+#   6  restart wpa_supplicant@wlan0 and DHCP (networkd)
+#  10  Wi-Fi function off/on in the driver (/dev/wmtWifi), or rerun the bring-up if wlan0 is gone
+#  30  reboot - at most once per 6 h (stamp in /var/lib/tablet-netwatch), so a router that is
+#      simply off does not cause a reboot loop; never in the first 30 min after boot
+# Router reboots and roaming are handled by wpa_supplicant itself; this is for wedged states.
+# Thresholds can be overridden for tests: NW_STEP (seconds per check), NW_T1/T2/T3/T4 (checks).
+STEP=${NW_STEP:-60}; T1=${NW_T1:-3}; T2=${NW_T2:-6}; T3=${NW_T3:-10}; T4=${NW_T4:-30}
+IF=wlan0
+STATE=/var/lib/tablet-netwatch
+mkdir -p $STATE
+
+log() { echo "$*"; echo "<5>tablet-netwatch: $*" > /dev/kmsg; }
+
+healthy() {
+	[ -d /sys/class/net/$IF ] || return 1
+	[ "$(wpa_cli -i $IF status 2>/dev/null | sed -n 's/^wpa_state=//p')" = COMPLETED ] || return 1
+	gw=$(ip -4 route show default dev $IF 2>/dev/null | awk '{print $3; exit}')
+	[ -n "$gw" ] || return 1
+	ping -c 2 -W 3 -I $IF "$gw" >/dev/null 2>&1
+}
+
+sleep "$STEP"
+bad=0
+while :; do
+	if healthy; then
+		[ $bad -gt 0 ] && log "Wi-Fi back after $bad failed checks"
+		bad=0
+	else
+		bad=$((bad + 1))
+		case $bad in
+		"$T1")
+			log "offline: reassociate"
+			wpa_cli -i $IF reassociate >/dev/null 2>&1 ;;
+		"$T2")
+			log "offline: restarting wpa_supplicant and DHCP"
+			systemctl restart wpa_supplicant@$IF.service
+			networkctl reconfigure $IF >/dev/null 2>&1 ;;
+		"$T3")
+			if [ -d /sys/class/net/$IF ]; then
+				log "offline: Wi-Fi function off/on"
+				echo 0 > /dev/wmtWifi; sleep 3; echo 1 > /dev/wmtWifi
+				for i in $(seq 20); do [ -d /sys/class/net/$IF ] && break; sleep 1; done
+			else
+				log "offline: $IF missing, rerunning the Wi-Fi bring-up"
+				systemctl restart mt6755-wifi.service
+			fi
+			iw dev $IF set power_save on 2>/dev/null
+			systemctl restart wpa_supplicant@$IF.service
+			networkctl reconfigure $IF >/dev/null 2>&1 ;;
+		"$T4")
+			up=$(cut -d. -f1 /proc/uptime)
+			last=$(cat $STATE/last-reboot 2>/dev/null || echo 0)
+			now=$(date +%s)
+			if [ "$up" -lt 1800 ]; then
+				log "offline for $bad checks, but up only ${up}s: not rebooting"
+			elif [ $((now - last)) -lt 21600 ]; then
+				log "offline for $bad checks; rebooted for this less than 6 h ago: not rebooting"
+			else
+				log "offline for $bad checks: rebooting"
+				echo "$now" > $STATE/last-reboot
+				sync
+				systemctl reboot
+			fi ;;
+		esac
+	fi
+	sleep "$STEP"
+done

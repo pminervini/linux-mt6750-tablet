@@ -1,0 +1,69 @@
+From e2b4b3d2854717a3e2df3f0084cb30ad0d05b054 Mon Sep 17 00:00:00 2001
+From: Samuel Holland <samuel@sholland.org>
+Date: Tue, 27 Dec 2022 15:48:21 -0600
+Subject: [PATCH] kbuild: Fix running modpost with musl libc
+
+commit 3d57e1b7b1d4 ("kbuild: refactor the prerequisites of the modpost
+rule") moved 'vmlinux.o' inside modpost-args, possibly before some of
+the other options. However, getopt() in musl libc follows POSIX and
+stops looking for options upon reaching the first non-option argument.
+As a result, the '-T' option is misinterpreted as a positional argument,
+and the build fails:
+
+  make -f ./scripts/Makefile.modpost
+     scripts/mod/modpost   -E   -o Module.symvers vmlinux.o -T modules.order
+  -T: No such file or directory
+  make[1]: *** [scripts/Makefile.modpost:137: Module.symvers] Error 1
+  make: *** [Makefile:1960: modpost] Error 2
+
+The fix is to move all options before 'vmlinux.o' in modpost-args.
+
+Fixes: 3d57e1b7b1d4 ("kbuild: refactor the prerequisites of the modpost rule")
+Signed-off-by: Samuel Holland <samuel@sholland.org>
+---
+ scripts/Makefile.modpost | 22 +++++++++++-----------
+ 1 file changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/scripts/Makefile.modpost b/scripts/Makefile.modpost
+index 5eb5e8280379..0ee296cf520c 100644
+--- a/scripts/Makefile.modpost
++++ b/scripts/Makefile.modpost
+@@ -55,6 +55,17 @@ ifneq ($(findstring i,$(filter-out --%,$(MAKEFLAGS))),)
+ modpost-args += -n
+ endif
+ 
++ifneq ($(KBUILD_MODPOST_WARN)$(missing-input),)
++modpost-args += -w
++endif
++
++# Read out modules.order to pass in modpost.
++# Otherwise, allmodconfig would fail with "Argument list too long".
++ifdef KBUILD_MODULES
++modpost-args += -T $(MODORDER)
++modpost-deps += $(MODORDER)
++endif
++
+ ifeq ($(KBUILD_EXTMOD),)
+ 
+ # Generate the list of in-tree objects in vmlinux
+@@ -113,17 +124,6 @@ modpost-args += -e $(addprefix -i , $(KBUILD_EXTRA_SYMBOLS))
+ 
+ endif # ($(KBUILD_EXTMOD),)
+ 
+-ifneq ($(KBUILD_MODPOST_WARN)$(missing-input),)
+-modpost-args += -w
+-endif
+-
+-ifdef KBUILD_MODULES
+-modpost-args += -T $(MODORDER)
+-modpost-deps += $(MODORDER)
+-endif
+-
+-# Read out modules.order to pass in modpost.
+-# Otherwise, allmodconfig would fail with "Argument list too long".
+ quiet_cmd_modpost = MODPOST $@
+       cmd_modpost = \
+ 	$(if $(missing-input), \
+-- 
+GitLab
+

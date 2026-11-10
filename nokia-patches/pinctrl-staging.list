@@ -1,0 +1,100 @@
+bf3acd3ea675ab02155cded13dae0a61ab1fcae2 2023-07-20T03:13:06 arm64: dts: mediatek: mt6755: Add pinctrl
+0f28c379e93d800b3ca64d18abc811aeb61e6a3c 2023-07-20T03:12:13 pinctrl: mediatek: Add MT6755 pinctrl driver
+4d6d97530fb229aa681023be7488d7e873144765 2023-07-20T01:04:41 arm64: dts: mediatek: mt6755: Add watchdog
+8f5d81c53a047f4826dc9858a4dd0bc27c1c83ef 2023-07-20T01:01:43 watchdog: mediatek: mt6755: add wdt support
+3a574cbb235978d1be2b7734a3c836ccab4c39af 2023-07-20T01:01:23 dt-bindings: reset: add dt binding header for MediaTek MT6755 resets
+cf1c51e808805e5761d9cd06b3f87c042f045ec3 2023-07-20T01:00:42 arm64: dts: mediatek: mt6755: Set initrd address
+92f6c8d3e4871da05e0be81c7d9a4113f5274632 2023-07-20T00:59:06 arm64: dts: mediatek: mt6755: Set initrd address
+9825744ef01202938d9988c7e7d411bca0053f69 2023-07-20T00:58:09 arm64: dts: mediatek: mt6755: Disable SMP
+0cdd981988045d0922c27977eae3f54f540dcc08 2023-07-20T00:56:10 arm64: dts: mediatek: Add initial support for Nokia 3.1
+bfa3037d828050896ae52f6467b6ca2489ae6fb1 2023-07-19T11:00:27 Merge tag 'fuse-update-6.5' of git://git.kernel.org/pub/scm/linux/kernel/git/mszeredi/fuse
+ccff6d117d8dc8d8d86e8695a75e5f8b01e573bf 2023-07-18T14:51:29 Merge tag 'perf-tools-fixes-for-v6.5-1-2023-07-18' of git://git.kernel.org/pub/scm/linux/kernel/git/perf/perf-tools
+4806364acf770fa1d24ccc98169ca6f5c6979caa 2023-07-18T14:19:42 Merge tag 'mm-hotfixes-stable-2023-07-18-12-28' of git://git.kernel.org/pub/scm/linux/kernel/git/akpm/mm
+74f1456c4a5f3d7da4102ecae5c20370f89c6ed1 2023-07-18T08:56:02 Merge tag 'linux-kselftest-fixes-6.5-rc3' of git://git.kernel.org/pub/scm/linux/kernel/git/shuah/linux-kselftest
+f2f393c385af0635eddb58df8bcd645cb6a18f5d 2023-07-18T08:43:35 Merge tag 'tpmdd-v6.5-rc3' of git://git.kernel.org/pub/scm/linux/kernel/git/jarkko/linux-tpmdd
+ef5c3de5211b5a3a8102b25aa83eb4cde65ac2fd 2023-07-17T12:53:22 maple_tree: fix node allocation testing on 32 bit
+7a93c71a6714ca1a9c03d70432dac104b0cfb815 2023-07-17T12:53:22 maple_tree: fix 32 bit mas_next testing
+25b5949c30938c7f26dbadc948b491e0e0811c78 2023-07-17T12:53:22 selftests/mm: mkdirty: fix incorrect position of #endif
+3c769fd88b9742954763a968e84de09f7ad78cfe 2023-07-17T12:53:22 maple_tree: set the node limit when creating a new root node
+2658f94d679243209889cdfa8de3743cde1abea9 2023-07-17T12:53:21 mm/mlock: fix vma iterator conversion of apply_vma_lock_flags()
+636e348353a7cc52609fdba5ff3270065da140d5 2023-07-17T12:53:21 prctl: move PR_GET_AUXV out of PR_MCE_KILL
+481c2d14627de8ecbb54dd125466e4b4a5069b47 2023-07-17T19:40:27 tpm,tpm_tis: Disable interrupts after 1000 unhandled IRQs
+393f362389cecc2e4f2e3520a6c8ee9dbb1e3d15 2023-07-17T19:40:27 tpm/tpm_tis: Disable interrupts for Lenovo L590 devices
+b1c1b98962d17a922989aa3b2822946bbb5c091f 2023-07-17T19:40:27 tpm: Do not remap from ACPI resources again for Pluton TPM
+bc825e851c2fe89c127cac1e0e5cf344c4940619 2023-07-17T19:40:27 tpm/tpm_tis: Disable interrupts for Framework Laptop Intel 13th gen
+08b0af4478bacb8bb701c172c99a34ea32da89f5 2023-07-17T19:40:27 tpm/tpm_tis: Disable interrupts for Framework Laptop Intel 12th gen
+2a4152742025c5f21482e8cebc581702a0fa5b01 2023-07-17T19:40:27 security: keys: Modify mismatched function name
+ecff6813d2bcf0c670881a9ba3f51cb032dd405a 2023-07-17T19:40:22 tpm: return false from tpm_amd_is_rng_defective on non-x86 platforms
+d55901522f96082a43b9842d34867363c0cdbac5 2023-07-17T19:32:30 keys: Fix linking a duplicate key to a keyring's assoc_array
+83e7e5d89f04d1c417492940f7922bc8416a8cc4 2023-07-17T19:32:30 tpm: tis_i2c: Limit write bursts to I2C_SMBUS_BLOCK_MAX (32) bytes
+f3b70b6e3390bfdf18fdd7d278a72a12784fdcce 2023-07-17T19:32:30 tpm: tis_i2c: Limit read bursts to I2C_SMBUS_BLOCK_MAX (32) bytes
+f0afba4042bd902d290405c0638bc1295872d8a7 2023-07-17T19:32:30 tpm_tis_spi: Release chip select when flow control fails
+edb13d7bb034c4d5523f15e9aeea31c504af6f91 2023-07-17T19:32:30 tpm: tpm_tis: Disable interrupts *only* for AEON UPX-i11
+f4032d615f90970d6c3ac1d9c0bce3351eb4445c 2023-07-17T19:32:30 tpm: tpm_vtpm_proxy: fix a race condition in /dev/vtpmx creation
+2480232c61b888a160153b9022858ac8c4362d5f 2023-07-17T10:27:44 perf test task_exit: No need for a cycles event to check if we get an PERF_RECORD_EXIT
+fdf0eaf11452d72945af31804e2a1048ee1b574c 2023-07-16T15:10:37 Linux 6.5-rc2
+5b8d6e8539498e8b2fa67fbcce3fe87834d44a7a 2023-07-16T14:12:49 Merge tag 'xtensa-20230716' of https://github.com/jcmvbkbc/linux-xtensa
+1667e630c228ca2e7577de7a404c89de3d9f7772 2023-07-16T13:46:08 Merge tag 'perf_urgent_for_v6.5_rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+8a3e4a64849eb9da0e8c7e693978499562581631 2023-07-16T13:34:29 Merge tag 'objtool_urgent_for_v6.5_rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+f61a89ca1182c43aa7a141c40f4063be81bd2562 2023-07-16T13:22:08 Merge tag 'sched_urgent_for_v6.5_rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+ede950b01922778ade5ba0d0834f25fca4ed1d88 2023-07-16T12:55:31 Merge tag 'pinctrl-v6.5-2' of git://git.kernel.org/pub/scm/linux/kernel/git/linusw/linux-pinctrl
+fe756ad0214619ac01503c37f43ca5b912d760d4 2023-07-16T12:49:05 Merge tag '6.5-rc1-smb3-fixes' of git://git.samba.org/sfrench/cifs-2.6
+20edcec23f92db47ca1ab33b4c6025bb8b3db7d7 2023-07-16T12:28:04 Merge tag 'powerpc-6.5-3' of git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux
+6eede0686f2f4a1b026a5714cb0481d074085855 2023-07-16T12:18:18 Merge tag 'hardening-v6.5-rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/kees/linux
+4b4eef57e6135ebd28de8c6a3e7898e04172a897 2023-07-16T12:13:51 Merge tag 'probes-fixes-v6.5-rc1-2' of git://git.kernel.org/pub/scm/linux/kernel/git/trace/linux-trace
+831fe284d8275987596b7d640518dddba5735f61 2023-07-15T08:51:02 Merge tag 'spi-fix-v6.5-rc1' of git://git.kernel.org/pub/scm/linux/kernel/git/broonie/spi
+393ea78172cdc68800285cb43855c9531abc26a1 2023-07-15T08:46:09 Merge tag 'regmap-fix-v6.5-rc1' of git://git.kernel.org/pub/scm/linux/kernel/git/broonie/regmap
+82678ab2a4af2b827d2b44b35b1295de8a1d312d 2023-07-15T08:40:00 Merge tag 'iommu-fixes-v6.5-rc1' of git://git.kernel.org/pub/scm/linux/kernel/git/joro/iommu
+b6e6cc1f78c772e952495b7416c9ac9029f9390c 2023-07-14T20:19:25 Merge tag 'x86_urgent_for_6.5_rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+be522ac7cdcc1b7dd19fa348205363041ab65a98 2023-07-14T19:57:29 Merge tag 'scsi-fixes' of git://git.kernel.org/pub/scm/linux/kernel/git/jejb/scsi
+b3bd86a0496565272ee1fc003b4b75ddb2f6427f 2023-07-14T19:52:18 Merge tag 'block-6.5-2023-07-14' of git://git.kernel.dk/linux
+ec17f16432058e1406c763a81acfc1394578bc8c 2023-07-14T19:46:54 Merge tag 'io_uring-6.5-2023-07-14' of git://git.kernel.dk/linux
+569f8b501b177f21121d483a96491716ab8905f4 2023-07-14T12:33:35 selftests/arm64: fix build failure during the "emit_tests" step
+c77896b143d3c9c3e84c4ed0662b807ccbd8730b 2023-07-14T12:32:42 selftests/riscv: fix potential build failure during the "emit_tests" step
+2772d7df3c93f15e5b2119bd9e14724db6a21a04 2023-07-14T11:14:07 Merge tag 'riscv-for-linus-6.5-rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/riscv/linux
+bde7f150276bf2a04f92d39beaf34eb40c42c9cc 2023-07-14T11:07:04 Merge tag 'pm-6.5-rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/rafael/linux-pm
+d121758da6df6829cb505ef0143cf42d28bd865d 2023-07-14T19:13:21 Merge branches 'pm-sleep' and 'pm-qos'
+69cba9d3c1284e0838ae408830a02c4a063104bc 2023-07-14T11:25:08 cifs: fix mid leak during reconnection after timeout threshold
+f13be0ad5344b46bb89323ea5576a2417c6d1e55 2023-07-14T09:24:31 selftests/mm: give scripts execute permission
+c071b34f62ddbf8435491ebb0e21eba9dc29f901 2023-07-14T11:24:14 cifs: is_network_name_deleted should return a bool
+3a97a2993e7e7392292323fefc46d79bf9633e44 2023-07-14T09:10:28 Merge tag 'drm-fixes-2023-07-14-1' of git://anongit.freedesktop.org/drm/drm
+ddbd91617f6d0b2fd8d509c45348a56125df07b1 2023-07-14T09:05:15 Merge tag 'ceph-for-6.5-rc2' of https://github.com/ceph/ceph-client
+9f87fc4d72f52b26ac3e19df5e4584227fe6740c 2023-07-14T08:42:58 block: queue data commands from the flush state machine at the head
+963293ff058cef54718fd225a542c73778257b3c 2023-07-14T10:36:16 tools headers arm64: Sync arm64's cputype.h with the kernel sources
+28e898ffa0c6a0875319d9362e387509819c9907 2023-07-14T10:33:50 tools include UAPI: Sync the sound/asound.h copy with the kernel sources
+7b8615935560e1db55c962efa17a5cbdab349107 2023-07-14T10:16:03 tools include UAPI: Sync linux/vhost.h with the kernel sources
+0e022f5bf72f9d7b6f77466b41a87c2076aa8d03 2023-07-14T09:59:56 perf beauty: Update copy of linux/socket.h with the kernel sources
+c20ecf7bb6153149b81a9277eda23398957656f2 2023-07-14T14:53:19 iommu/sva: Fix signedness bug in iommu_sva_alloc_pasid()
+911476ef3c585da9fdf156fd7aaa7455455daf76 2023-07-14T14:49:33 iommu: Fix crash during syfs iommu_groups/N/type
+797311bce5c2ac90b8d65e357603cfd410d36ebb 2023-07-14T17:04:58 tracing/probes: Fix to record 0-length data_loc in fetch_store_string*() if fails
+38d88d5e97c9032ebeca092b9372209f2ca92cdf 2023-07-14T13:19:54 Merge tag 'amd-drm-fixes-6.5-2023-07-12' of https://gitlab.freedesktop.org/agd5f/linux into drm-fixes
+864e029fea2b8e6583e026a6f93e8933ba626d42 2023-07-14T11:13:15 Merge tag 'drm-intel-fixes-2023-07-13' of git://anongit.freedesktop.org/drm/drm-intel into drm-fixes
+b7a57386b851aa28547c0d389644ec77d59cbc23 2023-07-14T10:38:47 Merge tag 'drm-misc-fixes-2023-07-13' of ssh://git.freedesktop.org/git/drm/drm-misc into drm-fixes
+4b810bf037e524b54669acbe4e0df54b15d87ea1 2023-07-13T14:35:02 Merge tag 'erofs-for-6.5-rc2-fixes' of git://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs
+b1983d427a53911ea71ba621d4bf994ae22b1536 2023-07-13T14:21:22 Merge tag 'net-6.5-rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/netdev/net
+ebc27aaceeb9c4c988dbf321e849fcb75c6b55fa 2023-07-13T13:44:28 Merge tag 'trace-v6.5-rc1-3' of git://git.kernel.org/pub/scm/linux/kernel/git/trace/linux-trace
+15999328946bd778b7bbf57179ee871dd5279b04 2023-07-13T13:39:36 Merge tag 'for-linus-6.5-rc2-tag' of git://git.kernel.org/pub/scm/linux/kernel/git/xen/tip
+9350cd0190c0d60915ec704112c864d858a0d31c 2023-07-13T13:34:00 Merge tag 'sh-for-v6.5-tag2' of git://git.kernel.org/pub/scm/linux/kernel/git/glaubitz/sh-linux
+90b4622954d59078fa0cecad7e7baa48efd006e7 2023-07-13T14:26:38 Merge tag 'nvme-6.5-2023-07-13' of git://git.infradead.org/nvme into block-6.5
+e8b03aef194c3c8597f4fb8e58ade1cc1f43001e 2023-07-13T13:32:36 tools: timers: fix freq average calculation
+b33b8731566d50aae6e11bd02921452cf3a7e0e7 2023-07-13T12:51:13 selftests/mincore: fix skip condition for check_huge_pages test
+5c17f45e91f5035c1b317e93b3dfb01088ac2902 2023-07-13T12:30:57 blk-mq: fix start_time_ns and alloc_time_ns for pre-allocated rq
+ec7633de404e7ce704d8f79081b97bca5b616c23 2023-07-13T09:54:32 sparc: mark __arch_xchg() as __always_inline
+e0b7b2081233ac7fe55838ff68cbc7ca9887a91f 2023-07-13T09:52:20 MAINTAINERS: Foolishly claim maintainership of string routines
+4ed8f337dee32df71435689c19d22e4ee846e15a 2023-07-14T00:37:43 Revert "tracing: Add "(fault)" name injection to kernel probes"
+e38e2c6a9efc435f9de344b7c91f7697e01b47d5 2023-07-14T00:37:00 tracing/probes: Fix to update dynamic data counter if fetcharg uses it
+b41326b5e0f82e93592c4366359917b5d67b529f 2023-07-14T00:36:28 tracing/probes: Fix not to count error code to total length
+66bcf65d6cf0ca6540e2341e88ee7ef02dbdda08 2023-07-14T00:35:53 tracing/probes: Fix to avoid double count of the string length on the array
+d5f28bb1ce04636b285726ee2a5afa3a514025f4 2023-07-14T00:24:00 fprobes: Add a comment why fprobe_kprobe_handler exits if kprobe is running
+b8f6446b6853768cb99e7c201bddce69ca60c15e 2023-07-13T08:16:07 nvme-pci: fix DMA direction of unmapping integrity data
+ac522fc6c3165fd0daa2f8da7e07d5f800586daa 2023-07-13T08:12:50 nvme: don't reject probe due to duplicate IDs for single-ported PCIe devices
+d5a821896360cc8b93a15bd888fabc858c038dc0 2023-07-13T10:48:36 tracing: Fix memory leak of iter->temp when reading trace_pipe
+a282a2f10539dce2aa619e71e1817570d557fc97 2023-07-13T13:18:57 libceph: harden msgr2.1 frame segment length checks
+9d23aac8a85f69239e585c8656c6fdb21be65695 2023-07-13T11:12:01 Merge branch 'net-sched-fixes-for-sch_qfq'
+137f6219da59903f480a9032b01225e9062f7ae0 2023-07-13T11:11:59 selftests: tc-testing: add test for qfq with stab overhead
+3e337087c3b5805fe0b8a46ba622a962880b5d64 2023-07-13T11:11:59 net/sched: sch_qfq: account for stab overhead in qfq_enqueue
+c5a06fdc618d1d262fa0db3483f096936961588c 2023-07-13T11:11:59 selftests: tc-testing: add tests for qfq mtu sanity check
+158810b261d02fc7dd92ca9c392d8f8a211a2401 2023-07-13T11:11:59 net/sched: sch_qfq: reintroduce lmax bound check for MTU
+7c28a35e19fafa1d3b367bcd3ec4021427a9397b 2023-07-13T08:37:53 sh: hd64461: Handle virq offset for offchip IRQ base and HD64461 IRQ
+3d20f7a6eb76afdf9d4ad9cb864c2e2da9c38e1f 2023-07-13T08:37:43 sh: mach-dreamcast: Handle virq offset in cascaded IRQ demux
+a2601b8d8f077368c6d113b4d496559415c6d495 2023-07-13T08:37:38 sh: mach-highlander: Handle virq offset in cascaded IRL demux

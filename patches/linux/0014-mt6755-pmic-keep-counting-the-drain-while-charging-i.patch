@@ -1,0 +1,76 @@
+From 521bd5ce7c75f1e20e14f2be533f61f15d98cae7 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sun, 8 Nov 2026 08:21:00 +0000
+Subject: [PATCH 14/25] mt6755-pmic: keep counting the drain while charging is
+ paused in full; status Not charging below 100%
+
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 27 ++++++++++++++++++---------
+ 1 file changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index 620966b79..f61b29b4c 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -16,13 +16,14 @@
+  *    readout (BATSNS/ISENSE, 56 mOhm sense resistor).
+  *  - charge control (sampled every 2 s): battery NTC on AUXADC ch3 (BATON,
+  *    16.9k pull-up to 1.8 V, 10k NTC, stock table), charging only inside
+- *    0..45 C (resume 3..42 C), stop when full (>= 4.15 V and < 100 mA taper
+- *    for 60 s, recharge below 4.10 V), software VBAT cap 4.25 V, NTC open/
++ *    0..45 C (resume 3..42 C), stop when full (>= 4.15 V and battery current
++ *    < 60 mA for 60 s, recharge below 4.05 V), software VBAT cap 4.25 V, NTC open/
+  *    short = no charging. Orderly power-off below 3.45 V when not charging.
+  *  - fuel gauge: MT6353 FGADC coulomb counter (R_FG 10 mOhm, CAR_TUNE 118, both
+  *    from the stock DT and confirmed by charger-current = load + battery-current),
+  *    started from the OCV table at boot, anchored at 100 % on charge termination
+- *    and near empty; current_now is the real battery current (the charger ISENSE
++ *    (the drain while charging is paused in "full" is still counted; status
++ *    is then "Not charging") and near empty; current_now is the real battery current (the charger ISENSE
+  *    path also feeds the system). charge_uah can be restored across reboots.
+  *  - power_supply "battery" (status/health/voltage/current/temp/capacity/charge)
+  *    and "usb" (online = charger detected).
+@@ -512,9 +513,7 @@ static void fg_update(void)
+ 		pr_info("mt6755-pmic: gauge start %lld mAh (%d mV, %d mA)\n",
+ 			div_s64(bs.q_nah, 1000000), bs.vbat, bs.fg_ma);
+ 	}
+-	if (bs.st == CHG_FULL)
+-		bs.q_nah = qmax;
+-	else if (!bs.chr && bs.vbat > 2500 && bs.vbat < 3500 && bs.q_nah > qmax * 3 / 100)
++	if (!bs.chr && bs.vbat > 2500 && bs.vbat < 3500 && bs.q_nah > qmax * 3 / 100)
+ 		bs.q_nah = qmax * 3 / 100;	/* empty anchor */
+ 	if (!bs.q_valid) {
+ 		bs.q_nah = ocv_q_nah();		/* provisional until the real start */
+@@ -602,8 +601,18 @@ static void chr_work_fn(struct work_struct *w)
+ 	}
+ 	bs.st = st;
+ 
+-	if (st == CHG_FULL)
+-		fg_update();		/* re-anchor at 100 % in the same tick */
++	/*
++	 * Re-anchor at 100 % on termination only: while charging is paused in
++	 * "full" the system runs from the battery (~200 mA idle), so keep
++	 * counting the drain until the recharge threshold.
++	 */
++	if (st == CHG_FULL && old != CHG_FULL) {
++		s64 qmax = (s64)qmax_mah * 1000000;
++
++		bs.q_nah = qmax;
++		bs.q_valid = true;
++		bs.cap = 100;
++	}
+ 
+ 	/* low battery: orderly power-off before the eMMC browns out */
+ 	if (lowbat_mv && !chr && bs.vbat > 2500 && bs.vbat < lowbat_mv) {
+@@ -672,7 +681,7 @@ static int bat_get(struct power_supply *psy, enum power_supply_property psp,
+ 	switch (psp) {
+ 	case POWER_SUPPLY_PROP_STATUS:
+ 		val->intval = bs.st == CHG_ON ? POWER_SUPPLY_STATUS_CHARGING :
+-			      bs.st == CHG_FULL ? POWER_SUPPLY_STATUS_FULL :
++			      bs.st == CHG_FULL && bs.cap >= 100 ? POWER_SUPPLY_STATUS_FULL :
+ 			      bs.st == CHG_NONE ? POWER_SUPPLY_STATUS_DISCHARGING :
+ 			      POWER_SUPPLY_STATUS_NOT_CHARGING;
+ 		break;
+-- 
+2.53.0
+

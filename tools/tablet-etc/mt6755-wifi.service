@@ -1,0 +1,15 @@
+[Unit]
+Description=MT6755 CONSYS WiFi bring-up (btif/wmt/launcher/wlan_gen2)
+After=systemd-modules-load.service local-fs.target
+Before=wpa_supplicant@wlan0.service network-pre.target
+Wants=network-pre.target
+ConditionPathExists=/root/connsys/up.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /root/connsys/up.sh
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

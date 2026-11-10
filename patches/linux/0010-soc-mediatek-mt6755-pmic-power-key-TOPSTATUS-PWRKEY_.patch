@@ -1,0 +1,97 @@
+From 390220cb9d821eea7d8cb1c080bb0fbc1df309a1 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Sat, 7 Nov 2026 23:10:25 +0000
+Subject: [PATCH 10/25] soc: mediatek: mt6755-pmic: power key (TOPSTATUS
+ PWRKEY_DEB, polled) as KEY_POWER input device
+
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 53 ++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index ccfd84d38..b02ab5579 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -25,12 +25,15 @@
+  *  - rtc: MT6353 RTC (MT6397 layout at PMIC 0x4000), year base 1968 as stock.
+  *  - /sys/kernel/mt6755_pmic/boot_recovery: RTC_PDN1 FAC_RESET, the flag stock
+  *    `reboot recovery` sets; lk boots `recovery` once and clears it.
++ *  - power key: TOPSTATUS PWRKEY_DEB (active low, as mtk-pmic-keys) polled every
++ *    50 ms -> input device "mt6755-pwrkey" (KEY_POWER).
+  *  - power-off: stock mt_power_off() (RTC BBPU pwrdown = PWRBB low); if a
+  *    charger keeps the PMIC up, restart instead (as stock does).
+  */
+ #include <linux/delay.h>
+ #include <linux/export.h>
+ #include <linux/init.h>
++#include <linux/input.h>
+ #include <linux/io.h>
+ #include <linux/kobject.h>
+ #include <linux/moduleparam.h>
+@@ -777,6 +780,55 @@ static const struct rtc_class_ops mt6755_rtc_ops = {
+ 	.set_time = mt6755_rtc_set_time,
+ };
+ 
++/* ---------------- power key ---------------- */
++#define TOPSTATUS		0x021C
++#define TOPSTATUS_PWRKEY_DEB	BIT(1)
++
++static struct input_dev *pwrkey_input;
++static struct delayed_work pwrkey_work;
++static bool pwrkey_down;
++
++static void pwrkey_work_fn(struct work_struct *w)
++{
++	u16 v;
++
++	if (!mt6755_pmic_read(TOPSTATUS, &v)) {
++		bool down = !(v & TOPSTATUS_PWRKEY_DEB);
++
++		if (down != pwrkey_down) {
++			pwrkey_down = down;
++			input_report_key(pwrkey_input, KEY_POWER, down);
++			input_sync(pwrkey_input);
++		}
++	}
++	queue_delayed_work(system_dfl_wq, &pwrkey_work, msecs_to_jiffies(50));
++}
++
++static void pwrkey_init(struct device *parent)
++{
++	u16 v = 0;
++
++	pwrkey_input = input_allocate_device();
++	if (!pwrkey_input)
++		return;
++	pwrkey_input->name = "mt6755-pwrkey";
++	pwrkey_input->phys = "mt6755-pmic/input0";
++	pwrkey_input->id.bustype = BUS_HOST;
++	pwrkey_input->dev.parent = parent;
++	input_set_capability(pwrkey_input, EV_KEY, KEY_POWER);
++	if (input_register_device(pwrkey_input)) {
++		input_free_device(pwrkey_input);
++		pwrkey_input = NULL;
++		return;
++	}
++	mt6755_pmic_read(TOPSTATUS, &v);
++	pwrkey_down = !(v & TOPSTATUS_PWRKEY_DEB);
++	pr_info("mt6755-pmic: power key input, TOPSTATUS 0x%04x (%s)\n", v,
++		pwrkey_down ? "pressed?!" : "released");
++	INIT_DELAYED_WORK(&pwrkey_work, pwrkey_work_fn);
++	queue_delayed_work(system_dfl_wq, &pwrkey_work, 0);
++}
++
+ static int __init mt6755_battery_init(void)
+ {
+ 	struct power_supply_config cfg = {};
+@@ -803,6 +855,7 @@ static int __init mt6755_battery_init(void)
+ 		pr_warn("mt6755-pmic: battery psy: %ld\n", PTR_ERR(bat_psy));
+ 		bat_psy = NULL;
+ 	}
++	pwrkey_init(&pdev->dev);
+ 	cfg.supplied_to = usb_supplied_to;
+ 	cfg.num_supplicants = ARRAY_SIZE(usb_supplied_to);
+ 	usb_psy = power_supply_register(&pdev->dev, &usb_desc, &cfg);
+-- 
+2.53.0
+

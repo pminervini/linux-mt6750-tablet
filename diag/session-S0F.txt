@@ -1,0 +1,8 @@
+da peek 0x7ff80000 0x80000 --filename out/s0f-logstore.bin
+da peek 0x11D000 0xc00 --filename out/s0f-ramcon-sram.bin
+da peek 0x44400000 0x10000 --filename out/s0f-ramcon-dram.bin
+da peek 0x44480000 0x100 --filename out/s0f-marker.bin
+da poke 0x1123007c 0x00000001
+da poke 0x1123007c 0x00000000
+da poke 0x10007000 0x22000014
+da poke 0x10007014 0x00001209

@@ -1,0 +1,26 @@
+From 28c0230aa9f1549a098a984da03cb9b5493303d5 Mon Sep 17 00:00:00 2001
+From: Arseniy Velikanov <adomerlee@gmail.com>
+Date: Mon, 2 Jan 2023 08:26:34 +0400
+Subject: [PATCH] arm64: dts: mediatek: mt6755: Set initrd address
+
+Signed-off-by: Arseniy Velikanov <adomerlee@gmail.com>
+---
+ arch/arm64/boot/dts/mediatek/mt6755.dtsi | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6755.dtsi b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+index 56658cb17591..0e21e3867f82 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6755.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6755.dtsi
+@@ -90,7 +90,7 @@ chosen {
+ 		 * on boot.img cmdline to boot 64-bit kernel (adding it here doesn't help)
+ 		 * FIXME: without "maxcpus=0" the kernel will panic while bringing up the secondary CPUs!
+ 		 */
+-		bootargs = "maxcpus=0";
++		bootargs = "maxcpus=0 initrd=0x45000000,0x1000000";
+ 	};
+ 
+ 	uart_clk: dummy26m {
+-- 
+GitLab
+
