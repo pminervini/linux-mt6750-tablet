@@ -1,7 +1,7 @@
 From 50c51448f8178acd8bc8834961e9a9b4c201f65b Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sat, 7 Nov 2026 22:11:58 +0000
-Subject: [PATCH 08/30] soc: mediatek: mt6755-pmic: MT6353 pwrap accessors,
+Subject: [PATCH 08/31] soc: mediatek: mt6755-pmic: MT6353 pwrap accessors,
  pulse charger, AUXADC battery readout; dts: CONSYS/BTIF/WiFi nodes
 
 - mt6755_pmic_read/write/rmw (WACS2, mutex-serialized), exported for the connsys modules

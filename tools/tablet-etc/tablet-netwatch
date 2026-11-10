@@ -6,13 +6,15 @@
 #   3  wpa_cli reassociate
 #   6  restart wpa_supplicant@wlan0 and DHCP (networkd)
 #  10  Wi-Fi function off/on in the driver (/dev/wmtWifi), or rerun the bring-up if wlan0 is gone
-#  30  reboot - at most once per 6 h (stamp in /var/lib/tablet-netwatch), so a router that is
-#      simply off does not cause a reboot loop; never in the first 30 min after boot
+#  30+ reboot - at most once per 6 h (stamp in /var/lib/tablet-netwatch), so a router that is
+#      simply off does not cause a reboot loop; never in the first 30 min after boot;
+#      while still offline it happens as soon as these guards allow
 # Router reboots and roaming are handled by wpa_supplicant itself; this is for wedged states.
-# Thresholds can be overridden for tests: NW_STEP (seconds per check), NW_T1/T2/T3/T4 (checks).
+# Thresholds can be overridden for tests: NW_STEP (seconds per check), NW_T1/T2/T3/T4 (checks),
+# NW_STATE (state directory).
 STEP=${NW_STEP:-60}; T1=${NW_T1:-3}; T2=${NW_T2:-6}; T3=${NW_T3:-10}; T4=${NW_T4:-30}
 IF=wlan0
-STATE=/var/lib/tablet-netwatch
+STATE=${NW_STATE:-/var/lib/tablet-netwatch}
 mkdir -p $STATE
 
 log() { echo "$*"; echo "<5>tablet-netwatch: $*" > /dev/kmsg; }
@@ -26,11 +28,11 @@ healthy() {
 }
 
 sleep "$STEP"
-bad=0
+bad=0 held=
 while :; do
 	if healthy; then
 		[ $bad -gt 0 ] && log "Wi-Fi back after $bad failed checks"
-		bad=0
+		bad=0 held=
 	else
 		bad=$((bad + 1))
 		case $bad in
@@ -53,21 +55,31 @@ while :; do
 			iw dev $IF set power_save on 2>/dev/null
 			systemctl restart wpa_supplicant@$IF.service
 			networkctl reconfigure $IF >/dev/null 2>&1 ;;
-		"$T4")
+		esac
+		# From T4 on, every check reconsiders the reboot, so one held back by a guard happens as
+		# soon as the guard expires (an exact "= T4" test fired only once per outage).
+		if [ $bad -ge $T4 ]; then
 			up=$(cut -d. -f1 /proc/uptime)
 			last=$(cat $STATE/last-reboot 2>/dev/null || echo 0)
 			now=$(date +%s)
 			if [ "$up" -lt 1800 ]; then
-				log "offline for $bad checks, but up only ${up}s: not rebooting"
+				why=uptime msg="up only ${up}s"
 			elif [ $((now - last)) -lt 21600 ]; then
-				log "offline for $bad checks; rebooted for this less than 6 h ago: not rebooting"
+				why=recent msg="rebooted for this less than 6 h ago"
 			else
+				why=
 				log "offline for $bad checks: rebooting"
 				echo "$now" > $STATE/last-reboot
 				sync
-				systemctl reboot
-			fi ;;
-		esac
+				if ! systemctl reboot; then
+					log "reboot request failed, will retry"
+					echo "$last" > $STATE/last-reboot
+				fi
+			fi
+			# log a held-back reboot once per reason, not every minute
+			[ -n "$why" ] && [ "$why" != "$held" ] && log "offline for $bad checks, but $msg: not rebooting yet"
+			held=$why
+		fi
 	fi
 	sleep "$STEP"
 done

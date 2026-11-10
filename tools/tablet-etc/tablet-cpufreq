@@ -81,6 +81,9 @@ def main():
     high["vproc"] = pmic(VPROC_VOSEL)
     if high["vproc"] <= LOW["vproc"] or high["big"] == LOW["big"]:
         high = dict(BOOT)           # restarted while at LOW: HIGH = the boot point
+    # Start from HIGH in hardware too, so the logical state below matches the chip (after a crash
+    # or SIGKILL at LOW, the loop would otherwise believe HIGH while the CPUs stay at LOW).
+    apply(high, True)
     print(f"tablet-cpufreq: HIGH big=0x{high['big']:08x} little=0x{high['little']:08x} "
           f"vproc=0x{high['vproc']:02x}", flush=True)
 

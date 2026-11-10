@@ -1,7 +1,7 @@
 From 003ba2fcd060552bf69ce21e44dd976a41fc602e Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 12:24:23 +0000
-Subject: [PATCH 28/30] USB host on MT6755 + reboots on battery
+Subject: [PATCH 28/31] USB host on MT6755 + reboots on battery
 
 mtu3: on MT6755 (SSUSB IP v0) the U2 port follows the PHY's IDDIG while
 OTG_SEL is set and the IPPC FORCE_IDDIG bits do nothing; in host mode the

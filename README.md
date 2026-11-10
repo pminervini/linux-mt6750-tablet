@@ -19,8 +19,8 @@ It is not a polished distribution.
   PWM backlight, panel sleep/wake over DSI
 - Wi-Fi (WPA2, DHCP, power save) and Bluetooth (BlueZ) through the vendor connsys stack, forward-ported
   as out-of-tree modules (see "Not included")
-- charging with temperature limits, coulomb-counting fuel gauge, a 70-80 % charge limit for a tablet that
-  stays plugged in, orderly power-off on low battery
+- charging with temperature limits (charging stops if the voltage/NTC readings go stale), coulomb-counting
+  fuel gauge, a 70-80 % charge limit for a tablet that stays plugged in, orderly power-off on low battery
 - RTC, power key, accelerometer (QMA6100P), SoC temperature sensor (thermal zone with critical trip)
 - touchscreen (Silead GSL3670, multitouch; firmware cut from the device's own stock kernel)
 - GPS: open-source engine [opengps-mtk](https://github.com/pminervini/opengps-mtk) (no mnld/libmnl)
@@ -28,8 +28,9 @@ It is not a polished distribution.
 - boot splash: own boot logo (lk), lk's "Orange State" screen and 5 s delay patched out, quiet boot
   with an optional animation until the login prompt, console rotated for landscape
   (`tools/splash`)
-- unattended operation: watchdog full-reset, fallback to Android when a kernel fails early, Wi-Fi
-  watchdog, quiet console with a clean login prompt
+- unattended operation: hardware watchdog fed by systemd (full reset if userspace hangs), fallback to
+  Android when a kernel fails early, Wi-Fi watchdog, flashing script that verifies the write and the
+  booted kernel, quiet console with a clean login prompt
 
 Not working yet: cameras, CPU frequency scaling beyond the boot loader's operating point
 (a small userspace governor switches between two points), GPU.

@@ -1,7 +1,7 @@
 From 3bbde271f3ddf382043a60870a7f715fcccc5153 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Fri, 6 Nov 2026 15:37:23 +0000
-Subject: [PATCH 02/30] MT6750 tablet: early VEMC power-cycle + breadcrumbs,
+Subject: [PATCH 02/31] MT6750 tablet: early VEMC power-cycle + breadcrumbs,
  lk-compatible reserved-memory; first boot to userspace
 
 ---

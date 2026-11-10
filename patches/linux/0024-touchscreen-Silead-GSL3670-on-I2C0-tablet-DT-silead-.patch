@@ -1,7 +1,7 @@
 From 6194b06bf916bd7c0dd94957316b00d83d6270a4 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 09:38:23 +0000
-Subject: [PATCH 24/30] touchscreen: Silead GSL3670 on I2C0 (tablet DT) +
+Subject: [PATCH 24/31] touchscreen: Silead GSL3670 on I2C0 (tablet DT) +
  silead: tolerate a NACKed reset command
 
 The chip answers register transactions (write the register, then read)

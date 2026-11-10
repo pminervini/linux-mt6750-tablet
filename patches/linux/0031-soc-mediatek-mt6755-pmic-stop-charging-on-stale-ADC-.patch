@@ -1,0 +1,176 @@
+From 8b1d4b28c0bc4af640e29f8788817c6e0066b6ee Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 15:50:42 +0000
+Subject: [PATCH 31/31] soc: mediatek: mt6755-pmic: stop charging on stale ADC
+ samples, no 'full' on discharge
+
+Charging decisions used the last good sample of battery voltage and NTC
+temperature with no age limit: after one good reading, failing conversions
+left charging enabled on old values. Track when each input was last read
+successfully; a battery voltage older than 10 s or an NTC sample older
+than 60 s (the BATON plausibility filter needs up to 30 s to accept a real
+step) now stops charging in a new 'adc-fault' state (health: unspecified
+failure). The low-battery power-off also ignores a stale voltage.
+
+Termination ('full', which re-anchors the gauge at 100 %) accepted any
+battery current below 60 mA, including a discharge when the load exceeds
+what the charger delivers. Require a fresh gauge sample between -20 and
+60 mA. fg_read() now checks every register read instead of using zeroed
+values after a failed one.
+
+Tested with a temporary fault-injection switch (not in this patch): vbat
+reads failing -> adc-fault after 10 s, charger off (battery current
++60 -> -440 mA); NTC reads failing -> adc-fault after 60 s; recovery on
+the next good sample.
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 57 +++++++++++++++++++++++-------
+ 1 file changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index de7a1f27a..d17472d15 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -384,12 +384,22 @@ static int lowbat_mv = 3450;
+ module_param(lowbat_mv, int, 0644);
+ MODULE_PARM_DESC(lowbat_mv, "power off below this battery voltage when not charging (0 = never)");
+ 
+-enum chg_state { CHG_NONE, CHG_ON, CHG_FULL, CHG_HOT, CHG_COLD, CHG_OV, CHG_NTC, CHG_OFF, CHG_LIMIT };
++enum chg_state { CHG_NONE, CHG_ON, CHG_FULL, CHG_HOT, CHG_COLD, CHG_OV, CHG_NTC, CHG_OFF, CHG_LIMIT,
++		 CHG_ADC };
+ static const char * const chg_names[] = {
+ 	"no-charger", "charging", "full", "too-hot", "too-cold", "over-voltage", "ntc-fault", "disabled",
+-	"limit",
++	"limit", "adc-fault",
+ };
+ 
++/*
++ * Charging decisions use the last good sample of each input; one that is too old (conversions
++ * failing) stops charging (CHG_ADC) instead of trusting it. The NTC limit covers the 30 s a real
++ * temperature step needs to pass the BATON plausibility filter.
++ */
++#define VBAT_MAX_AGE	(10 * HZ)
++#define NTC_MAX_AGE	(60 * HZ)
++#define FG_MAX_AGE	(10 * HZ)
++
+ static struct {
+ 	int vbat, ibat, vntc, temp;	/* mV, charger mA, mV, 0.1 C */
+ 	int fg_ma, last_car, cap;	/* battery mA (+ = charging), raw CAR, % */
+@@ -400,7 +410,14 @@ static struct {
+ 	bool limited;			/* charge limit reached; survives hot/cold/unplug interruptions */
+ 	bool vntc_valid;
+ 	int ntc_jump;			/* consecutive BATON samples far from the accepted value */
++	bool vbat_valid, fg_valid;
++	unsigned long vbat_at, ntc_at, fg_at;	/* jiffies of the last good vbat / NTC / gauge sample */
+ } bs;
++
++static bool fresh(bool valid, unsigned long at, unsigned long max_age)
++{
++	return valid && time_before(jiffies, at + max_age);
++}
+ static struct power_supply *bat_psy, *usb_psy;
+ 
+ static int ntc_temp(int mv, int *t10)
+@@ -488,11 +505,12 @@ static int fg_read(int *car, int *ma)
+ 	}
+ 	mt6755_pmic_write(FGADC_CON0, 0x0200 | c0);
+ 	ret = fg_wait(true);
+-	if (!ret) {
+-		mt6755_pmic_read(FGADC_CON1, &c1);
+-		mt6755_pmic_read(FGADC_CON2, &c2);
+-		mt6755_pmic_read(FGADC_CON11, &ci);
+-	}
++	if (!ret)
++		ret = mt6755_pmic_read(FGADC_CON1, &c1);
++	if (!ret)
++		ret = mt6755_pmic_read(FGADC_CON2, &c2);
++	if (!ret)
++		ret = mt6755_pmic_read(FGADC_CON11, &ci);	/* a failed read is an error, not 0 */
+ 	mt6755_pmic_write(FGADC_CON0, 0x0800 | c0);
+ 	fg_wait(false);
+ 	mt6755_pmic_write(FGADC_CON0, c0);
+@@ -520,6 +538,8 @@ static void fg_update(void)
+ 
+ 	if (!fg_read(&car, &ma)) {
+ 		bs.fg_ma = ma;
++		bs.fg_valid = true;
++		bs.fg_at = jiffies;
+ 		if (bs.car_valid) {
+ 			d = car - bs.last_car;
+ 			if (abs(d) < 5000)	/* else the counter was reset under us */
+@@ -571,7 +591,7 @@ static void chr_work_fn(struct work_struct *w)
+ {
+ 	enum chg_state st = bs.st, old = bs.st;
+ 	int vbat, ibat, vntc, t, vocv, oldcap = bs.cap;
+-	bool chr, oldchr = bs.chr;
++	bool chr, oldchr = bs.chr, vbat_ok, ntc_fresh;
+ 	u16 c0;
+ 
+ 	if (mt6755_pmic_read(CHR_CON0, &c0))
+@@ -580,6 +600,8 @@ static void chr_work_fn(struct work_struct *w)
+ 	if (!battery_read(&vbat, &ibat)) {
+ 		bs.vbat = vbat;
+ 		bs.ibat = ibat;
++		bs.vbat_valid = true;
++		bs.vbat_at = jiffies;
+ 	}
+ 	/*
+ 	 * BATON plausibility: the GPS co-TSX (MDRT) conversion lands in the same output register
+@@ -595,8 +617,11 @@ static void chr_work_fn(struct work_struct *w)
+ 			bs.ntc_ok = !ntc_temp(vntc - bs.ibat * ntc_comp_mohm / 1000, &t);
+ 			if (bs.ntc_ok)
+ 				bs.temp = t;
++			bs.ntc_at = jiffies;
+ 		}
+ 	}
++	vbat_ok = fresh(bs.vbat_valid, bs.vbat_at, VBAT_MAX_AGE);
++	ntc_fresh = fresh(bs.vntc_valid, bs.ntc_at, NTC_MAX_AGE);
+ 	bs.chr = chr;
+ 	fg_update();
+ 	vocv = bs.vbat - bs.fg_ma * r_int_mohm / 1000;	/* IR-compensated (approx. open-circuit) */
+@@ -625,6 +650,8 @@ static void chr_work_fn(struct work_struct *w)
+ 		st = CHG_NONE;
+ 	else if (!charger)
+ 		st = CHG_OFF;
++	else if (!vbat_ok || (!ignore_temp && !ntc_fresh))
++		st = CHG_ADC;
+ 	else if (!ignore_temp && !bs.ntc_ok)
+ 		st = CHG_NTC;
+ 	else if (!ignore_temp && bs.hot)
+@@ -660,8 +687,14 @@ static void chr_work_fn(struct work_struct *w)
+ 		bs.lim_cnt = 0;
+ 	}
+ 
+-	/* termination: at CV and the battery itself takes < 60 mA (gauge, not charger, current) */
+-	if (st == CHG_ON && bs.vbat >= 4150 && bs.fg_ma < 60) {
++	/*
++	 * termination: at CV and the battery itself takes < 60 mA (gauge, not charger, current).
++	 * The current must be a fresh sample and not a discharge: with the charger on but the load
++	 * above what it delivers, the battery current is negative and the battery is not full.
++	 * (-20 mA leaves room for gauge offset/noise around a taper current near zero.)
++	 */
++	if (st == CHG_ON && bs.vbat >= 4150 && fresh(bs.fg_valid, bs.fg_at, FG_MAX_AGE) &&
++	    bs.fg_ma > -20 && bs.fg_ma < 60) {
+ 		if (++bs.full_cnt >= 30)
+ 			st = CHG_FULL;
+ 	} else {
+@@ -691,7 +724,7 @@ static void chr_work_fn(struct work_struct *w)
+ 	}
+ 
+ 	/* low battery: orderly power-off before the eMMC browns out */
+-	if (lowbat_mv && !chr && bs.vbat > 2500 && bs.vbat < lowbat_mv) {
++	if (lowbat_mv && !chr && vbat_ok && bs.vbat > 2500 && bs.vbat < lowbat_mv) {
+ 		if (++bs.low_cnt == 15) {
+ 			pr_crit("mt6755-pmic: battery %d mV < %d mV for 30 s, powering off\n",
+ 				bs.vbat, lowbat_mv);
+@@ -767,7 +800,7 @@ static int bat_get(struct power_supply *psy, enum power_supply_property psp,
+ 		val->intval = bs.st == CHG_HOT ? POWER_SUPPLY_HEALTH_OVERHEAT :
+ 			      bs.st == CHG_COLD ? POWER_SUPPLY_HEALTH_COLD :
+ 			      bs.st == CHG_OV ? POWER_SUPPLY_HEALTH_OVERVOLTAGE :
+-			      bs.st == CHG_NTC ? POWER_SUPPLY_HEALTH_UNSPEC_FAILURE :
++			      bs.st == CHG_NTC || bs.st == CHG_ADC ? POWER_SUPPLY_HEALTH_UNSPEC_FAILURE :
+ 			      POWER_SUPPLY_HEALTH_GOOD;
+ 		break;
+ 	case POWER_SUPPLY_PROP_PRESENT:
+-- 
+2.53.0
+

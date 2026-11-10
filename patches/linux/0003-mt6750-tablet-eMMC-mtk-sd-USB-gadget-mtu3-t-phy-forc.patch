@@ -1,7 +1,7 @@
 From 4881d9c715033eef5943c2265b53ccc1e31210ab Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sat, 7 Nov 2026 09:09:00 +0000
-Subject: [PATCH 03/30] mt6750 tablet: eMMC (mtk-sd), USB gadget (mtu3 + t-phy
+Subject: [PATCH 03/31] mt6750 tablet: eMMC (mtk-sd), USB gadget (mtu3 + t-phy
  force-vbus, PHY at 0x11290000), SPM CPU power-on for cluster 0
 
 ---

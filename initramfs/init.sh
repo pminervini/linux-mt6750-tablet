@@ -147,12 +147,24 @@ if grep -q " /mnt ext4 rw" /proc/mounts && [ -x $DEB/bin/bash ] && [ ! -e /mnt/l
   cp /tablet-init /newroot/run/tablet-init; chmod 755 /newroot/run/tablet-init
   echo "$SUM" > /newroot/run/mainline-summary
   kill $LOOPS 2>/dev/null; sleep 0.2; killall telnetd nc 2>/dev/null   # respawn loops first, else they spin without busybox
-  for m in dev proc sys; do mount --move /$m /newroot/$m; done
   # systemd if installed (and not vetoed by /data/linux/mainline-simple-init), else the minimal bash init
-  if [ -x /newroot/lib/systemd/systemd ] && [ ! -e /mnt/linux/mainline-simple-init ]; then
-    log "exec systemd"
-    exec switch_root /newroot /lib/systemd/systemd --log-target=kmsg
+  INIT=tablet-init
+  [ -x /newroot/lib/systemd/systemd ] && [ ! -e /mnt/linux/mainline-simple-init ] && INIT=systemd
+  # Hand the hardware watchdog to systemd (RuntimeWatchdogSec in system.conf.d/watchdog.conf):
+  # busybox's feeder would otherwise keep running under systemd and keep a hung userspace alive.
+  # SIGKILL, not SIGTERM: on SIGTERM busybox does the magic close and stops the timer; killed,
+  # the close is "unexpected" ("watchdog did not stop!"), the timer keeps running with its 31 s
+  # timeout, and systemd (which opens the device about 2 s later) takes over without a gap.
+  # The minimal-init and stay-in-initramfs paths keep the busybox feeder. Before the mount
+  # --move below: killall/pidof need /proc, log needs /dev/kmsg.
+  if [ $INIT = systemd ] && [ -e /newroot/etc/systemd/system.conf.d/watchdog.conf ]; then
+    killall -KILL watchdog 2>/dev/null
+    i=0; while pidof watchdog >/dev/null && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done  # else EBUSY
+    pidof watchdog >/dev/null && log "watchdog: busybox feeder did not exit" || log "watchdog handed over to systemd"
   fi
+  log "exec $INIT"
+  for m in dev proc sys; do mount --move /$m /newroot/$m; done
+  [ $INIT = systemd ] && exec switch_root /newroot /lib/systemd/systemd --log-target=kmsg
   exec switch_root /newroot /bin/bash /run/tablet-init
 fi
 log "staying in initramfs"

@@ -1,7 +1,7 @@
 From 715b3c3940e1dd7de8d108a52b8f715122f6d7bf Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Mon, 9 Nov 2026 22:53:24 +0000
-Subject: [PATCH 21/30] mt6755-pmic: pause the MDRT conversion around AP AUXADC
+Subject: [PATCH 21/31] mt6755-pmic: pause the MDRT conversion around AP AUXADC
  reads (BATON glitch)
 
 The periodic modem real-time conversion enabled in c66f03af3 for the
