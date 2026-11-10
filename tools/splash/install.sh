@@ -6,6 +6,8 @@
 #   install.sh logo IMAGE         boot loader logo (static; any image, fitted to 1280x800 landscape)
 #   install.sh anim SRC           boot animation (GIF/APNG, PNG directory, single image, or .splash);
 #   install.sh anim none            "none" removes it (the logo then stays up until the login prompt)
+#   install.sh scroll on|off      "on": no animation; after the logo, systemd's "[ OK ] Started ..."
+#                                   lines scroll until the login prompt. "off": back to the animation
 #   install.sh lk-patch           remove lk's Orange State screen + its 5 s delay (4-byte patch)
 #   install.sh capture OUT.png    what lk showed at this boot (kernel snapshot), in view orientation
 #   install.sh restore PART FILE  write a saved partition image back (PART: logo or lk)
@@ -67,8 +69,24 @@ do_anim() {
     sudo install -m 644 /tmp/tablet-splash.service /etc/systemd/system/tablet-splash.service
     sudo install -D -m 644 /tmp/splash-getty.conf /etc/systemd/system/getty@tty1.service.d/splash.conf
     rm -f /tmp/tablet-splash /tmp/tablet-splash.service /tmp/splash-getty.conf /tmp/$(basename "$f")
+    sudo rm -f /etc/systemd/system.conf.d/show-status.conf /etc/systemd/system/getty@tty1.service.d/keep-boot-log.conf
     sudo systemctl daemon-reload; sudo systemctl enable -q tablet-splash.service
-    echo 'boot animation installed'"
+    echo 'boot animation installed (boot scroll off)'"
+}
+
+do_scroll() {   # boot status lines on tty1 instead of the animation
+  if [ "$1" = on ]; then
+    scp -q show-status.conf getty-keep-boot-log.conf "$T:/tmp/"
+    ssh "$T" "set -e; sudo install -D -m 644 /tmp/show-status.conf /etc/systemd/system.conf.d/show-status.conf
+      sudo install -D -m 644 /tmp/getty-keep-boot-log.conf /etc/systemd/system/getty@tty1.service.d/keep-boot-log.conf
+      rm -f /tmp/show-status.conf /tmp/getty-keep-boot-log.conf
+      sudo systemctl disable -q tablet-splash.service 2>/dev/null || true
+      sudo systemctl daemon-reload; echo 'boot scroll on (animation off)'"
+  else
+    ssh "$T" "set -e; sudo rm -f /etc/systemd/system.conf.d/show-status.conf /etc/systemd/system/getty@tty1.service.d/keep-boot-log.conf
+      sudo systemctl daemon-reload
+      if [ -f /usr/local/share/tablet-splash/boot.splash ]; then sudo systemctl enable -q tablet-splash.service; echo 'boot scroll off (animation on)'; else echo 'boot scroll off'; fi"
+  fi
 }
 
 do_lk_patch() {
@@ -102,10 +120,11 @@ case "${1:-}" in
     do_anim "$TMP/cyber/frames" ;;
   logo) do_logo "${2:?image}" ;;
   anim) do_anim "${2:?animation or none}" ;;
+  scroll) case "${2:-}" in on|off) do_scroll "$2" ;; *) echo "scroll on|off"; exit 1 ;; esac ;;
   lk-patch) do_lk_patch ;;
   capture) do_capture "${2:?output png}" ;;
   restore)
     case "${2:-}" in logo|lk) ;; *) echo "restore logo|lk FILE"; exit 1 ;; esac
     save_part "$2"; write_part "$2" "${3:?file}" ;;
-  *) sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

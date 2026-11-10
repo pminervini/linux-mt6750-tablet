@@ -10,6 +10,11 @@ What the screen shows from power-on to the login prompt:
    `getty@tty1` starts (~16 s), then gives tty1 back to the console.
 4. The **console** is rotated for landscape (`fbcon=rotate:3`).
 
+Instead of the animation, `install.sh scroll on` keeps the logo only while the kernel boots and then
+lets systemd's `[  OK  ] Started ...` lines scroll on tty1 until the login prompt
+(`show-status.conf`: `ShowStatus=yes`; `getty-keep-boot-log.conf`: the getty does not wipe the
+screen first). `install.sh scroll off` (or installing an animation) goes back.
+
 Errors still reach the screen: any kernel message at error level or worse ends the logo, and the
 animation stops on emergency/rescue mode or after 90 s. `BOOT_VERBOSE=1 ./build.sh config` builds a
 kernel with the old verbose boot console instead (the animation is then skipped).
@@ -29,6 +34,8 @@ tools/splash/install.sh default            # generated cyberpunk splash: logo + 
 tools/splash/install.sh logo my.png        # any image as the boot logo
 tools/splash/install.sh anim my.gif        # GIF/APNG, directory of PNGs, or a single image
 tools/splash/install.sh anim none          # no animation: the logo stays until the login prompt
+tools/splash/install.sh scroll on          # no animation: logo, then systemd's boot lines scroll
+tools/splash/install.sh scroll off         # back to the animation (if one is installed)
 tools/splash/install.sh lk-patch           # no Orange State screen / 5 s delay
 tools/splash/install.sh capture shot.png   # what lk showed at this boot
 tools/splash/install.sh restore lk  backups/lk-<date>.bin     # undo (also: restore logo ...)
