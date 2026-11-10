@@ -13,7 +13,8 @@ Load = the busiest CPU's. Go LOW after DOWN_SECS below DOWN_LOAD; HIGH as soon a
 exceeds UP_LOAD.
 On SIGTERM the HIGH point is restored.
 Thermal cap (no kernel cooling maps yet): at >= HOT_C on the cpu-thermal zone the CPUs are held
-at LOW whatever the load, until the temperature falls to COOL_C (the zone's "hot" trip is 90 C).
+at LOW whatever the load, until a valid reading at or below COOL_C (the zone's "hot" trip is 90 C);
+unreadable samples while capped keep LOW. If the zone is unreadable from the start, there is no cap.
 """
 import mmap, os, signal, struct, sys, time
 
@@ -118,7 +119,7 @@ def main():
     tpath = cpu_temp_path()
     print(f"tablet-cpufreq: thermal cap {HOT_C:.0f} C (release {COOL_C:.0f} C) on "
           f"{tpath or 'NO cpu-thermal zone: cap disabled'}", flush=True)
-    state, quiet, hot = "HIGH", 0, False
+    state, quiet, hot, blind = "HIGH", 0, False, False
     prev = cpu_times()
     while True:
         time.sleep(1)
@@ -131,10 +132,13 @@ def main():
         if temp is not None and not hot and temp >= HOT_C:
             hot = True
             print(f"tablet-cpufreq: {temp:.1f} C >= {HOT_C:.0f} C: held at LOW", flush=True)
-        elif hot and (temp is None or temp <= COOL_C):
+        elif hot and temp is not None and temp <= COOL_C:
             hot = False
-            print("tablet-cpufreq: %s: thermal cap released" %
-                  ("temperature unreadable" if temp is None else f"{temp:.1f} C"), flush=True)
+            print(f"tablet-cpufreq: {temp:.1f} C: thermal cap released", flush=True)
+        elif hot and temp is None and not blind:
+            # a failed read is not evidence of cooling: stay at LOW until a valid reading
+            print("tablet-cpufreq: temperature unreadable while capped: staying at LOW", flush=True)
+        blind = temp is None
         if hot:
             if state == "HIGH":
                 apply(LOW, False)
