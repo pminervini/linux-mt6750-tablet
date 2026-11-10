@@ -31,7 +31,7 @@ It is not a polished distribution.
   with an optional animation until the login prompt, console rotated for landscape
   (`tools/splash`)
 - unattended operation: hardware watchdog fed by systemd (full reset if userspace hangs), fallback to
-  Android when a kernel fails early, Wi-Fi watchdog, flashing script that verifies the write and the
+  Android when a kernel fails early or Debian cannot start (after 30 min on the USB rescue console), Wi-Fi watchdog, flashing script that verifies the write and the
   booted kernel, quiet console with a clean login prompt
 
 Not working yet: cameras, CPU frequency scaling beyond the boot loader's operating point

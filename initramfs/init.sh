@@ -2,6 +2,14 @@
 # Stage-4 init: eMMC (userdata rw, rest ro), USB CDC-Ethernet, then switch_root into
 # /data/linux/debian with /run/tablet-init as PID 1 (sshd + telnet fallback).
 # Stay in this initramfs instead: create /data/linux/mainline-stay (or debian missing).
+# Rescue timeout: if Debian cannot be started (userdata not rw, rootfs missing), stay reachable
+# over USB for RESCUE_MIN minutes, then reboot; with the BCB consumed and lk's one-shot flag
+# cleared, that boot is Android, which is reachable over Wi-Fi/VPN (Magisk debian.sh: chroot sshd
+# + OpenVPN). With mainline-stay (deliberate) the old 10 days apply. From the USB console:
+# `echo N > /tmp/extend_min` adds N minutes, `touch /tmp/stay` keeps it up, `touch /tmp/stop` reboots.
+# Test: /data/linux/mainline-rescue-test containing M forces this path with an M-minute timeout,
+# once (the file is deleted when read).
+RESCUE_MIN=30
 # Logs go to /dev/kmsg (-> ramoops -> stock /sys/fs/pstore after reboot).
 /bin/busybox mkdir -p /bin /sbin /usr/bin /usr/sbin /proc /sys /dev /mnt /tmp /pstore
 /bin/busybox --install -s
@@ -129,7 +137,7 @@ dmesg | grep -iE "error|fail|warn" | tail -20 | logf "dmesg-err:"
 
 # one-line summary, repeated with every heartbeat so it is visible on screen
 MMC=$( [ -b /dev/mmcblk0 ] && echo "mmc OK $(($(cat /sys/class/block/mmcblk0/size)/2048))MB" || echo "mmc NONE")
-MNT=$(grep -q " /mnt " /proc/mounts && echo "userdata ro-mounted, debian:$( [ -d /mnt/linux/debian/etc ] && echo yes || echo no)" || echo "userdata not mounted")
+MNT=$(grep -q " /mnt " /proc/mounts && echo "userdata $(grep " /mnt " /proc/mounts | grep -qw rw && echo rw || echo READ-ONLY), debian:$( [ -x /mnt/linux/debian/bin/bash ] && echo yes || echo MISSING)" || echo "userdata NOT MOUNTED")
 NET=$(ip link show usb0 >/dev/null 2>&1 && echo "usb0 up" || echo "usb0 MISSING")
 REGS="sts1=$(devmem 0x11280710 32) sts2=$(devmem 0x11280714 32) cfg7=$(devmem 0x100000b0 32) ista2=$(devmem 0x100010ac 32) ista0=$(devmem 0x10001090 32)"
 SUM="$MMC | $NET | udc=$(udc_state) step=$STEP | before: $U0 | after: $U1"
@@ -137,7 +145,13 @@ log "SUMMARY $SUM"
 
 # --- switch into Debian ---
 DEB=/mnt/linux/debian
-if grep -q " /mnt ext4 rw" /proc/mounts && [ -x $DEB/bin/bash ] && [ ! -e /mnt/linux/mainline-stay ]; then
+RESCUE_TEST=
+if [ -f /mnt/linux/mainline-rescue-test ] && grep -q " /mnt ext4 rw" /proc/mounts; then
+  RESCUE_TEST=$(tr -cd 0-9 < /mnt/linux/mainline-rescue-test); RESCUE_TEST=${RESCUE_TEST:-2}
+  rm -f /mnt/linux/mainline-rescue-test; sync
+  log "rescue test: staying in initramfs, ${RESCUE_TEST} min timeout"
+fi
+if [ -z "$RESCUE_TEST" ] && grep -q " /mnt ext4 rw" /proc/mounts && [ -x $DEB/bin/bash ] && [ ! -e /mnt/linux/mainline-stay ]; then
   log "switching root to $DEB"
   say "MAINLINE: switching to Debian..."
   mkdir -p /newroot
@@ -167,17 +181,28 @@ if grep -q " /mnt ext4 rw" /proc/mounts && [ -x $DEB/bin/bash ] && [ ! -e /mnt/l
   [ $INIT = systemd ] && exec switch_root /newroot /lib/systemd/systemd --log-target=kmsg
   exec switch_root /newroot /bin/bash /run/tablet-init
 fi
-log "staying in initramfs"
-
-# --- stay up until /tmp/stop (a reboot ends in BROM/power-off anyway) ---
-END=$(( $(cut -d. -f1 /proc/uptime) + 864000 ))
-while [ "$(cut -d. -f1 /proc/uptime)" -lt "$END" ]; do
+# --- stay up (USB console) until the timeout, /tmp/stop, or forever with /tmp/stay ---
+if [ -e /mnt/linux/mainline-stay ]; then
+  MIN=14400; WHY="mainline-stay set"                  # deliberate: 10 days
+elif [ -n "$RESCUE_TEST" ]; then
+  MIN=$RESCUE_TEST; WHY="rescue test"
+else
+  MIN=$RESCUE_MIN; WHY="Debian could not be started ($MNT)"
+fi
+log "staying in initramfs: $WHY; reboot (-> Android) in $MIN min unless /tmp/stay"
+echo -e "\r\nMAINLINE RESCUE: $WHY.\r\nUSB console: telnet 192.168.77.2. Reboot to Android in $MIN min.\r" > /dev/tty0
+END=$(( $(cut -d. -f1 /proc/uptime) + 60 * MIN ))
+while [ -e /tmp/stay ] || [ "$(cut -d. -f1 /proc/uptime)" -lt "$END" ]; do
   [ -f /tmp/extend_min ] && { END=$((END + 60 * $(cat /tmp/extend_min))); rm /tmp/extend_min; }
   [ -f /tmp/stop ] && break
   sleep 10
-  log "alive up=$(cut -d' ' -f1 /proc/uptime)"
+  log "alive up=$(cut -d' ' -f1 /proc/uptime), reboot in $(( END - $(cut -d. -f1 /proc/uptime) ))s"
   echo -e "\rMAINLINE up $(cut -d' ' -f1 /proc/uptime)s: $SUM" > /dev/tty0
 done
-log "rebooting"
+# lk boots Android unless its one-shot flag or the BCB asks for recovery: the flag was cleared by lk
+# for this boot (make sure), and the BCB was consumed above (boot-recovery -> mainline-trying), so
+# Android stays the default until mainline is fixed and re-armed.
+echo 0 > /sys/kernel/mt6755_pmic/boot_recovery 2>/dev/null
+log "rescue over: rebooting into Android"
 sync
 reboot -f
