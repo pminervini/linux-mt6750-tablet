@@ -12,10 +12,14 @@ with its cluster's CPU clock parked on the 26 MHz crystal (TOP_CKMUXSEL), as sto
 Load = the busiest CPU's. Go LOW after DOWN_SECS below DOWN_LOAD; HIGH as soon as one second
 exceeds UP_LOAD.
 On SIGTERM the HIGH point is restored.
+Thermal cap (no kernel cooling maps yet): at >= HOT_C on the cpu-thermal zone the CPUs are held
+at LOW whatever the load, until the temperature falls to COOL_C (the zone's "hot" trip is 90 C).
 """
 import mmap, os, signal, struct, sys, time
 
 UP_LOAD, DOWN_LOAD, DOWN_SECS = 0.50, 0.20, 5
+HOT_C = float(os.environ.get("CPUFREQ_HOT_C", 85))      # overridable for tests
+COOL_C = float(os.environ.get("CPUFREQ_COOL_C", 75))
 PMIC_REG = "/sys/kernel/mt6755_pmic/reg"
 VPROC_VOSEL = 0x060a                    # MT6353 BUCK_VPROC_VOSEL (SW mode): 0.6 V + 6.25 mV * n
 CLUSTERS = (("big", 0x200, 4), ("little", 0x210, 8))  # ARM PLL base in APMIXED, CKMUXSEL shift
@@ -76,6 +80,24 @@ def cpu_times():
     return out
 
 
+def cpu_temp_path():
+    for z in sorted(os.listdir("/sys/class/thermal")):
+        try:
+            if open(f"/sys/class/thermal/{z}/type").read().strip() == "cpu-thermal":
+                return f"/sys/class/thermal/{z}/temp"
+        except OSError:
+            pass
+    return None
+
+
+def cpu_temp(path):
+    """degrees C, or None if unreadable (then no cap)"""
+    try:
+        return int(open(path).read()) / 1000
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def main():
     high = {name: rd(apmix, base + 4) & 0x07ffffff for name, base, _ in CLUSTERS}
     high["vproc"] = pmic(VPROC_VOSEL)
@@ -93,7 +115,10 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    state, quiet = "HIGH", 0
+    tpath = cpu_temp_path()
+    print(f"tablet-cpufreq: thermal cap {HOT_C:.0f} C (release {COOL_C:.0f} C) on "
+          f"{tpath or 'NO cpu-thermal zone: cap disabled'}", flush=True)
+    state, quiet, hot = "HIGH", 0, False
     prev = cpu_times()
     while True:
         time.sleep(1)
@@ -102,7 +127,19 @@ def main():
         load = max(((b - prev[c][0]) / max(1, t - prev[c][1])
                     for c, (b, t) in cur.items() if c in prev), default=0)
         prev = cur
-        if state == "LOW" and load > UP_LOAD:
+        temp = cpu_temp(tpath)
+        if temp is not None and not hot and temp >= HOT_C:
+            hot = True
+            print(f"tablet-cpufreq: {temp:.1f} C >= {HOT_C:.0f} C: held at LOW", flush=True)
+        elif hot and (temp is None or temp <= COOL_C):
+            hot = False
+            print("tablet-cpufreq: %s: thermal cap released" %
+                  ("temperature unreadable" if temp is None else f"{temp:.1f} C"), flush=True)
+        if hot:
+            if state == "HIGH":
+                apply(LOW, False)
+                state = "LOW"
+        elif state == "LOW" and load > UP_LOAD:
             apply(high, True)
             state, quiet = "HIGH", 0
         elif state == "HIGH":

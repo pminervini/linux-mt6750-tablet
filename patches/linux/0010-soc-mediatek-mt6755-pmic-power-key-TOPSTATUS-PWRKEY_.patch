@@ -1,7 +1,7 @@
 From 390220cb9d821eea7d8cb1c080bb0fbc1df309a1 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sat, 7 Nov 2026 23:10:25 +0000
-Subject: [PATCH 10/31] soc: mediatek: mt6755-pmic: power key (TOPSTATUS
+Subject: [PATCH 10/32] soc: mediatek: mt6755-pmic: power key (TOPSTATUS
  PWRKEY_DEB, polled) as KEY_POWER input device
 
 ---

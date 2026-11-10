@@ -1,7 +1,7 @@
 From efa6f21a4701b5dc190a29004fbb56183aa10f97 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 13:13:51 +0000
-Subject: [PATCH 30/31] mt6755-bringup: keep a copy of lk's screen (boot logo)
+Subject: [PATCH 30/32] mt6755-bringup: keep a copy of lk's screen (boot logo)
  for checking a new logo
 
 Copied at arch_initcall, before fbcon draws, into lk's third display buffer

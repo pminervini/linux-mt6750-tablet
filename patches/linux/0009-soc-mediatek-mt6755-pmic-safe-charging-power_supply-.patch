@@ -1,7 +1,7 @@
 From abfcc162150c8d66f779d3cbcd0988c5dba32c0e Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sat, 7 Nov 2026 23:02:34 +0000
-Subject: [PATCH 09/31] soc: mediatek: mt6755-pmic: safe charging,
+Subject: [PATCH 09/32] soc: mediatek: mt6755-pmic: safe charging,
  power_supply, RTC, boot-recovery flag, power-off; dts: DISP_PWM backlight
 
 - charge control: battery NTC (AUXADC ch3, 16.9k pull-up, 10k NTC), charge only 0..45 C

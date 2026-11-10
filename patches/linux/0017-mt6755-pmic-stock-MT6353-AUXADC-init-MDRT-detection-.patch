@@ -1,7 +1,7 @@
 From c66f03af3a5348ee47c40984b5e0c46c3f94842e Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Mon, 9 Nov 2026 07:06:33 +0000
-Subject: [PATCH 17/31] mt6755-pmic: stock MT6353 AUXADC init (MDRT detection
+Subject: [PATCH 17/32] mt6755-pmic: stock MT6353 AUXADC init (MDRT detection
  on) - GPS core starts
 
 PMIC_WRAP's ADC channel feeds AUXADC_ADC_OUT_MDRT to the connsys GPS core for co-TSX

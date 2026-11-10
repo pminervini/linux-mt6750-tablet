@@ -1,0 +1,60 @@
+From d392248c15c2250950867ed439bd63ae346813d1 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 16:28:39 +0000
+Subject: [PATCH 32/32] soc: mediatek: mt6755-pmic: low-battery power-off also
+ with a charger attached while discharging
+
+The orderly power-off below lowbat_mv required 'no charger detected'. A
+charger can be attached while the battery still drains: charging paused
+(too hot/cold, adc-fault) or a supply weaker than the load (seen right
+after boot: state 'charging' with -114 mA). Then the battery could run flat
+and brown out the eMMC. With a charger attached, power off when the
+voltage is low and a fresh gauge sample shows a discharge (< 0 mA) for
+30 s; a deeply discharged battery that is actually charging is left alone.
+
+Tested with a temporary dry-run switch (not in this patch) and lowbat_mv
+raised above the battery voltage: charger attached and charging -> no
+action for 40 s; charger attached, charging paused at the limit, -215 mA
+-> fires after 30 s.
+---
+ drivers/soc/mediatek/mt6755-pmic.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index d17472d15..d59b599c9 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -382,7 +382,7 @@ module_param(limit_max_mv, int, 0644);
+ MODULE_PARM_DESC(limit_max_mv, "with a charge limit, also stop at this battery voltage (IR-compensated), whatever the gauge says");
+ static int lowbat_mv = 3450;
+ module_param(lowbat_mv, int, 0644);
+-MODULE_PARM_DESC(lowbat_mv, "power off below this battery voltage when not charging (0 = never)");
++MODULE_PARM_DESC(lowbat_mv, "power off below this battery voltage while the battery discharges (0 = never)");
+ 
+ enum chg_state { CHG_NONE, CHG_ON, CHG_FULL, CHG_HOT, CHG_COLD, CHG_OV, CHG_NTC, CHG_OFF, CHG_LIMIT,
+ 		 CHG_ADC };
+@@ -723,11 +723,17 @@ static void chr_work_fn(struct work_struct *w)
+ 		bs.cap = 100;
+ 	}
+ 
+-	/* low battery: orderly power-off before the eMMC browns out */
+-	if (lowbat_mv && !chr && vbat_ok && bs.vbat > 2500 && bs.vbat < lowbat_mv) {
++	/*
++	 * low battery: orderly power-off before the eMMC browns out. Not only without a charger:
++	 * one can be attached while the battery still drains (charging paused hot/cold/adc-fault,
++	 * or a supply weaker than the load). With a charger, require a fresh gauge sample showing
++	 * a discharge, so a deeply discharged battery that is charging (< lowbat_mv) is left alone.
++	 */
++	if (lowbat_mv && vbat_ok && bs.vbat > 2500 && bs.vbat < lowbat_mv &&
++	    (!chr || (fresh(bs.fg_valid, bs.fg_at, FG_MAX_AGE) && bs.fg_ma < 0))) {
+ 		if (++bs.low_cnt == 15) {
+-			pr_crit("mt6755-pmic: battery %d mV < %d mV for 30 s, powering off\n",
+-				bs.vbat, lowbat_mv);
++			pr_crit("mt6755-pmic: battery %d mV < %d mV for 30 s (%s, %d mA), powering off\n",
++				bs.vbat, lowbat_mv, chr ? "charger attached" : "no charger", bs.fg_ma);
+ 			orderly_poweroff(true);
+ 		}
+ 	} else {
+-- 
+2.53.0
+

@@ -1,7 +1,7 @@
 From 6e0dbe6448ba8c0e735e4dd993a5e5a231c1de95 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 10:49:00 +0000
-Subject: [PATCH 26/31] tablet DT: USB dual role - ID pin GPIO23
+Subject: [PATCH 26/32] tablet DT: USB dual role - ID pin GPIO23
  (gpio-usb-b-connector), 5 V host VBUS on GPIO43, xhci host child
 
 As the stock kernel (otg_gpios, IDDIG on GPIO23, pinctrl drvvbus_high =

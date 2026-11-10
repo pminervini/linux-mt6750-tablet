@@ -1,7 +1,7 @@
 From 421fc982738970ea551d4d2a123a3a8c6a46a0cf Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Mon, 9 Nov 2026 22:20:27 +0000
-Subject: [PATCH 20/31] mt6755-pmic: charge limit (default 70-80 %) for a
+Subject: [PATCH 20/32] mt6755-pmic: charge limit (default 70-80 %) for a
  tablet that stays on the charger
 
 Stop charging at chg_end_pct by the coulomb counter and resume below

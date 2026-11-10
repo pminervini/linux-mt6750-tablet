@@ -1,7 +1,7 @@
 From 3c733b14983586dae7aacefa8c6d0af7eb2d8519 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sun, 8 Nov 2026 11:55:49 +0000
-Subject: [PATCH 16/31] mt6750 tablet DT: I2C3 (MT6311 ext buck does not answer
+Subject: [PATCH 16/32] mt6750 tablet DT: I2C3 (MT6311 ext buck does not answer
  under mainline)
 
 ---

@@ -1,7 +1,7 @@
 From 26d97449cc1211b26b441b33bc874d19e542e264 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 08:57:28 +0000
-Subject: [PATCH 23/31] thermal: MT6755 SoC temperature (auxadc_thermal) +
+Subject: [PATCH 23/32] thermal: MT6755 SoC temperature (auxadc_thermal) +
  tablet DT
 
 The MT6755 thermal controller is the MT8173 one with the same v1 eFuse

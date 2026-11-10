@@ -1,7 +1,7 @@
 From 88bd14223949cc669c9a19a0d46cff3dd11e6368 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Mon, 9 Nov 2026 08:10:52 +0000
-Subject: [PATCH 18/31] mt6755-pmic: enable VTCXO24 (stock DT
+Subject: [PATCH 18/32] mt6755-pmic: enable VTCXO24 (stock DT
  regulator-boot-on) - GPS RF front end; GPS fix works
 
 With only the AUXADC fix the GPS core ran but received nothing at a window where stock Android

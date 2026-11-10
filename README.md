@@ -21,7 +21,9 @@ It is not a polished distribution.
   as out-of-tree modules (see "Not included")
 - charging with temperature limits (charging stops if the voltage/NTC readings go stale), coulomb-counting
   fuel gauge, a 70-80 % charge limit for a tablet that stays plugged in, orderly power-off on low battery
-- RTC, power key, accelerometer (QMA6100P), SoC temperature sensor (thermal zone with critical trip)
+  (also with a charger attached that cannot keep up)
+- RTC, power key, accelerometer (QMA6100P), SoC temperature sensor (thermal zone with critical trip; the
+  userspace DVFS holds the low clock above 85 C)
 - touchscreen (Silead GSL3670, multitouch; firmware cut from the device's own stock kernel)
 - GPS: open-source engine [opengps-mtk](https://github.com/pminervini/opengps-mtk) (no mnld/libmnl)
 - speaker audio from userspace (`tools/audio/tablet-audio`, no ALSA driver yet)

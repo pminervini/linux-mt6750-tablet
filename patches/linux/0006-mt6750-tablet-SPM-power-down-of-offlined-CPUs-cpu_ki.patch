@@ -1,7 +1,7 @@
 From 6ec8ac238a9a6ab45ec654af9f11861641334c97 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sat, 7 Nov 2026 16:54:16 +0000
-Subject: [PATCH 06/31] mt6750 tablet: SPM power-down of offlined CPUs
+Subject: [PATCH 06/32] mt6750 tablet: SPM power-down of offlined CPUs
  (cpu_kill), needed for kexec/hotplug
 
 ---
