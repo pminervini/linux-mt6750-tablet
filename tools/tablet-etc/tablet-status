@@ -77,6 +77,8 @@ def temps():
     for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
         t = num(z + "/temp", 1e-3)
         row(rd(z + "/type"), "%.1f C" % t if t is not None else None)
+    # tablet-cpufreq's operating point and thermal cap (it is also the only CPU thermal protection)
+    row("CPU clock", rd("/run/tablet-cpufreq", "unknown: tablet-cpufreq not running (no thermal cap)"))
 
 
 def gps(show_pos):

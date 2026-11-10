@@ -14,13 +14,22 @@ exceeds UP_LOAD.
 On SIGTERM the HIGH point is restored.
 Thermal cap (no kernel cooling maps yet): at >= HOT_C on the cpu-thermal zone the CPUs are held
 at LOW whatever the load, until a valid reading at or below COOL_C (the zone's "hot" trip is 90 C);
-unreadable samples while capped keep LOW. If the zone is unreadable from the start, there is no cap.
+unreadable samples while capped keep LOW.
+Fail-safe: with no valid temperature for SENSOR_GRACE seconds (from start, or since the last good
+reading) the CPUs are also held at LOW - logged as a warning - until the next valid reading below
+HOT_C. A missing zone is looked for again every RESCAN seconds. CPUFREQ_NO_SENSOR=allow (in a
+drop-in: [Service] Environment=CPUFREQ_NO_SENSOR=allow) runs without a sensor at full speed.
+The current point and cap reason are in STATUS_FILE (shown by tablet-status).
 """
 import mmap, os, signal, struct, sys, time
 
 UP_LOAD, DOWN_LOAD, DOWN_SECS = 0.50, 0.20, 5
 HOT_C = float(os.environ.get("CPUFREQ_HOT_C", 85))      # overridable for tests
 COOL_C = float(os.environ.get("CPUFREQ_COOL_C", 75))
+SENSOR_GRACE = float(os.environ.get("CPUFREQ_SENSOR_GRACE", 60))
+RESCAN = 30
+ALLOW_NO_SENSOR = os.environ.get("CPUFREQ_NO_SENSOR") == "allow"
+STATUS_FILE = "/run/tablet-cpufreq"
 PMIC_REG = "/sys/kernel/mt6755_pmic/reg"
 VPROC_VOSEL = 0x060a                    # MT6353 BUCK_VPROC_VOSEL (SW mode): 0.6 V + 6.25 mV * n
 CLUSTERS = (("big", 0x200, 4), ("little", 0x210, 8))  # ARM PLL base in APMIXED, CKMUXSEL shift
@@ -92,11 +101,30 @@ def cpu_temp_path():
 
 
 def cpu_temp(path):
-    """degrees C, or None if unreadable (then no cap)"""
+    """degrees C, or None if unreadable"""
     try:
         return int(open(path).read()) / 1000
     except (OSError, ValueError, TypeError):
         return None
+
+
+def log(msg, warn=False):
+    print(("<4>" if warn else "") + "tablet-cpufreq: " + msg, flush=True)   # <4>: journal warning
+    if warn:
+        try:
+            with open("/dev/kmsg", "w") as f:
+                f.write("<4>tablet-cpufreq: " + msg + "\n")
+        except OSError:
+            pass
+
+
+def set_status(text):
+    try:
+        with open(STATUS_FILE + ".tmp", "w") as f:
+            f.write(text + "\n")
+        os.replace(STATUS_FILE + ".tmp", STATUS_FILE)
+    except OSError:
+        pass
 
 
 def main():
@@ -112,14 +140,22 @@ def main():
 
     def stop(*_):
         apply(high, True)
+        try:
+            os.unlink(STATUS_FILE)
+        except OSError:
+            pass
         sys.exit(0)
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
     tpath = cpu_temp_path()
-    print(f"tablet-cpufreq: thermal cap {HOT_C:.0f} C (release {COOL_C:.0f} C) on "
-          f"{tpath or 'NO cpu-thermal zone: cap disabled'}", flush=True)
-    state, quiet, hot, blind = "HIGH", 0, False, False
+    log(f"thermal cap {HOT_C:.0f} C (release {COOL_C:.0f} C) on {tpath or 'NO cpu-thermal zone yet'}; "
+        + ("no sensor: full speed allowed (CPUFREQ_NO_SENSOR=allow)" if ALLOW_NO_SENSOR else
+           f"fail-safe: LOW after {SENSOR_GRACE:.0f} s without a valid reading"))
+    state, quiet = "HIGH", 0
+    cap = None                  # None, "hot" (>= HOT_C) or "sensor" (fail-safe: no valid reading)
+    blind, shown = False, None
+    last_ok = last_scan = time.monotonic()      # the grace period starts with the service
     prev = cpu_times()
     while True:
         time.sleep(1)
@@ -128,18 +164,36 @@ def main():
         load = max(((b - prev[c][0]) / max(1, t - prev[c][1])
                     for c, (b, t) in cur.items() if c in prev), default=0)
         prev = cur
+        now = time.monotonic()
         temp = cpu_temp(tpath)
-        if temp is not None and not hot and temp >= HOT_C:
-            hot = True
-            print(f"tablet-cpufreq: {temp:.1f} C >= {HOT_C:.0f} C: held at LOW", flush=True)
-        elif hot and temp is not None and temp <= COOL_C:
-            hot = False
-            print(f"tablet-cpufreq: {temp:.1f} C: thermal cap released", flush=True)
-        elif hot and temp is None and not blind:
+        if temp is None and now - last_scan >= RESCAN:          # zone missing or gone: look again
+            last_scan = now
+            p = cpu_temp_path()
+            if p != tpath:
+                log(f"cpu-thermal zone now {p or 'missing'}")
+                tpath = p
+                temp = cpu_temp(tpath)
+        if temp is not None:
+            last_ok = now
+        if temp is not None and temp >= HOT_C and cap != "hot":
+            cap = "hot"
+            log(f"{temp:.1f} C >= {HOT_C:.0f} C: held at LOW")
+        elif cap == "hot" and temp is not None and temp <= COOL_C:
+            cap = None
+            log(f"{temp:.1f} C: thermal cap released")
+        elif cap == "sensor" and temp is not None:              # here temp < HOT_C
+            cap = None
+            log(f"CPU temperature readable again ({temp:.1f} C): fail-safe cap released")
+        elif (cap is None and temp is None and not ALLOW_NO_SENSOR
+              and now - last_ok >= SENSOR_GRACE):
+            cap = "sensor"
+            log(f"no valid CPU temperature for {now - last_ok:.0f} s: held at LOW (fail-safe)",
+                warn=True)
+        elif cap == "hot" and temp is None and not blind:
             # a failed read is not evidence of cooling: stay at LOW until a valid reading
-            print("tablet-cpufreq: temperature unreadable while capped: staying at LOW", flush=True)
+            log("temperature unreadable while capped: staying at LOW")
         blind = temp is None
-        if hot:
+        if cap:
             if state == "HIGH":
                 apply(LOW, False)
                 state = "LOW"
@@ -151,6 +205,11 @@ def main():
             if quiet >= DOWN_SECS:
                 apply(LOW, False)
                 state = "LOW"
+        text = state + {None: "", "hot": " (capped: CPU hot)",
+                        "sensor": " (capped: no CPU temperature, fail-safe)"}[cap]
+        if text != shown:
+            set_status(text)
+            shown = text
 
 
 if __name__ == "__main__":
