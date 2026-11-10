@@ -25,6 +25,9 @@ It is not a polished distribution.
 - touchscreen (Silead GSL3670, multitouch; firmware cut from the device's own stock kernel)
 - GPS: open-source engine [opengps-mtk](https://github.com/pminervini/opengps-mtk) (no mnld/libmnl)
 - speaker audio from userspace (`tools/audio/tablet-audio`, no ALSA driver yet)
+- boot splash: own boot logo (lk), lk's "Orange State" screen and 5 s delay patched out, quiet boot
+  with an optional animation until the login prompt, console rotated for landscape
+  (`tools/splash`)
 - unattended operation: watchdog full-reset, fallback to Android when a kernel fails early, Wi-Fi
   watchdog, quiet console with a clean login prompt
 
@@ -70,7 +73,7 @@ lk boots `recovery` (mainline) when either
 - `initramfs/` - init sources (switch_root into Debian on userdata `/linux/debian`)
 - `tools/` - flashing and test loop (`flash-mainline.sh`, `to-mainline.sh`, `tab.py`), register
   peek/poke/diff helpers for the stock kernel (`regpeek`, `regpoke`, `regdiff`, `chipreg`), I2C
-  bit-bang probe, charger and audio experiments, `tablet-etc/` (systemd units and scripts installed on
+  bit-bang probe, charger and audio experiments, `splash/` (boot logo, animation, lk patch), `tablet-etc/` (systemd units and scripts installed on
   the tablet), `gps/` (notes; the engine is in opengps-mtk), `touch-notes.md`,
   `gsl-fwextract.py` (touchscreen firmware from the stock boot image)
 - `diag/` - boot-ROM (mtkclient) session scripts used to read logs and registers during early bring-up

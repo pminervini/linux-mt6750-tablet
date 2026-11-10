@@ -1,7 +1,7 @@
 From b7dbc37d7ec840f6f9524d9a7c5b5166a521b6f1 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 11:22:18 +0000
-Subject: [PATCH 27/29] mt6755-pmic: mark reboots for the preloader (RTC_PDN1
+Subject: [PATCH 27/30] mt6755-pmic: mark reboots for the preloader (RTC_PDN1
  bypass-power-key); usb-conn-gpio: repeated role at debug level
 
 Stock arch_reset() calls rtc_mark_bypass_pwrkey() (RTC_PDN1 bit 6). Without

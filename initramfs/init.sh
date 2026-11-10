@@ -14,6 +14,8 @@ mount -t tmpfs tmpfs /tmp
 mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 log() { echo "<5>STAGE2: $*" > /dev/kmsg; }
+# progress on the screen, except on a quiet (splash) boot: any text there ends the boot logo
+say() { grep -qw quiet /proc/cmdline || echo -e "\r$*" > /dev/tty0; }
 logf() { while IFS= read -r l; do log "$1 $l"; done; }
 
 log "init up: $(cat /proc/version)"
@@ -97,8 +99,16 @@ udc_state() { cat /sys/class/udc/$UDC/state 2>/dev/null || echo none; }
 reconnect() { echo disconnect > /sys/class/udc/$UDC/soft_connect 2>/dev/null; sleep 1; echo connect > /sys/class/udc/$UDC/soft_connect 2>/dev/null; sleep 6; }
 dumpu() { echo "acr6=$(devmem 0x11290818 32) acr4=$(devmem 0x11290820 32) dtm0=$(devmem 0x11290868 32) dtm1=$(devmem 0x1129086c 32) misc=$(devmem 0x11271c84 32) pm=$(devmem 0x11273404 32) u2c=$(devmem 0x11280750 32) vusb33=$(pw_r 0x0a86)"; }
 U0=$(dumpu); log "usb regs before: $U0 udc=$UDC state=$(udc_state)"
+# only worth trying with a computer on the port: VBUS present (PMIC CHRDET) and not host mode
+# (keyboard on an OTG adapter, VBUS from ourselves); else each step just waits 7 s
+usb_peer() {
+  grep -q "chrdet=1" /sys/kernel/mt6755_pmic/charging 2>/dev/null || return 1
+  ! grep -qx host /sys/class/usb_role/*/role 2>/dev/null
+}
+usb_peer || log "usb: no computer on the port ($(cat /sys/kernel/mt6755_pmic/charging 2>/dev/null), role $(cat /sys/class/usb_role/*/role 2>/dev/null)), PHY steps skipped"
 STEP=0
 for st in 3 4 5; do
+  usb_peer || break
   [ "$(udc_state)" != "not attached" ] && [ "$(udc_state)" != "none" ] && break
   case $st in
     1) v=$(pw_r 0x0a86); pw_w 0x0a86 $(( v | 2 )); sleep 1 ;;           # MT6353 VUSB33 LDO on
@@ -109,7 +119,7 @@ for st in 3 4 5; do
   esac
   STEP=$st; reconnect
   log "usb step $st -> state=$(udc_state) $(dumpu)"
-  echo -e "\rUSB step $st state=$(udc_state)" > /dev/tty0
+  say "USB step $st state=$(udc_state)"
 done
 U1=$(dumpu)
 i=0; while ! ip link show usb0 >/dev/null 2>&1 && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done
@@ -129,7 +139,7 @@ log "SUMMARY $SUM"
 DEB=/mnt/linux/debian
 if grep -q " /mnt ext4 rw" /proc/mounts && [ -x $DEB/bin/bash ] && [ ! -e /mnt/linux/mainline-stay ]; then
   log "switching root to $DEB"
-  echo -e "\rMAINLINE: switching to Debian..." > /dev/tty0
+  say "MAINLINE: switching to Debian..."
   mkdir -p /newroot
   mount --bind $DEB /newroot
   mount -t tmpfs -o mode=755,size=64m tmpfs /newroot/run

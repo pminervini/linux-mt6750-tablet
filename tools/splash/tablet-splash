@@ -1,0 +1,123 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""tablet-splash: play a boot animation (.splash, made by splash.py anim-pack) on /dev/fb0
+while Linux boots, continuing the boot loader's logo, until stopped (SIGTERM: getty@tty1
+starting) or --max seconds. Standard library only.
+
+  tablet-splash play FILE [--max S] [--once]
+
+While playing, tty1 is in KD_GRAPHICS mode so console text cannot draw over the animation;
+on exit it goes back to KD_TEXT and the console repaints.
+"""
+import argparse, fcntl, mmap, os, signal, struct, sys, time, zlib
+
+KDSETMODE, KD_TEXT, KD_GRAPHICS = 0x4B3A, 0, 1
+stop = False
+
+
+def on_term(*_):
+    global stop
+    stop = True
+
+
+def sysfs(name, default=None):
+    try:
+        return open("/sys/class/graphics/fb0/" + name).read().strip()
+    except OSError:
+        return default
+
+
+def load(path):
+    d = open(path, "rb").read()
+    if d[:8] != b"TSPLASH1":
+        sys.exit("%s: not a tablet-splash file" % path)
+    w, h, n, loop_from = struct.unpack_from("<HHHH", d, 8)
+    o, frames = 16, []
+    for _ in range(n + (1 if n > 1 else 0)):            # + the wrap-around frame
+        delay, nr = struct.unpack_from("<HH", d, o)
+        o += 4
+        rects = []
+        for _ in range(nr):
+            x, y, rw, rh, zl = struct.unpack_from("<HHHHI", d, o)
+            o += 12
+            rects.append((x, y, rw, rh, d[o:o + zl]))
+            o += zl
+        frames.append((delay, rects))
+    return w, h, loop_from, frames
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["play"])
+    ap.add_argument("file")
+    ap.add_argument("--max", type=float, default=90, help="give the console back after S seconds")
+    ap.add_argument("--once", action="store_true", help="play once, keep the last frame")
+    ap.add_argument("--stats", action="store_true", help="print the frame rate achieved")
+    a = ap.parse_args()
+
+    w, h, loop_from, frames = load(a.file)
+    xres, yres = (int(v) for v in sysfs("virtual_size", "%d,%d" % (w, h)).split(","))
+    stride = int(sysfs("stride", str(w * 4)))
+    if (xres, yres) != (w, h) or int(sysfs("bits_per_pixel", "32")) != 32:
+        sys.exit("framebuffer %dx%d does not match the animation (%dx%d)" % (xres, yres, w, h))
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    tty = None
+    try:
+        tty = os.open("/dev/tty1", os.O_RDWR | os.O_NOCTTY)
+        fcntl.ioctl(tty, KDSETMODE, KD_GRAPHICS)
+    except OSError as e:
+        print("tablet-splash: no KD_GRAPHICS on tty1 (%s)" % e, file=sys.stderr)
+    fb = os.open("/dev/fb0", os.O_RDWR)
+    mm = mmap.mmap(fb, stride * h, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    cache = {}
+    t_end = time.monotonic() + a.max
+    try:
+        n = len(frames) - (1 if len(frames) > 1 else 0)    # real frames; frames[n] = wrap
+        i, nxt = 0, time.monotonic()
+        t0, shown, late = nxt, 0, 0
+        while not stop and time.monotonic() < t_end:
+            delay, rects = frames[i]
+            for k, (x, y, rw, rh, z) in enumerate(rects):
+                px = cache.get((i, k))
+                if px is None:
+                    px = cache[(i, k)] = zlib.decompress(z)
+                row = rw * 4
+                for r in range(rh):
+                    o = (y + r) * stride + x * 4
+                    mm[o:o + row] = px[r * row:(r + 1) * row]
+            shown += 1
+            if i == n:                          # wrapped: screen now shows frame loop_from
+                delay, i = frames[loop_from][0], loop_from + 1
+            elif i == n - 1:
+                if a.once or n == 1:
+                    break
+                i = n
+            else:
+                i += 1
+            nxt += delay / 1000
+            dt = nxt - time.monotonic()
+            if dt > 0:
+                time.sleep(dt)
+            else:
+                late += 1
+                nxt = time.monotonic()
+        if a.stats:
+            dt = time.monotonic() - t0
+            print("%d frames in %.2f s (%.1f fps), %d late" % (shown, dt, shown / dt, late))
+        while a.once and not stop and time.monotonic() < t_end:
+            time.sleep(0.2)
+    finally:
+        mm.close()
+        os.close(fb)
+        if tty is not None:
+            try:
+                fcntl.ioctl(tty, KDSETMODE, KD_TEXT)
+            except OSError:
+                pass
+            os.close(tty)
+
+
+if __name__ == "__main__":
+    main()

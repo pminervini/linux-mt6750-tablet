@@ -1,7 +1,7 @@
 From 74d72469f804e93062e4cc6474174ac21b446959 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Mon, 9 Nov 2026 21:47:27 +0000
-Subject: [PATCH 19/29] mt6755-bringup: switch off lk's overlay layer (Orange
+Subject: [PATCH 19/30] mt6755-bringup: switch off lk's overlay layer (Orange
  State text over the console)
 
 lk leaves OVL0 layers 0 and 3 enabled. Layer 0 scans out the buffer handed to

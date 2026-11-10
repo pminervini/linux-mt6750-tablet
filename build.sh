@@ -66,7 +66,12 @@ if [ ! -f $OUT/.config ] || [ "${1:-all}" = config ]; then
   $C -e BT_LE -m BT_RFCOMM -e BT_RFCOMM_TTY -m BT_BNEP -e BT_BNEP_MC_FILTER -e BT_BNEP_PROTO_FILTER -m BT_HIDP
   $C --set-val WATCHDOG_OPEN_TIMEOUT 150
   $C --set-val SERIAL_EARLYCON_RAM_BASE 0xb00d0000 --set-val SERIAL_EARLYCON_RAM_HEAD 0xb00c0000
-  $C --set-str CMDLINE "console=tty0 clk_ignore_unused pd_ignore_unused panic=10 loglevel=8 ignore_loglevel rdinit=/init keep_bootcon g_ether.dev_addr=02:4d:54:00:00:02 g_ether.host_addr=02:4d:54:00:00:01"
+  # console: rotated for landscape (fbcon=rotate:3, console top at the panel's left edge) and,
+  # unless BOOT_VERBOSE=1, quiet with deferred fbcon takeover: the boot logo stays on screen
+  # (or tablet-splash animates) until the login prompt or an error message
+  $C -e FRAMEBUFFER_CONSOLE_ROTATION -e FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER -d MTK_SOCINFO
+  if [ "${BOOT_VERBOSE:-0}" = 1 ]; then VERB="loglevel=8 ignore_loglevel"; else VERB="quiet"; fi
+  $C --set-str CMDLINE "console=tty0 fbcon=rotate:3 $VERB clk_ignore_unused pd_ignore_unused panic=10 rdinit=/init keep_bootcon g_ether.dev_addr=02:4d:54:00:00:02 g_ether.host_addr=02:4d:54:00:00:01"
   $C -e CMDLINE_FORCE -e SERIAL_EARLYCON_RAM_FORCE
   $M olddefconfig
 fi

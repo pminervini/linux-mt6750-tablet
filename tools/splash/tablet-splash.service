@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Boot animation on /dev/fb0 from early boot until getty@tty1 starts (see splash-getty.conf).
+# Only on a quiet boot: with a verbose kernel command line the console stays visible.
+[Unit]
+Description=Boot animation on the framebuffer, until the login prompt
+DefaultDependencies=no
+ConditionKernelCommandLine=quiet
+ConditionPathExists=/usr/local/share/tablet-splash/boot.splash
+Conflicts=emergency.service rescue.service shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tablet-splash play /usr/local/share/tablet-splash/boot.splash --max 90
+Nice=5
+
+[Install]
+WantedBy=sysinit.target

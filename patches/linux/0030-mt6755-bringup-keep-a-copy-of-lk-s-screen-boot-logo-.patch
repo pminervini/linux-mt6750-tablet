@@ -1,0 +1,52 @@
+From efa6f21a4701b5dc190a29004fbb56183aa10f97 Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Tue, 10 Nov 2026 13:13:51 +0000
+Subject: [PATCH 30/30] mt6755-bringup: keep a copy of lk's screen (boot logo)
+ for checking a new logo
+
+Copied at arch_initcall, before fbcon draws, into lk's third display buffer
+(logo decompression scratch, reserved and unused by Linux); readable through
+/dev/mem until the next boot.
+---
+ drivers/soc/mediatek/mt6755-bringup.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/drivers/soc/mediatek/mt6755-bringup.c b/drivers/soc/mediatek/mt6755-bringup.c
+index df80dfc5a..7c37e07dc 100644
+--- a/drivers/soc/mediatek/mt6755-bringup.c
++++ b/drivers/soc/mediatek/mt6755-bringup.c
+@@ -62,6 +62,7 @@ arch_initcall(mt6755_bringup_clocks);
+  * frame). Leaves the hardware alone if no layer shows that buffer.
+  */
+ #define DISP_OVL0		0x14008000
++#define LK_LOG_STORE		0x7ff80000	/* end of lk's display reservation */
+ #define  OVL_SRC_CON		0x02c
+ #define  OVL_LX_ADDR(n)		(0xf40 + 0x20 * (n))
+ 
+@@ -82,6 +83,23 @@ static int __init mt6755_bringup_lk_layers(void)
+ 	of_node_put(fb);
+ 	if (n)
+ 		return 0;
++	/*
++	 * Snapshot of what lk left on screen (boot logo), for checking a new logo without a
++	 * camera: copied to lk's third buffer (logo decompression scratch, unused by Linux),
++	 * readable via /dev/mem at simple-framebuffer base + 2 * size until the next boot.
++	 */
++	if (res.start + 3 * resource_size(&res) <= LK_LOG_STORE) {
++		void *src = memremap(res.start, resource_size(&res), MEMREMAP_WC);
++		void *dst = memremap(res.start + 2 * resource_size(&res), resource_size(&res),
++				     MEMREMAP_WC);
++
++		if (src && dst)
++			memcpy(dst, src, resource_size(&res));
++		if (src)
++			memunmap(src);
++		if (dst)
++			memunmap(dst);
++	}
+ 	ovl = ioremap(DISP_OVL0, 0x1000);
+ 	if (!ovl)
+ 		return -ENOMEM;
+-- 
+2.53.0
+
