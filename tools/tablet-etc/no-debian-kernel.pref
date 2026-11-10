@@ -1,0 +1,7 @@
+# /etc/apt/preferences.d/no-debian-kernel
+# The kernel is ours (boot image in the `recovery` partition, modules in /lib/modules/7.3.1-mt6750,
+# not owned by any package). Never install a Debian kernel or anything that installs/flashes one:
+# flash-kernel writes boot partitions, initramfs-tools/dracut and boot loaders are not used here.
+Package: linux-image-* linux-headers-* linux-modules-* linux-kbuild-* flash-kernel initramfs-tools initramfs-tools-core dracut dracut-core grub-* systemd-boot* u-boot*
+Pin: release *
+Pin-Priority: -1
