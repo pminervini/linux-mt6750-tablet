@@ -1,0 +1,167 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""tablet-status: one-screen summary of the MT6750 tablet (battery, power, temperatures, GPS,
+network, system). Install as /usr/local/bin/tablet-status.
+
+  tablet-status            everything (GPS listens to gpsd for 3 s)
+  tablet-status --no-gps   skip GPS
+  tablet-status --no-pos   GPS fix quality only, no coordinates
+"""
+import argparse, glob, json, os, re, shutil, subprocess, time
+
+
+def rd(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def num(path, scale=1.0, default=None):
+    v = rd(path)
+    try:
+        return int(v) * scale
+    except (TypeError, ValueError):
+        return default
+
+
+def run(cmd, timeout=5):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def hdr(name):
+    print("\033[1m%s\033[0m" % name if os.isatty(1) else name)
+
+
+def row(label, value):
+    if value not in (None, ""):
+        print("  %-14s %s" % (label, value))
+
+
+def battery():
+    b = "/sys/class/power_supply/battery/"
+    hdr("Battery")
+    cap, st = rd(b + "capacity"), rd(b + "status")
+    v, i = num(b + "voltage_now", 1e-6), num(b + "current_now", 1e-3)
+    row("level", "%s %%  (%s)" % (cap, st) if cap else None)
+    if v is not None and i is not None:
+        row("draw", "%.2f V  %+.0f mA  %+.2f W" % (v, i, v * i / 1000))
+    t = num(b + "temp", 0.1)
+    row("temperature", "%.1f C" % t if t is not None else None)
+    up = run(["upower", "-i", "/org/freedesktop/UPower/devices/battery_battery"])
+    m = re.search(r"time to (empty|full):\s+(.+)", up)
+    row("time to " + m.group(1) if m else "estimate", m.group(2) if m else None)
+    lo, hi = rd(b + "charge_control_start_threshold"), rd(b + "charge_control_end_threshold")
+    row("charge limit", "charges from %s %% up to %s %%" % (lo, hi) if lo and hi else None)
+    row("driver", rd("/sys/kernel/mt6755_pmic/state"))
+
+
+def power():
+    hdr("Power / USB-C")
+    online = rd("/sys/class/power_supply/usb/online")
+    role = rd(glob.glob("/sys/class/usb_role/*/role")[0]) if glob.glob("/sys/class/usb_role/*/role") else None
+    row("charger", {"1": "connected", "0": "not connected"}.get(online, online))
+    row("USB port", {"host": "host (keyboard etc.)", "device": "device (computer: ssh over USB)"}.get(role, role))
+    if role == "host":
+        names = re.findall(r'N: Name="([^"]+)"', rd("/proc/bus/input/devices", ""))
+        usb = [n for n in names if not n.startswith(("mt6755", "silead"))]
+        row("USB devices", ", ".join(dict.fromkeys(usb)) or "none")
+
+
+def temps():
+    hdr("Temperatures")
+    for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+        t = num(z + "/temp", 1e-3)
+        row(rd(z + "/type"), "%.1f C" % t if t is not None else None)
+
+
+def gps(show_pos):
+    hdr("GPS")
+    if not shutil.which("gpspipe"):
+        row("gpsd", "gpspipe not installed")
+        return
+    tpv = sky = None
+    for l in run(["gpspipe", "-w", "-x", "3"], timeout=6).splitlines():   # 3 s of gpsd reports
+        try:
+            j = json.loads(l)
+        except ValueError:
+            continue
+        if j.get("class") == "TPV":
+            tpv = j
+        elif j.get("class") == "SKY" and ("satellites" in j or "uSat" in j):
+            sky = j
+    svc = run(["systemctl", "is-active", "opengps"]).strip()
+    row("engine", "opengps " + svc)
+    if not tpv:
+        row("fix", "none: no reports from the GPS engine in 3 s (no satellites tracked; needs sky)")
+        return
+    mode = {0: "unknown", 1: "no fix", 2: "2D fix", 3: "3D fix"}.get(tpv.get("mode"), tpv.get("mode"))
+    row("fix", mode)
+    if sky:
+        sats = sky.get("satellites") or []
+        used = sky.get("uSat", sum(1 for s in sats if s.get("used")))
+        seen = sky.get("nSat", len(sats))
+        row("satellites", "%s used / %s visible" % (used, seen))
+    if tpv.get("mode", 0) >= 2:
+        if show_pos and "lat" in tpv:
+            alt = tpv.get("altHAE", tpv.get("alt"))
+            row("position", "%.6f, %.6f%s" % (tpv["lat"], tpv["lon"],
+                                              "  alt %.0f m" % alt if alt is not None else ""))
+        err = tpv.get("eph") or (max(tpv.get("epx", 0), tpv.get("epy", 0)) or None)
+        row("accuracy", "~%.0f m" % err if err else None)
+        row("time", tpv.get("time"))
+
+
+def network():
+    hdr("Network")
+    link = run(["iw", "dev", "wlan0", "link"]) or run(["sudo", "-n", "iw", "dev", "wlan0", "link"])
+    ssid = re.search(r"SSID: (.+)", link)
+    sig = re.search(r"signal: (-?\d+) dBm", link)
+    row("Wi-Fi", "%s (%s dBm)" % (ssid.group(1), sig.group(1)) if ssid and sig else
+        (ssid.group(1) if ssid else "not connected"))
+    for line in run(["ip", "-4", "-br", "addr"]).splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[0] != "lo":
+            row(f[0], f[2].split("/")[0] + (" (down)" if f[1] == "DOWN" else ""))
+
+
+def system():
+    hdr("System")
+    up = float(rd("/proc/uptime", "0").split()[0])
+    d, r = divmod(int(up), 86400)
+    row("uptime", ("%dd " % d if d else "") + "%dh %02dm" % (r // 3600, r % 3600 // 60))
+    row("load", " ".join(rd("/proc/loadavg", "").split()[:3]))
+    mi = dict(re.findall(r"(\w+):\s+(\d+) kB", rd("/proc/meminfo", "")))
+    if mi:
+        tot, av = int(mi["MemTotal"]) / 1024, int(mi.get("MemAvailable", 0)) / 1024
+        row("memory", "%.0f MB used of %.0f MB" % (tot - av, tot))
+    s = os.statvfs("/")
+    row("disk /", "%.1f GB free of %.1f GB" % (s.f_bavail * s.f_frsize / 1e9, s.f_blocks * s.f_frsize / 1e9))
+    f = [num(p, 1e-3) for p in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq")]
+    f = [x for x in f if x]
+    row("cpu", "%d cores online%s" % (len(os.sched_getaffinity(0)),
+                                      ", %.0f-%.0f MHz" % (min(f), max(f)) if f else ""))
+    row("kernel", os.uname().release + " " + os.uname().version.split(" ")[0])
+    bl = glob.glob("/sys/class/backlight/*/brightness")
+    if bl:
+        b, mx = num(bl[0]), num(os.path.dirname(bl[0]) + "/max_brightness")
+        row("screen", "off" if not b else "on, backlight %d %%" % round(100 * b / mx) if mx else b)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--no-gps", action="store_true")
+    ap.add_argument("--no-pos", action="store_true", help="do not print coordinates")
+    a = ap.parse_args()
+    battery(); power(); temps()
+    if not a.no_gps:
+        gps(not a.no_pos)
+    network(); system()
+
+
+if __name__ == "__main__":
+    main()
