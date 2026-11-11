@@ -93,8 +93,9 @@ Nothing here is MediaTek's or the device vendor's code or firmware; take those f
 - **connsys firmware and NVRAM** (`WIFI_RAM_CODE_6755`, `ROMv2_lm_patch_*`, `WMT_SOC.cfg`, Wi-Fi
   calibration): from the stock `vendor`/`nvdata` partitions.
 - **connsys kernel modules** (WMT/STP/BTIF, wlan gen2): a forward-port of MediaTek's GPL downstream
-  drivers, based on [mt6572-connsys-modules](https://github.com/buddyjojo/mt6572-connsys-modules);
-  built separately, against the same kernel.
+  drivers, based on [mt6572-connsys-modules](https://github.com/buddyjojo/mt6572-connsys-modules),
+  in their own repository, [mt6750-connsys](https://github.com/pminervini/mt6750-connsys) (Wi-Fi
+  incl. monitor mode, Bluetooth, the GPS core); built separately, against the same kernel.
 - **touchscreen firmware**: `tools/gsl-fwextract.py <stock boot.img> /lib/firmware/silead/gsl3670-k50v1.fw`.
 - **GPS firmware**: `fwextract.py` in opengps-mtk.
 - **the board's ODM overlay** (`dtbo/ov0.dtbo`, for `check-dtb.py`) and stock device-tree dumps.
