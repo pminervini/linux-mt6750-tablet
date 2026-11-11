@@ -32,7 +32,9 @@ class Gpio:
 
     def set_mode(self, p, m):
         reg, sh = self.mode_loc(p)
-        self.wr(reg, (self.rd(reg) & ~(7 << sh)) | (m << sh))
+        self.wr(reg + 8, 7 << sh)               # CLR/SET aliases: never rewrite the whole MODE
+        if m:                                    # register (it may hold live connsys pins)
+            self.wr(reg + 4, m << sh)
 
     def bank(self, p):
         return (p // 32) * 0x10, 1 << (p % 32)

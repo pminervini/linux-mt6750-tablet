@@ -34,8 +34,12 @@ It is not a polished distribution.
   Android when a kernel fails early or Debian cannot start (after 30 min on the USB rescue console), Wi-Fi watchdog, flashing script that verifies the write and the
   booted kernel, quiet console with a clean login prompt
 
-Not working yet: cameras, CPU frequency scaling beyond the boot loader's operating point
-(a small userspace governor switches between two points), GPU.
+- cameras: rear OV8856 (8 MP) and front GC2365 (2 MP) take still photos with `tablet-camera`, a
+  userspace capture pipeline (sensor -> SENINF -> CAMSV raw dump -> demosaic/AE/AWB) with no kernel
+  camera driver (`tools/camera`)
+
+Not working yet: video and V4L2 cameras (`/dev/video*`), autofocus, CPU frequency scaling beyond
+the boot loader's operating point (a small userspace governor switches between two points), GPU.
 
 ## Building
 

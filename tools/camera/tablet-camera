@@ -1,0 +1,463 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0
+"""tablet-camera: take a photo with the MT6750 tablet's rear (OV8856, 8 MP) or front (GC2365,
+2 MP) camera on mainline Linux. Root only. No kernel camera driver: the pipeline is driven from
+here through /dev/mem, as stock Android programs it (register values recorded from Android,
+tools/regdiff/and-cam-*), with a raw-dump path that bypasses the ISP:
+
+  sensor --MIPI CSI--> SENINF --mux 3--> CAMSV (timing generator, RAW10 packer, IMGO DMA)
+         --> physically contiguous CMA buffer (physbuf.ko) --> demosaic/AE/AWB here --> JPEG/PNG
+
+  tablet-camera [-f|--front] [--full] [-o out.jpg] [--raw out.raw] [--exposure LINES --gain X]
+    default: rear camera, 1632x1224 (2x2 binned); --full: 3264x2448 (rear only)
+    --raw:   also save the packed RAW10 frame (MediaTek bit order, see unpack())
+    the front camera is 1600x1200.
+
+Sensor control is over I2C2 bit-banged on GPIO112/113 (the I2C2 controller has no DT node yet).
+Auto exposure: a few frames adjusting exposure, then gain, towards a mid-grey mean. White
+balance: grey world. No lens shading, denoise or sharpening: expect a plain, noisy-in-the-dark
+picture. ~5-15 s per photo.
+"""
+import argparse, mmap, os, struct, subprocess, sys, time
+
+DATA = os.environ.get("TABLET_CAMERA_DATA", "/usr/local/share/tablet-camera")
+PHYSBUF = os.environ.get("TABLET_CAMERA_KO", "/usr/local/lib/tablet-camera/physbuf.ko")
+PMIC = "/sys/kernel/mt6755_pmic/reg"
+fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+
+
+class Blk:
+    def __init__(self, base, size=0x1000):
+        self.m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=base)
+
+    def rd(self, o):
+        return struct.unpack_from("<I", self.m, o)[0]
+
+    def wr(self, o, v):
+        struct.pack_into("<I", self.m, o, v & 0xffffffff)
+
+
+def prd(a):
+    open(PMIC, "w").write(f"{a:#x}")
+    return int(open(PMIC).read().split()[1], 16)
+
+
+def pfield(a, mask, val):
+    open(PMIC, "w").write(f"{a:#x} {(prd(a) & ~mask) | val:#x}")
+
+
+def load(name):
+    out = []
+    for l in open(os.path.join(DATA, name)):
+        a, b = l.split()
+        out.append(("delay", int(b)) if a == "delay" else (int(a, 16), int(b, 16)))
+    return out
+
+
+spm, gpio = Blk(0x10006000), Blk(0x10005000)
+PDN_REAR, PDN_FRONT, RST, SCL, SDA = 107, 108, 110, 112, 113
+
+
+def gpio_out(p, v):
+    bank, bit = (p // 32) * 0x10, 1 << (p % 32)
+    gpio.wr(0x004 + bank, bit)                               # DIR set: output
+    gpio.wr(0x100 + bank + (4 if v else 8), bit)             # DO set / clr
+
+
+# ---------------------------------------------------------------- bit-banged I2C on I2C2 pins
+def mode_loc(p):
+    return 0x300 + (p // 10) * 0x10, (p % 10 % 5) * 3 + (16 if p % 10 >= 5 else 0)
+
+
+def set_mode(p, m):
+    """through the MODE CLR/SET aliases: rewriting the whole register re-muxes its other pins, and
+    0x3b0 also holds the connsys F2W_DATA/F2W_CK/WB_RSTB pins (GPIO117-119) - doing that while the
+    Wi-Fi radio runs makes its firmware assert (rlm_phy.c #1961) and the CONSYS chip reset"""
+    r, s = mode_loc(p)
+    gpio.wr(r + 8, 7 << s)
+    if m:
+        gpio.wr(r + 4, m << s)
+
+
+def line(p, high):
+    bank, bit = (p // 32) * 0x10, 1 << (p % 32)
+    gpio.wr(0x108 + bank, bit)                               # DO = 0
+    gpio.wr(0x000 + bank + (8 if high else 4), bit)          # release / drive low
+
+
+def get(p):
+    return (gpio.rd(0x200 + (p // 32) * 0x10) >> (p % 32)) & 1
+
+
+def _start():
+    line(SDA, 1); line(SCL, 1); line(SDA, 0); line(SCL, 0)
+
+
+def _stop():
+    line(SDA, 0); line(SCL, 1); line(SDA, 1)
+
+
+def _wbyte(b):
+    for i in range(7, -1, -1):
+        line(SDA, (b >> i) & 1); line(SCL, 1); line(SCL, 0)
+    line(SDA, 1); line(SCL, 1)
+    ack = get(SDA) == 0
+    line(SCL, 0)
+    return ack
+
+
+def _rbyte(last):
+    line(SDA, 1)
+    v = 0
+    for _ in range(8):
+        line(SCL, 1); v = (v << 1) | get(SDA); line(SCL, 0)
+    line(SDA, 1 if last else 0); line(SCL, 1); line(SCL, 0); line(SDA, 1)
+    return v
+
+
+class Bus:
+    """I2C2 pins switched to GPIO for the duration (nothing else uses I2C2 on mainline)"""
+    def __enter__(self):
+        self.old = {p: (gpio.rd(mode_loc(p)[0]) >> mode_loc(p)[1]) & 7 for p in (SCL, SDA)}
+        for p in (SCL, SDA):
+            set_mode(p, 0)
+        line(SCL, 1); line(SDA, 1)
+        return self
+
+    def __exit__(self, *a):
+        for p in (SCL, SDA):
+            set_mode(p, self.old[p])
+
+    def write(self, addr, reg, val, reg16):
+        for _ in range(3):
+            _start()
+            ok = _wbyte(addr << 1) and (not reg16 or _wbyte(reg >> 8)) and _wbyte(reg & 0xff) and _wbyte(val)
+            _stop()
+            if ok:
+                return
+        raise IOError(f"I2C write {addr:#x}:{reg:#x} not acknowledged")
+
+    def read(self, addr, reg, reg16):
+        _start()
+        if not _wbyte(addr << 1):
+            _stop()
+            return None
+        if reg16:
+            _wbyte(reg >> 8)
+        _wbyte(reg & 0xff)
+        _start()
+        _wbyte((addr << 1) | 1)
+        v = _rbyte(True)
+        _stop()
+        return v
+
+    def run(self, addr, seq, reg16):
+        for r, v in seq:
+            if r == "delay":
+                time.sleep(v / 1000)
+            else:
+                self.write(addr, r, v, reg16)
+                if reg16 and r == 0x0103:
+                    time.sleep(0.01)                         # OV8856 software reset
+
+
+# ---------------------------------------------------------------- sensors
+class OV8856:
+    name, addr, reg16, black = "rear OV8856", 0x36, True, 64
+    flip = True                                             # mounted upside down: rows reversed
+    pdn = PDN_REAR
+
+    def __init__(self, full):
+        self.full = full
+        self.w, self.h, self.vts = (3264, 2448, 2482) if full else (1632, 1224, 1246)
+        self.vts_max = self.vts * 4                         # longer frames for dark scenes
+
+    def check(self, bus):
+        return [bus.read(self.addr, r, True) for r in (0x300b, 0x300c)] == [0x88, 0x5a]
+
+    def start(self, bus):
+        bus.run(self.addr, load("ov8856-init.txt"), True)
+        bus.run(self.addr, load("ov8856-full.txt" if self.full else "ov8856-preview.txt"), True)
+
+    def set_ae(self, bus, lines, gain):
+        """lines: exposure in lines; gain: analog gain, 1.0 .. 15.5"""
+        vts = max(self.vts, lines + 8)
+        e, g = lines << 4, int(gain * 128)
+        for r, v in ((0x380e, vts >> 8), (0x380f, vts & 0xff), (0x3500, (e >> 16) & 0xf),
+                     (0x3501, (e >> 8) & 0xff), (0x3502, e & 0xff), (0x3508, g >> 8), (0x3509, g & 0xff)):
+            bus.write(self.addr, r, v, True)
+        return vts
+
+    def stop(self, bus):
+        bus.write(self.addr, 0x0100, 0x00, True)
+
+    max_gain = 15.5
+
+
+class GC2365:
+    name, addr, reg16, black = "front GC2365", 0x37, False, 32   # dark frames: median ~36
+    pdn = PDN_FRONT
+    flip = False
+    w, h, vts, vts_max, max_gain = 1600, 1200, 1240, 4960, 7.7
+    WIN = 1208                                              # window height (0x0d/0x0e)
+    # analog gain stages from the stock driver: (threshold in 1/64 units, reg 0x33, reg 0xb6)
+    STAGES = ((64, 0x20, 0), (89, 0x24, 1), (123, 0x28, 2), (170, 0x30, 3), (248, 0x50, 4),
+              (344, 0x50, 5), (494, 0x50, 6))
+
+    def __init__(self, full):
+        pass
+
+    def check(self, bus):
+        return [bus.read(self.addr, r, False) for r in (0xf0, 0xf1)] == [0x23, 0x65]
+
+    def start(self, bus):
+        bus.run(self.addr, load("gc2365-init.txt") + load("gc2365-stream.txt"), False)
+
+    def set_ae(self, bus, lines, gain):
+        g = int(gain * 64)
+        th, r33, rb6 = [s for s in self.STAGES if s[0] <= g][-1]
+        fine = 64 * g // th
+        lines = max(6, min(lines, self.vts_max - 8))
+        vb = max(16, lines + 8 - self.WIN)                  # vertical blanking: longer frames
+        for r, v in ((0xfe, 0), (0x07, (vb >> 8) & 0x1f), (0x08, vb & 0xff), (0x03, (lines >> 8) & 0x3f),
+                     (0x04, lines & 0xff), (0x33, r33), (0xb6, rb6), (0xb1, fine >> 6),
+                     (0xb2, (fine << 2) & 0xfc)):
+            bus.write(self.addr, r, v, False)
+        return max(self.vts, self.WIN + vb + 16)
+
+    def stop(self, bus):
+        for r, v in ((0xfe, 3), (0x10, 0), (0xfe, 0)):
+            bus.write(self.addr, r, v, False)
+
+
+# ---------------------------------------------------------------- SoC side
+def isp_power(on):
+    c = 0x308
+    spm.wr(0x000, (0xb16 << 16) | 1)                         # SPM register write enable
+    if on:
+        for b in (2, 3):
+            spm.wr(c, spm.rd(c) | (1 << b))
+        for _ in range(1000):
+            if spm.rd(0x180) & 0x20 and spm.rd(0x184) & 0x20:
+                break
+            time.sleep(0.001)
+        else:
+            sys.exit("ISP power domain did not come up")
+        for b, v in ((4, 0), (1, 0), (0, 1), (8, 0), (9, 0)):   # CLK_DIS, ISO, RST_B, SRAM_PDN
+            spm.wr(c, (spm.rd(c) | (1 << b)) if v else (spm.rd(c) & ~(1 << b)))
+        for _ in range(1000):
+            if not spm.rd(c) & (3 << 12):
+                break
+            time.sleep(0.001)
+    else:                                                    # stock spm_mtcmos_ctrl_isp(DOWN)
+        spm.wr(c, spm.rd(c) | (3 << 8))
+        for _ in range(1000):
+            if spm.rd(c) & (3 << 12) == 3 << 12:
+                break
+            time.sleep(0.001)
+        for b, v in ((1, 1), (4, 1), (0, 0), (2, 0), (3, 0)):
+            spm.wr(c, (spm.rd(c) | (1 << b)) if v else (spm.rd(c) & ~(1 << b)))
+
+
+def ldo(on):
+    if on:
+        pfield(0xAD6, 0x300, 0x300)                          # VCAMIO 1.8 V
+        pfield(0xAA0, 0x300, 0x300)                          # VCAMA 2.8 V
+        pfield(0xACA, 0x700, 0x300)                          # VCAMD 1.22 V
+        for a in (0xA54, 0xA50, 0xA58):
+            pfield(a, 0x2, 0x2)
+            time.sleep(0.002)
+    else:
+        for a in (0xA58, 0xA50, 0xA54):
+            pfield(a, 0x2, 0)
+
+
+def physbuf(size_mb):
+    p = "/sys/module/physbuf/parameters/"
+    if os.path.exists(p + "size_mb") and int(open(p + "size_mb").read()) < size_mb:
+        subprocess.run(["rmmod", "physbuf"], check=True)
+    if not os.path.exists(p + "phys"):
+        subprocess.run(["insmod", PHYSBUF, f"size_mb={size_mb}"], check=True)
+    return int(open(p + "phys").read())
+
+
+def power_up(front):
+    ldo(True)
+    for p in (PDN_REAR, PDN_FRONT, RST):
+        gpio_out(p, 0)
+    gpio_out(PDN_FRONT, 1)                                   # GC2365 PWDN is active high: off
+    if not spm.rd(0x180) & 0x20:
+        isp_power(True)
+    Blk(0x15000000, 0x100).wr(0x8, (1 << 0) | (0x1f << 5))  # IMG_CG_CLR: LARB2, CAM, SENINF, CAMSV
+    Blk(0x15001000).wr(0xfc0, 0)                             # larb2 ports: physical addresses, no M4U
+    sen = Blk(0x15008000)
+    for o, v in load("front-seninf.txt" if front else "rear-seninf.txt"):
+        sen.wr(o, v)
+    ana = Blk(0x10218000 if front else 0x10217000, 0x100)
+    for o, v in load("front-csi1.txt" if front else "rear-csi0.txt"):
+        ana.wr(o, v)
+    time.sleep(0.005)                                        # MCLK (TG1) running from the config
+    gpio_out(PDN_FRONT if front else PDN_REAR, 0 if front else 1)
+    time.sleep(0.002)
+    gpio_out(RST, 1)
+    time.sleep(0.02)
+
+
+def power_down(cam, bus):
+    try:
+        cam.stop(bus)
+    except IOError:
+        pass
+    Blk(0x15009000).wr(0x414, 0)                             # CAMSV VF off
+    for p in (RST, PDN_REAR):
+        gpio_out(p, 0)
+    gpio_out(PDN_FRONT, 1)
+    Blk(0x15008000).wr(0x200, 0)                             # MCLK off
+    isp_power(False)
+    ldo(False)
+    gpio_out(PDN_FRONT, 0)
+
+
+def capture(sv, phys, w, h, src, timeout):
+    """one frame through SENINF mux 3 -> CAMSV -> phys; returns packed RAW10 bytes"""
+    sen = Blk(0x15008000)
+    for o in range(0, 0x20, 4):                              # mux 3 configured as mux 1
+        sen.wr(0x920 + o, sen.rd(0x120 + o))
+    sen.wr(0x008, (sen.rd(0x008) & ~0xf00) | (src << 8))     # mux 3 source: SENINF1/2
+    bpl, TG, IMGO = w * 10 // 8, 0x400, 0x208
+    sv.wr(TG + 0x14, 0)
+    sv.wr(0x01c, 0)
+    sv.wr(TG + 0x10, 0)                                      # one pixel per clock
+    sv.wr(TG + 0x18, w << 16)
+    sv.wr(TG + 0x1c, h << 16)
+    sv.wr(TG + 0x20, 0x1000)
+    sv.wr(0x010, 1 << 2); sv.wr(0x010, 0); sv.wr(0x010, 1)  # SW reset, IMGO reset
+    for _ in range(100):
+        if sv.rd(0x010) == 3:
+            break
+        time.sleep(0.001)
+    sv.wr(0x010, 0)
+    sv.wr(0x008, 1 << 10)
+    sv.wr(0x000, (1 << 30) | (1 << 0) | (1 << 2))            # DB, TG, PAK
+    sv.wr(0x004, (1 << 24) | 1)                              # IMGO bus 16 bit, RAW10
+    sv.wr(0x03c, 0x2)                                        # PAK RAW10
+    sv.wr(IMGO + 0x08, bpl - 1)
+    sv.wr(IMGO + 0x0c, h - 1)
+    sv.wr(IMGO + 0x10, (1 << 19) | (1 << 16) | bpl)
+    sv.wr(IMGO + 0x14, (8 << 28) | 0x80)
+    sv.wr(IMGO + 0x18, (2 << 8) | (2 << 16))
+    sv.wr(IMGO + 0x00, phys)
+    sv.wr(TG + 0x10, 1)                                      # CMOS_EN
+    sv.wr(0x000, sv.rd(0x000) | (1 << 4))                    # IMGO_EN
+    sv.wr(0x01c, (1 << 14) | (1 << 16))                      # FBC: 1 buffer
+    sv.wr(0x01c, sv.rd(0x01c) | (1 << 11)); sv.wr(0x01c, sv.rd(0x01c) & ~(1 << 11))
+    sv.wr(0x020, (1 << 0) | (1 << 2) | (1 << 15))
+    sv.rd(0x00c)                                             # clear stale status
+    sv.wr(TG + 0x14, 1)                                      # go
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if sv.rd(0x00c) & (1 << 10):
+            break
+        time.sleep(0.005)
+    else:
+        sv.wr(TG + 0x14, 0)
+        raise TimeoutError("no frame from CAMSV")
+    sv.wr(TG + 0x14, 0)
+    m = mmap.mmap(fd, bpl * h, mmap.MAP_SHARED, mmap.PROT_READ, offset=phys)
+    data = bytes(m[:bpl * h])
+    m.close()
+    return data
+
+
+def unpack(data, w, h):
+    """MediaTek packed RAW10: a little-endian bit stream, 4 pixels in 5 bytes"""
+    import numpy as np
+    b = np.frombuffer(data, np.uint8).reshape(h, w // 4, 5).astype(np.uint16)
+    px = np.empty((h, w // 4, 4), np.uint16)
+    px[..., 0] = b[..., 0] | ((b[..., 1] & 0x03) << 8)
+    px[..., 1] = (b[..., 1] >> 2) | ((b[..., 2] & 0x0f) << 6)
+    px[..., 2] = (b[..., 2] >> 4) | ((b[..., 3] & 0x3f) << 4)
+    px[..., 3] = (b[..., 3] >> 6) | (b[..., 4] << 2)
+    return px.reshape(h, w)
+
+
+def develop(raw, black, path, flip=False):
+    """BGGR -> RGB (bilinear), grey-world white balance, gamma, save"""
+    import numpy as np
+    from PIL import Image
+    x = np.clip(raw.astype(np.float32) - black, 0, None)
+    h, w = x.shape
+    rgb = np.zeros((h, w, 3), np.float32)
+    msk = np.zeros((h, w, 3), np.float32)
+    rgb[1::2, 1::2, 0] = x[1::2, 1::2]; msk[1::2, 1::2, 0] = 1     # R
+    rgb[0::2, 1::2, 1] = x[0::2, 1::2]; msk[0::2, 1::2, 1] = 1     # G
+    rgb[1::2, 0::2, 1] = x[1::2, 0::2]; msk[1::2, 0::2, 1] = 1     # G
+    rgb[0::2, 0::2, 2] = x[0::2, 0::2]; msk[0::2, 0::2, 2] = 1     # B
+
+    def blur(a):                                                     # 3x3 box, edge-padded
+        p = np.pad(a, ((1, 1), (1, 1), (0, 0)), mode="edge")
+        return sum(p[dy:dy + h, dx:dx + w] for dy in range(3) for dx in range(3))
+    rgb = blur(rgb) / np.maximum(blur(msk), 1e-6)
+    mean = rgb.reshape(-1, 3).mean(0)
+    rgb *= mean[1] / np.maximum(mean, 1e-3)                          # grey world
+    rgb /= max(np.percentile(rgb, 99.7), 1.0)
+    out = (np.clip(rgb, 0, 1) ** (1 / 2.2) * 255 + 0.5).astype(np.uint8)
+    if flip:
+        out = out[::-1]
+    Image.fromarray(out).save(path, quality=92) if path.lower().endswith((".jpg", ".jpeg")) \
+        else Image.fromarray(out).save(path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-f", "--front", action="store_true", help="front camera (GC2365)")
+    ap.add_argument("--full", action="store_true", help="rear camera at 3264x2448")
+    ap.add_argument("-o", "--output", default="photo.jpg")
+    ap.add_argument("--raw", help="also save the packed RAW10 frame here")
+    ap.add_argument("--exposure", type=int, help="fixed exposure in lines (skips auto exposure)")
+    ap.add_argument("--gain", type=float, default=1.0, help="fixed analog gain with --exposure")
+    a = ap.parse_args()
+    if os.geteuid():
+        sys.exit("tablet-camera: run as root")
+    cam = GC2365(False) if a.front else OV8856(a.full)
+    phys = physbuf(12 if a.full else 4)
+    t0 = time.time()
+    power_up(a.front)
+    with Bus() as bus:
+        try:
+            if not cam.check(bus):
+                sys.exit(f"tablet-camera: {cam.name} not answering on I2C")
+            cam.start(bus)
+            sv = Blk(0x15009000)
+            src = 1 if a.front else 0
+            if a.exposure:
+                vts = cam.set_ae(bus, a.exposure, a.gain)
+                time.sleep(0.2)
+                data = capture(sv, phys, cam.w, cam.h, src, 3)
+            else:
+                lines, gain = cam.vts // 2, 1.0
+                for it in range(8):
+                    vts = cam.set_ae(bus, lines, gain)
+                    time.sleep(3 * vts / cam.vts / 30 + 0.05)    # let the new exposure through
+                    data = capture(sv, phys, cam.w, cam.h, src, 3 * vts / cam.vts / 30 + 1)
+                    import numpy as np
+                    raw = unpack(data, cam.w, cam.h)
+                    m = float(np.mean(raw[::4, ::4])) - cam.black
+                    print(f"AE {it}: exposure {lines} lines, gain {gain:.2f}, level {m:.0f}")
+                    if 90 < m < 200:
+                        break
+                    k = 140 / max(m, 1.0)
+                    tot = min(lines * gain * k, cam.vts_max * cam.max_gain)
+                    lines = int(min(max(tot, 8), cam.vts_max - 8))
+                    gain = max(1.0, min(tot / lines, cam.max_gain))
+        finally:
+            power_down(cam, bus)
+    if a.raw:
+        open(a.raw, "wb").write(data)
+    subprocess.run(["rmmod", "physbuf"])                     # give the CMA memory back
+    develop(unpack(data, cam.w, cam.h), cam.black, a.output, cam.flip)
+    print(f"{cam.name}: {cam.w}x{cam.h} -> {a.output} in {time.time() - t0:.1f} s")
+
+
+if __name__ == "__main__":
+    main()
