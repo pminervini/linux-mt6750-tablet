@@ -1,7 +1,7 @@
 From b49cb89be372b7f5d64cdae1814db56153bc41fe Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 12:39:29 +0000
-Subject: [PATCH 29/32] soc: mediatek: mt6755-pmic: ignore CHRDET while the
+Subject: [PATCH 29/33] soc: mediatek: mt6755-pmic: ignore CHRDET while the
  USB-C port supplies host VBUS
 
 In host mode the port's own 5 V (GPIO43, drvvbus) reaches the charger input

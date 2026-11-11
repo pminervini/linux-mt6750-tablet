@@ -1,7 +1,7 @@
 From 8b1d4b28c0bc4af640e29f8788817c6e0066b6ee Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 15:50:42 +0000
-Subject: [PATCH 31/32] soc: mediatek: mt6755-pmic: stop charging on stale ADC
+Subject: [PATCH 31/33] soc: mediatek: mt6755-pmic: stop charging on stale ADC
  samples, no 'full' on discharge
 
 Charging decisions used the last good sample of battery voltage and NTC

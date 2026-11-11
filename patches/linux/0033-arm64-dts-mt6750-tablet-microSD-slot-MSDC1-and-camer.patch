@@ -1,0 +1,182 @@
+From 976d4857a991174852ef3423262619723781d86e Mon Sep 17 00:00:00 2001
+From: Pasquale Minervini <p.minervini@gmail.com>
+Date: Wed, 11 Nov 2026 23:28:10 +0000
+Subject: [PATCH 33/33] arm64: dts: mt6750 tablet: microSD slot (MSDC1) and
+ camera I2C2
+
+microSD on MSDC1 (0x11240000, SPI 80, pins GPIO30-35 left in mode 1 by lk, card detect GPIO3
+active high): fixed 2.9 V VMCH (card) / VMC (I/O) supplies, switched on by mt6755-pmic at init;
+SD default/high-speed only (no 1.8 V I/O, no UHS). lk leaves the MSDC1 pads with CMD pulled down
+and CLK pulled up, so no card answers: mt6755-bringup applies the stock pull-up configuration
+(PUPD 0x222262: CMD/DAT0-3 50k pull-up, CLK pull-down) and the Schmitt triggers.
+
+MMC aliases keep the eMMC at mmcblk0 (the initramfs and tablet-bcb rely on it).
+
+I2C2 (0x11009000, SPI 86, GPIO112/113): the camera bus, used from userspace through /dev/i2c-N.
+---
+ .../boot/dts/mediatek/mt6750-k50v1-tablet.dts | 68 +++++++++++++++++++
+ drivers/soc/mediatek/mt6755-bringup.c         | 30 ++++++++
+ drivers/soc/mediatek/mt6755-pmic.c            |  6 ++
+ 3 files changed, 104 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+index a2b2a5d49..9f569832b 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6750-k50v1-tablet.dts
+@@ -31,6 +31,9 @@ psci {
+ 
+ 	aliases {
+ 		serial0 = &uart0;
++		/* fixed MMC numbering: the eMMC must stay mmcblk0 (initramfs, tablet-bcb) */
++		mmc0 = &mmc0;
++		mmc1 = &mmc1;
+ 	};
+ 
+ 	chosen: chosen {
+@@ -223,6 +226,33 @@ vio18_fixed: regulator-vio18 {
+ 		regulator-always-on;
+ 	};
+ 
++	/*
++	 * microSD supplies, MT6353 VMCH (card, LDO1_VMCH_CON0 0x0A80) and VMC (I/O, LDO1_VMC_CON0
++	 * 0x0A7A): switched on by mt6755-pmic at init, at their preset 2.9 V (no 1.8 V I/O: no UHS).
++	 */
++	vmch_fixed: regulator-vmch {
++		compatible = "regulator-fixed";
++		regulator-name = "vmch";
++		regulator-min-microvolt = <2900000>;
++		regulator-max-microvolt = <2900000>;
++		regulator-always-on;
++	};
++
++	vmc_fixed: regulator-vmc {
++		compatible = "regulator-fixed";
++		regulator-name = "vmc";
++		regulator-min-microvolt = <2900000>;
++		regulator-max-microvolt = <2900000>;
++		regulator-always-on;
++	};
++
++	/* MSDC1 source: lk leaves msdc30_1_sel = msdcpll_d2 (~192 MHz); declared high, as MSDC0's */
++	msdc1_src_clk: msdc1-src-clk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <200000000>;
++	};
++
+ 	vusb33_fixed: regulator-vusb33 {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "vusb33";
+@@ -250,6 +280,27 @@ mmc0: mmc@11230000 {
+ 		mediatek,pins-preset;
+ 	};
+ 
++	/*
++	 * microSD (MSDC1, pins GPIO30-35 left in mode 1 by lk). Card detect GPIO3, high = card in.
++	 * Default/high-speed only: fixed 2.9 V I/O, no UHS.
++	 */
++	mmc1: mmc@11240000 {
++		compatible = "mediatek,mt6755-mmc", "mediatek,mt2701-mmc";
++		reg = <0 0x11240000 0 0x1000>;
++		interrupts = <GIC_SPI 80 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&msdc1_src_clk>, <&msdc0_hclk>;
++		clock-names = "source", "hclk";
++		bus-width = <4>;
++		max-frequency = <50000000>;
++		cap-sd-highspeed;
++		no-mmc;
++		no-sdio;
++		cd-gpios = <&gpio 3 GPIO_ACTIVE_HIGH>;
++		vmmc-supply = <&vmch_fixed>;
++		vqmmc-supply = <&vmc_fixed>;
++		mediatek,pins-preset;
++	};
++
+ 	/* PHY ("ssusb_sif2" in stock DT) is at 0x11290000; 0x11280000 is the IPPC/SIF of the MAC. */
+ 	/* T-PHY v1 (vendor mu3phy: SPLLC 0x0, FMREG 0x100, IPPC/CHIP 0x700, U2 0x800, U3 0x900) */
+ 	u3phy: t-phy@11290000 {
+@@ -409,6 +460,23 @@ accelerometer@12 {
+ 		};
+ 	};
+ 
++	/*
++	 * I2C2 (SCL2/SDA2 = GPIO112/113, mode 1 from lk): the cameras - rear OV8856 at 0x36, front
++	 * GC2365 at 0x37. They answer only while powered and clocked, which userspace does
++	 * (tools/camera/tablet-camera, through /dev/i2c-N): no sensor nodes here.
++	 */
++	i2c_2: i2c@11009000 {
++		compatible = "mediatek,mt6755-i2c";
++		reg = <0 0x11009000 0 0x1000>, <0 0x11000200 0 0x80>;
++		interrupts = <GIC_SPI 86 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&i2c_src_clk>, <&clk26m_ref>;
++		clock-names = "main", "dma";
++		clock-div = <10>;
++		clock-frequency = <100000>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++	};
++
+ 	/* I2C3 (SDA3/SCL3 = GPIO50/49): MT6311 external CPU buck at 0x6b (stock "ext_buck") */
+ 	i2c_3: i2c@1100f000 {
+ 		compatible = "mediatek,mt6755-i2c";
+diff --git a/drivers/soc/mediatek/mt6755-bringup.c b/drivers/soc/mediatek/mt6755-bringup.c
+index 7c37e07dc..c13c00eaa 100644
+--- a/drivers/soc/mediatek/mt6755-bringup.c
++++ b/drivers/soc/mediatek/mt6755-bringup.c
+@@ -53,6 +53,36 @@ static int __init mt6755_bringup_clocks(void)
+ }
+ arch_initcall(mt6755_bringup_clocks);
+ 
++/*
++ * microSD (MSDC1) pads in IOCFG_0: lk leaves CMD pulled down and CLK pulled up (PUPD 0x...226),
++ * so no card can answer (CMD is open-drain during card identification). Stock
++ * msdc_pin_config_by_id(1, MSDC_PIN_PULL_UP): PUPD 0x222262 = CMD and DAT0-3 50k pull-up, CLK 50k
++ * pull-down; Android also has the Schmitt triggers on (SMT bits 8-10: CLK, CMD, DAT).
++ */
++#define IOCFG_0			0x10002000
++#define  MSDC1_SMT		0x010
++#define  MSDC1_PUPD		0x0c0
++
++static int __init mt6755_bringup_msdc1_pads(void)
++{
++	void __iomem *io;
++	u32 old;
++
++	if (!of_machine_is_compatible("mediatek,k50v1-tablet"))
++		return 0;
++	io = ioremap(IOCFG_0, 0x100);
++	if (!io)
++		return -ENOMEM;
++	old = readl(io + MSDC1_PUPD);
++	writel((old & ~0x777777) | 0x222262, io + MSDC1_PUPD);
++	writel(readl(io + MSDC1_SMT) | (7 << 8), io + MSDC1_SMT);
++	pr_info("mt6755-bringup: MSDC1 pads PUPD %08x -> %08x, SMT %08x\n", old,
++		readl(io + MSDC1_PUPD), readl(io + MSDC1_SMT));
++	iounmap(io);
++	return 0;
++}
++arch_initcall(mt6755_bringup_msdc1_pads);
++
+ /*
+  * lk leaves two OVL0 layers on: layer 0 scans out the framebuffer that we hand to
+  * simple-framebuffer, and layer 3 (lk's second buffer right after it) carries the
+diff --git a/drivers/soc/mediatek/mt6755-pmic.c b/drivers/soc/mediatek/mt6755-pmic.c
+index d59b599c9..8afbe5e67 100644
+--- a/drivers/soc/mediatek/mt6755-pmic.c
++++ b/drivers/soc/mediatek/mt6755-pmic.c
+@@ -961,6 +961,12 @@ static int __init mt6755_pmic_init(void)
+ 	 */
+ 	mt6755_pmic_rmw(0x0A06, 1, 4, 1);
+ 	mt6755_pmic_rmw(0x0A36, 1, 1, 1);
++	/*
++	 * microSD (MSDC1): VMCH (card power, LDO1_VMCH_CON0 b1) and VMC (I/O, LDO1_VMC_CON0 b1), at
++	 * the preset 2.9 V (DLDO_ANA_CON6/CON14). lk leaves both off; the DT describes them as fixed.
++	 */
++	mt6755_pmic_rmw(0x0A80, 1, 1, 1);
++	mt6755_pmic_rmw(0x0A7A, 1, 1, 1);
+ 	auxadc_hw_init();
+ 	chr_hw_init();
+ 	INIT_DELAYED_WORK(&chr_work, chr_work_fn);
+-- 
+2.53.0
+

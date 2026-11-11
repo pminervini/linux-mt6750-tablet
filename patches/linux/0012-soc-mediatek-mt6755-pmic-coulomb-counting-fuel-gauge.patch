@@ -1,7 +1,7 @@
 From 8a6d342827520e3604c6c9247f45197d419ae1ff Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sun, 8 Nov 2026 00:19:44 +0000
-Subject: [PATCH 12/32] soc: mediatek: mt6755-pmic: coulomb-counting fuel gauge
+Subject: [PATCH 12/33] soc: mediatek: mt6755-pmic: coulomb-counting fuel gauge
  (MT6353 FGADC)
 
 - FGADC latch/read/clear as stock fgauge_read_columb/current; R_FG 10 mOhm, CAR_TUNE 118

@@ -1,7 +1,7 @@
 From bbda23450101b17629ee278e05eabc5784b80678 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 09:48:34 +0000
-Subject: [PATCH 25/32] tablet DT: touchscreen axes swapped, chip ranges
+Subject: [PATCH 25/33] tablet DT: touchscreen axes swapped, chip ranges
  1664x960 (from corner taps); image s7g
 
 ---

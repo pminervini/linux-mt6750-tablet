@@ -1,7 +1,7 @@
 From d392248c15c2250950867ed439bd63ae346813d1 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Tue, 10 Nov 2026 16:28:39 +0000
-Subject: [PATCH 32/32] soc: mediatek: mt6755-pmic: low-battery power-off also
+Subject: [PATCH 32/33] soc: mediatek: mt6755-pmic: low-battery power-off also
  with a charger attached while discharging
 
 The orderly power-off below lowbat_mv required 'no charger detected'. A

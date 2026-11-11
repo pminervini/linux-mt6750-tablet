@@ -13,12 +13,13 @@ tools/regdiff/and-cam-*), with a raw-dump path that bypasses the ISP:
     --raw:   also save the packed RAW10 frame (MediaTek bit order, see unpack())
     the front camera is 1600x1200.
 
-Sensor control is over I2C2 bit-banged on GPIO112/113 (the I2C2 controller has no DT node yet).
+Sensor control is over the I2C2 controller (/dev/i2c-N for i2c@11009000; bit-banged on
+GPIO112/113 as a fallback on kernels without that DT node).
 Auto exposure: a few frames adjusting exposure, then gain, towards a mid-grey mean. White
 balance: grey world. No lens shading, denoise or sharpening: expect a plain, noisy-in-the-dark
 picture. ~5-15 s per photo.
 """
-import argparse, mmap, os, struct, subprocess, sys, time
+import argparse, ctypes, fcntl, glob, mmap, os, struct, subprocess, sys, time
 
 DATA = os.environ.get("TABLET_CAMERA_DATA", "/usr/local/share/tablet-camera")
 PHYSBUF = os.environ.get("TABLET_CAMERA_KO", "/usr/local/lib/tablet-camera/physbuf.ko")
@@ -115,8 +116,8 @@ def _rbyte(last):
     return v
 
 
-class Bus:
-    """I2C2 pins switched to GPIO for the duration (nothing else uses I2C2 on mainline)"""
+class BitBangBus:
+    """fallback for kernels without the I2C2 DT node: I2C2 pins switched to GPIO meanwhile"""
     def __enter__(self):
         self.old = {p: (gpio.rd(mode_loc(p)[0]) >> mode_loc(p)[1]) & 7 for p in (SCL, SDA)}
         for p in (SCL, SDA):
@@ -159,6 +160,68 @@ class Bus:
                 self.write(addr, r, v, reg16)
                 if reg16 and r == 0x0103:
                     time.sleep(0.01)                         # OV8856 software reset
+
+
+class HwBus:
+    """I2C2 controller (DT node i2c@11009000) through /dev/i2c-N, I2C_RDWR transfers"""
+    I2C_RDWR, I2C_M_RD = 0x0707, 0x0001
+
+    class Msg(ctypes.Structure):
+        _fields_ = [("addr", ctypes.c_uint16), ("flags", ctypes.c_uint16),
+                    ("len", ctypes.c_uint16), ("buf", ctypes.c_void_p)]
+
+    class RdWr(ctypes.Structure):
+        _fields_ = [("msgs", ctypes.c_void_p), ("nmsgs", ctypes.c_uint32)]
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_RDWR)
+        return self
+
+    def __exit__(self, *a):
+        os.close(self.fd)
+
+    def _xfer(self, *parts):
+        """parts: (addr, bytes to write) or (addr, n to read); returns the bytes read"""
+        msgs = (self.Msg * len(parts))()
+        bufs = []
+        for i, (addr, x) in enumerate(parts):
+            b = ctypes.create_string_buffer(bytes(x) if isinstance(x, (bytes, bytearray)) else x)
+            bufs.append(b)
+            msgs[i] = self.Msg(addr, 0 if isinstance(x, (bytes, bytearray)) else self.I2C_M_RD,
+                               len(x) if isinstance(x, (bytes, bytearray)) else x,
+                               ctypes.addressof(b))
+        data = self.RdWr(ctypes.addressof(msgs), len(parts))
+        fcntl.ioctl(self.fd, self.I2C_RDWR, data)
+        return bufs[-1].raw
+
+    def write(self, addr, reg, val, reg16):
+        b = bytes([reg >> 8, reg & 0xff, val]) if reg16 else bytes([reg & 0xff, val])
+        for _ in range(3):
+            try:
+                self._xfer((addr, b))
+                return
+            except OSError:
+                time.sleep(0.001)
+        raise IOError(f"I2C write {addr:#x}:{reg:#x} not acknowledged")
+
+    def read(self, addr, reg, reg16):
+        r = bytes([reg >> 8, reg & 0xff]) if reg16 else bytes([reg & 0xff])
+        try:
+            return self._xfer((addr, r), (addr, 1))[0]
+        except OSError:
+            return None
+
+    run = BitBangBus.run
+
+
+def Bus():
+    for d in glob.glob("/sys/bus/i2c/devices/i2c-*"):
+        if os.path.realpath(d + "/..").endswith("11009000.i2c"):
+            return HwBus("/dev/" + os.path.basename(d))
+    return BitBangBus()
 
 
 # ---------------------------------------------------------------- sensors

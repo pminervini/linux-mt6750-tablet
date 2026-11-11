@@ -1,0 +1,3 @@
+# microSD (mmcblk1, fixed by the DT alias mmc1): read-only as soon as it appears, card and
+# partitions. Remove this rule (or `blockdev --setrw /dev/mmcblk1`) to allow writing.
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="mmcblk1*", RUN+="/usr/sbin/blockdev --setro /dev/%k"

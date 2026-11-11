@@ -1,7 +1,7 @@
 From 67f991e51d7e0a0eccf64cf677f1e8bb57daeaf9 Mon Sep 17 00:00:00 2001
 From: Pasquale Minervini <p.minervini@gmail.com>
 Date: Sun, 8 Nov 2026 01:25:08 +0000
-Subject: [PATCH 13/32] MT6755: pinctrl (GPIO+EINT, paris), I2C0 (i2c-mt65xx
+Subject: [PATCH 13/33] MT6755: pinctrl (GPIO+EINT, paris), I2C0 (i2c-mt65xx
  mt6755 variant keeping boot TIMING/HS bits), Goodix touch node, VLDO28 on
 
 - pinctrl-mt6755: 190 GPIOs, EINT 0..159 = GPIO n; MODE is 10 pins/register in two
