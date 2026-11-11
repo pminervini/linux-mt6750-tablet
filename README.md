@@ -34,6 +34,8 @@ It is not a polished distribution.
   Android when a kernel fails early or Debian cannot start (after 30 min on the USB rescue console), Wi-Fi watchdog, flashing script that verifies the write and the
   booted kernel, quiet console with a clean login prompt
 
+- containers: Docker (Debian's `docker.io`) with its default bridge networking and published ports;
+  the kernel config carries the netfilter/overlay/veth pieces it needs
 - cameras: rear OV8856 (8 MP) and front GC2365 (2 MP) take still photos with `tablet-camera`, a
   userspace capture pipeline (sensor -> SENINF -> CAMSV raw dump -> demosaic/AE/AWB) with no kernel
   camera driver (`tools/camera`)

@@ -64,6 +64,23 @@ if [ ! -f $OUT/.config ] || [ "${1:-all}" = config ]; then
   # Bluetooth: BLE + RFCOMM/BNEP/HIDP for BlueZ on the VHCI bridge (tablet-btbridge)
   $C -e HID -e HID_GENERIC -m UHID
   $C -e BT_LE -m BT_RFCOMM -e BT_RFCOMM_TTY -m BT_BNEP -e BT_BNEP_MC_FILTER -e BT_BNEP_PROTO_FILTER -m BT_HIDP
+  # containers (Docker): the netfilter pieces its bridge networking uses through iptables-nft and
+  # legacy iptables (NAT, masquerade, filter, conntrack match), overlay/vxlan/ipvlan/dummy drivers
+  for o in NFT_COMPAT NFT_CT NFT_FIB_IPV4 NFT_FIB_IPV6 NFT_FIB_INET NFT_REJECT NETFILTER_XT_NAT \
+           NETFILTER_XT_TARGET_MASQUERADE NETFILTER_XT_TARGET_REDIRECT NETFILTER_XT_MATCH_MULTIPORT \
+           NETFILTER_XT_MATCH_COMMENT NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_MATCH_CONNTRACK \
+           NETFILTER_XT_MARK NETFILTER_XT_MATCH_IPVS IP_NF_IPTABLES IP_NF_FILTER IP_NF_NAT \
+           IP_NF_TARGET_MASQUERADE IP_NF_TARGET_REDIRECT IP_NF_MANGLE IP_NF_RAW IP6_NF_IPTABLES \
+           IP6_NF_FILTER IP6_NF_NAT IP6_NF_TARGET_MASQUERADE IP6_NF_MANGLE IP6_NF_RAW \
+           BRIDGE BRIDGE_NETFILTER VETH OVERLAY_FS VXLAN IPVLAN MACVLAN DUMMY IP_VS; do
+    $C -m $o
+  done
+  # legacy iptables tables too (fallback for iptables-legacy): they sit behind NETFILTER_XTABLES_LEGACY
+  $C -e NETFILTER_XTABLES_LEGACY -m IP_NF_IPTABLES_LEGACY -m IP6_NF_IPTABLES_LEGACY
+  for o in NF_TABLES_INET NF_TABLES_IPV6 BRIDGE_VLAN_FILTERING CFS_BANDWIDTH BLK_DEV_THROTTLING \
+           CGROUP_HUGETLB CGROUP_NET_PRIO; do
+    $C -e $o
+  done
   $C --set-val WATCHDOG_OPEN_TIMEOUT 150
   $C --set-val SERIAL_EARLYCON_RAM_BASE 0xb00d0000 --set-val SERIAL_EARLYCON_RAM_HEAD 0xb00c0000
   # console: rotated for landscape (fbcon=rotate:3, console top at the panel's left edge) and,
