@@ -1,0 +1,11 @@
+[Unit]
+Description=Rotate the text console with the tablet's orientation (accelerometer)
+After=systemd-udev-settle.service
+
+[Service]
+ExecStart=/usr/local/sbin/tablet-rotate
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

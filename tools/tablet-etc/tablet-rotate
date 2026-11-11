@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+"""tablet-rotate: rotate the text console (fbcon, all VTs) to follow the tablet's orientation,
+from the QMA6100P accelerometer (IIO). Running programs get the new size (SIGWINCH).
+
+Twice a second (every 2 s while the backlight is off): gravity in the screen plane picks one of
+four orientations; nothing changes while the tablet lies roughly flat, near a 45-degree diagonal,
+or before the new orientation has held for HOLD samples.
+
+/etc/default/tablet-rotate (optional, shell syntax):
+  ROTATE_MAP="-y:1 +y:3 +x:2 -x:0"   gravity direction (sensor axes) -> fbcon rotation (0..3);
+                                     measured 2026-11-11: anticlockwise turns from the landscape
+                                     with gravity on -y go -y, +x, +y, -x = rotations 1, 2, 3, 0
+  ROTATE_LOCK=3                      fixed rotation, no auto-rotation (empty = auto)
+The accelerometer is mounted rotated relative to the panel: gravity along +y = the landscape
+the boot console (fbcon=rotate:3) is drawn for; -y = the other landscape (rotation 1).
+"""
+import glob, os, sys, time
+
+CONF = "/etc/default/tablet-rotate"
+ROT = "/sys/class/graphics/fbcon/rotate_all"
+CUR = "/sys/class/graphics/fbcon/rotate"
+BL = glob.glob("/sys/class/backlight/*/brightness")
+FLAT = 0.55          # in-plane gravity below this fraction of g: lying flat, keep the rotation
+MARGIN = 1.6         # dominant axis must exceed the other by this factor (rejects ~45 degrees)
+HOLD = 2             # consecutive samples before switching
+
+
+def conf():
+    c = {"ROTATE_MAP": "-y:1 +y:3 +x:2 -x:0", "ROTATE_LOCK": ""}
+    try:
+        for l in open(CONF):
+            l = l.split("#")[0].strip()
+            if "=" in l:
+                k, v = l.split("=", 1)
+                c[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    m = {}
+    for tok in c["ROTATE_MAP"].split():
+        k, v = tok.split(":")
+        m[k] = int(v)
+    return m, c["ROTATE_LOCK"]
+
+
+def accel_dir():
+    d = glob.glob("/sys/bus/iio/devices/iio:device*")
+    for p in d:
+        try:
+            if open(p + "/name").read().strip().startswith("qma"):
+                return p
+        except OSError:
+            pass
+    return None
+
+
+def rd(p):
+    return int(open(p).read())
+
+
+def main():
+    mp, lock = conf()
+    if lock:
+        open(ROT, "w").write(lock)
+        print(f"tablet-rotate: locked at {lock}", flush=True)
+        return
+    dev = accel_dir()
+    if not dev:
+        sys.exit("tablet-rotate: no accelerometer")
+    scale = float(open(dev + "/in_accel_scale").read())
+    g = 9.81 / scale
+    last, cand, n = None, None, 0
+    print(f"tablet-rotate: {dev}, map {mp}", flush=True)
+    while True:
+        try:
+            x, y = rd(dev + "/in_accel_x_raw"), rd(dev + "/in_accel_y_raw")
+        except OSError:
+            time.sleep(2)
+            continue
+        new = None
+        if (x * x + y * y) ** 0.5 > FLAT * g:
+            if abs(y) > MARGIN * abs(x):
+                new = mp.get("-y" if y < 0 else "+y")
+            elif abs(x) > MARGIN * abs(y):
+                new = mp.get("-x" if x < 0 else "+x")
+        if new is not None and new != cand:
+            cand, n = new, 0
+        n += new is not None and new == cand
+        if cand is not None and n >= HOLD:
+            cur = int(open(CUR).read())
+            if cand != cur:
+                open(ROT, "w").write(str(cand))
+                print(f"tablet-rotate: x={x} y={y} -> rotation {cand}", flush=True)
+            last = cand
+        screen_off = BL and not rd(BL[0])
+        time.sleep(2 if screen_off else 0.5)
+
+
+if __name__ == "__main__":
+    main()
