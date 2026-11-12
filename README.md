@@ -34,8 +34,8 @@ It is not a polished distribution.
   Android when a kernel fails early or Debian cannot start (after 30 min on the USB rescue console), Wi-Fi watchdog, flashing script that verifies the write and the
   booted kernel, quiet console with a clean login prompt
 
-- microSD slot (MSDC1, SD default/high speed): driver, supplies and pad setup in place; not yet verified
-  with a working card (the test card failed under Android too); `60-sdcard-readonly.rules` keeps it read-only
+- microSD slot (MSDC1, SD default/high speed): cards read and mount (tested: 32 GB SDHC, FAT32);
+  `tools/tablet-etc/60-sdcard-readonly.rules` keeps cards read-only until removed
 - auto-rotation: the text console follows the tablet's orientation (accelerometer, `tablet-rotate`)
 - containers: Docker (Debian's `docker.io`) with its default bridge networking and published ports;
   the kernel config carries the netfilter/overlay/veth pieces it needs
