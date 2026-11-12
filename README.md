@@ -26,6 +26,9 @@ It is not a polished distribution.
   userspace DVFS holds the low clock above 85 C)
 - touchscreen (Silead GSL3670, multitouch; firmware cut from the device's own stock kernel)
 - GPS: open-source engine [opengps-mtk](https://github.com/pminervini/opengps-mtk) (no mnld/libmnl)
+- FM receiver: tuning/retuning and RDS PI, station name, and RadioText verified under native Debian;
+  requires the matching receiver-capable connsys revision and stock DSP firmware (see "Not included").
+  FM digital audio capture/playback and reboot persistence are not verified; module loading is manual.
 - speaker audio from userspace (`tools/audio/tablet-audio`, no ALSA driver yet)
 - boot splash: own boot logo (lk), lk's "Orange State" screen and 5 s delay patched out, quiet boot
   with an optional animation until the login prompt, console rotated for landscape
@@ -100,7 +103,12 @@ Nothing here is MediaTek's or the device vendor's code or firmware; take those f
 - **connsys kernel modules** (WMT/STP/BTIF, wlan gen2): a forward-port of MediaTek's GPL downstream
   drivers, based on [mt6572-connsys-modules](https://github.com/buddyjojo/mt6572-connsys-modules),
   in their own repository, [mt6750-connsys](https://github.com/pminervini/mt6750-connsys) (Wi-Fi
-  incl. monitor mode, Bluetooth, the GPS core); built separately, against the same kernel.
+  incl. monitor mode, Bluetooth, the GPS core, and FM receiver/RDS); built separately, against the same kernel.
+  For receiver setup and the distinction from the MT6572 ALSA audio helpers, see its
+  [MT6755 FM runbook](https://github.com/pminervini/mt6750-connsys/blob/main/tools/fm.md#mt6755--mt6750-receiver-and-rds).
+- **FM DSP firmware**: `mt6627_fm_v1_patch.bin` and `mt6627_fm_v1_coeff.bin`, from your own
+  stock `/vendor/firmware/`, installed in `/lib/firmware/`. No additional kernel patch was needed
+  for the receiver milestone; these proprietary blobs are not included here.
 - **touchscreen firmware**: `tools/gsl-fwextract.py <stock boot.img> /lib/firmware/silead/gsl3670-k50v1.fw`.
 - **GPS firmware**: `fwextract.py` in opengps-mtk.
 - **the board's ODM overlay** (`dtbo/ov0.dtbo`, for `check-dtb.py`) and stock device-tree dumps.
