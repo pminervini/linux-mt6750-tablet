@@ -30,6 +30,10 @@ It is not a polished distribution.
   requires the matching receiver-capable connsys revision and stock DSP firmware (see "Not included").
   FM digital audio capture/playback and reboot persistence are not verified; module loading is manual.
 - speaker audio from userspace (`tools/audio/tablet-audio`, no ALSA driver yet)
+- side-button playback volume in 5% steps, with a rotating two-second bar and percentage
+  (`tablet-pwrkey` plus `tablet-sentinel`); zero mutes playback samples. Changing the selected
+  level never starts audio. Install the renderer in `/usr/local/bin/` and the controller and
+  audio helper in `/usr/local/sbin/`; the renderer needs `python3-pil` and `fonts-dejavu-core`.
 - boot splash: own boot logo (lk), lk's "Orange State" screen and 5 s delay patched out, quiet boot
   with an optional animation until the login prompt, console rotated for landscape
   (`tools/splash`)

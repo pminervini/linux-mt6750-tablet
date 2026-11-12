@@ -1,69 +1,150 @@
 #!/usr/bin/python3
-"""Power key / input activity -> screen (MT6750 tablet, mainline).
+"""Tablet power/input controller, plus idle monochrome ambient eyes.
 
-- short press of the power key toggles the screen (backlight + DSI panel sleep);
-- a key or button on any keyboard or mouse (USB or Bluetooth, hot-plugged ones too) wakes it;
-- the touchscreen keeps it on while in use but does not wake it (no accidental wake-ups);
-- the screen turns off after SCREEN_TIMEOUT seconds without input.
-A long press (5 s) is left to systemd-logind (HandlePowerKeyLongPress=poweroff, short press ignored).
+Power key toggles; USB/BT keyboards and mice wake; touch keeps an awake screen on.
+Side volume buttons change playback volume, never start or unmute audio.
+After 120 seconds without input the screen sleeps. At random 1-3-hour checks,
+at least 6 hours without keyboard use permits 3-5 minutes of ambient eyes.
+Any input dismisses the eyes; a long power press remains logind's business.
+Only activity timestamps are retained, never key codes or text. /run state permits
+interrupted-display recovery; every controller start begins a fresh idle observation window.
+AMBIENT_*_SECONDS and SCREEN_TIMEOUT_SECONDS environment overrides support bounded tests.
 """
-import glob, os, select, struct, subprocess, sys, time
+import fcntl, glob, json, mmap, os, random, select, signal, struct, subprocess, sys, time
+from pathlib import Path
 
-SCREEN_TIMEOUT = 120
+SCREEN_TIMEOUT = float(os.environ.get('SCREEN_TIMEOUT_SECONDS', '120'))
 ON_LEVEL = 300
-RESCAN = 2.0                           # seconds between looks for new input devices
+RESCAN = 2.0
 BL = '/sys/class/backlight/backlight/brightness'
-EV = struct.Struct('llHHi')            # struct input_event on 64-bit
-EV_KEY, EV_REL, KEY_POWER = 1, 2, 116
-INPUT_PROP_DIRECT = 1                  # touchscreen
+EV = struct.Struct('llHHi')
+EV_KEY, EV_REL, EV_ABS, KEY_POWER = 1, 2, 3, 116
+INPUT_PROP_DIRECT = 1
+STATE = Path(os.environ.get('AMBIENT_STATE_PATH', '/run/tablet-ambient.json'))
+IDLE_SECONDS = float(os.environ.get('AMBIENT_IDLE_SECONDS', '21600'))
+CHECK_MIN = float(os.environ.get('AMBIENT_CHECK_MIN_SECONDS', '3600'))
+CHECK_MAX = float(os.environ.get('AMBIENT_CHECK_MAX_SECONDS', '10800'))
+SHOW_MIN = float(os.environ.get('AMBIENT_SHOW_MIN_SECONDS', '180'))
+SHOW_MAX = float(os.environ.get('AMBIENT_SHOW_MAX_SECONDS', '300'))
+ENABLED = os.environ.get('AMBIENT_ENABLED', '1') == '1'
+STOP = False
+
+
+class SideButtons:
+    """Read the stock MT6755 keypad map (MEM1 bits 0/1 = volume up/down).
+
+    Read-only: lk already enables the block. Debounce, then repeat held presses;
+    both buttons or a key held at startup require release before another action.
+    """
+    def __init__(self):
+        fd = os.open('/dev/mem', os.O_RDONLY | os.O_SYNC)
+        try:
+            self.keypad = mmap.mmap(fd, 4096, prot=mmap.PROT_READ, offset=0x10010000)
+        finally:
+            os.close(fd)
+        self.mask, self.raw_mask, self.changed_at = 3, 3, 0
+        self.next_at, self.down_at = None, 0
+        self.armed = False
+
+    def poll(self, now):
+        enabled = struct.unpack_from('<I', self.keypad, 0x24)[0] & 1
+        raw = (~struct.unpack_from('<I', self.keypad, 0x04)[0] & 3) if enabled else 3
+        if raw != self.raw_mask:
+            self.raw_mask, self.changed_at = raw, now
+        if now - self.changed_at < 0.05:
+            return None
+        mask = self.raw_mask
+        if mask != self.mask:
+            self.mask, self.down_at, self.next_at = mask, now, now
+            if mask == 0:
+                self.armed = True
+            elif mask == 3:
+                self.armed = False
+        if self.armed and mask in (1, 2) and now >= self.next_at:
+            self.next_at = now + (0.45 if now - self.down_at < 0.4 else 0.15)
+            return 'up' if mask == 1 else 'down'
+        return None
 
 
 def panel(on):
-    """DSI panel sleep/wake (tablet-panel: DCS 0x28/0x10, 0x11/0x29 in video mode)."""
-    r = subprocess.run(["/usr/local/sbin/tablet-panel", "on" if on else "off"],
-                       capture_output=True, text=True)
+    r = subprocess.run(['/usr/local/sbin/tablet-panel', 'on' if on else 'off'], capture_output=True, text=True, timeout=5)
     if r.returncode:
-        print("tablet-pwrkey: panel", "on" if on else "off", "failed:", r.stderr.strip(), flush=True)
+        print('tablet-pwrkey: panel failed:', r.stderr.strip(), flush=True)
 
 
 def bl(level=None):
     if level is None:
-        return int(open(BL).read())
+        return int(Path(BL).read_text())
     if level > 0:
-        panel(True)                 # wake the panel (and video stream) before lighting it; idempotent
-    with open(BL, 'w') as f:
-        f.write(str(level))
+        panel(True)
+    Path(BL).write_text(str(level))
     if level == 0:
-        panel(False)                # backlight off first, then put the panel to sleep
+        panel(False)
 
 
 def sysfs_hex(path):
-    """input capability bitmap (space-separated hex words, most significant first) -> int"""
     try:
-        return int("".join("%016x" % int(w, 16) for w in open(path).read().split()), 16)
+        return int(''.join('%016x' % int(w, 16) for w in Path(path).read_text().split()), 16)
     except (OSError, ValueError):
         return 0
 
 
 def classify(ev):
-    """'power', 'wake' (keyboard/mouse), 'touch', or None for devices we ignore."""
     d = '/sys/class/input/%s/device/' % ev
     try:
-        name = open(d + 'name').read().strip()
+        name = Path(d+'name').read_text().strip()
     except OSError:
         return None
     if name == 'mt6755-pwrkey':
         return 'power'
-    if sysfs_hex(d + 'properties') >> INPUT_PROP_DIRECT & 1:
+    if sysfs_hex(d+'properties') >> INPUT_PROP_DIRECT & 1:
         return 'touch'
-    evbits = sysfs_hex(d + 'capabilities/ev')
+    keys = sysfs_hex(d+'capabilities/key')
+    if all(keys >> k & 1 for k in (28, 30, 57)):  # Enter, A, Space: a typing keyboard
+        return 'keyboard'
+    evbits = sysfs_hex(d+'capabilities/ev')
     if evbits >> EV_KEY & 1 or evbits >> EV_REL & 1:
         return 'wake'
     return None
 
 
+def eligible(now, last_keyboard, last_input, brightness):
+    return now-last_keyboard >= IDLE_SECONDS and now-last_input >= SCREEN_TIMEOUT and brightness == 0
+
+
+def restore_console():
+    tty = os.open('/dev/tty1', os.O_RDWR | os.O_NOCTTY)
+    try:
+        # Never repaint over a renderer that has not exited yet.
+        fcntl.flock(tty, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.ioctl(tty, 0x4B3A, 0)
+    finally:
+        os.close(tty)
+
+
 def main():
-    devs = {}                           # fd -> (eventN, kind)
+    if not (SCREEN_TIMEOUT > 0 and IDLE_SECONDS >= 0 and 0 < CHECK_MIN <= CHECK_MAX and 0 < SHOW_MIN <= SHOW_MAX <= 300):
+        raise ValueError('invalid screen/ambient timing bounds')
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    now = time.monotonic()
+    try:
+        state = json.loads(STATE.read_text())
+        if not isinstance(state, dict) or state.get('boot_id') != boot:
+            state = {}
+    except (OSError, ValueError):
+        state = {}
+    if state.get('previous_level') is not None:
+        restore_console()
+        bl(int(state['previous_level']))
+        print('tablet-pwrkey: recovered interrupted ambient display', flush=True)
+    # Service downtime is unobserved: restart the full conservative idle window.
+    state = dict(boot_id=boot, last_keyboard=now, next_check=now+random.uniform(CHECK_MIN,CHECK_MAX), active_pid=None, ends_at=None, previous_level=None)
+    def save():
+        temporary = STATE.with_suffix('.tmp')
+        temporary.write_text(json.dumps(state)+'\n')
+        temporary.replace(STATE)
+    save()
+    devs = {}
     def rescan():
         have = {e for e, _ in devs.values()}
         for path in sorted(glob.glob('/dev/input/event*')):
@@ -77,64 +158,194 @@ def main():
                 fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
             except OSError:
                 continue
-            devs[fd] = (ev, kind)
-            print('tablet-pwrkey: %s (%s) %s' % (ev, kind,
-                  open('/sys/class/input/%s/device/name' % ev).read().strip()), flush=True)
-
-    bl(ON_LEVEL)
-    off_at = time.monotonic() + SCREEN_TIMEOUT
-    down_at = None
-    next_scan = 0
-    print(f'tablet-pwrkey: screen off after {SCREEN_TIMEOUT}s without input', flush=True)
-    while True:
-        now = time.monotonic()
-        if now >= next_scan:
-            rescan()
-            next_scan = now + RESCAN
-        wait = next_scan - now
-        if off_at is not None:
-            wait = min(wait, max(0, off_at - now))
-        r, _, _ = select.select(list(devs), [], [], wait)
-        now = time.monotonic()
-        if off_at is not None and now >= off_at:
-            bl(0)
-            off_at = None
-            print('tablet-pwrkey: screen off (no input for %ds)' % SCREEN_TIMEOUT, flush=True)
-        for fd in r:
-            ev, kind = devs[fd]
-            try:
-                data = os.read(fd, EV.size * 64)
-            except BlockingIOError:
-                continue
-            except OSError:             # unplugged
-                os.close(fd)
-                del devs[fd]
-                print('tablet-pwrkey: %s gone' % ev, flush=True)
-                continue
-            for i in range(0, len(data) - EV.size + 1, EV.size):
-                _, _, typ, code, val = EV.unpack_from(data, i)
-                if kind == 'power':
-                    if typ != EV_KEY or code != KEY_POWER:
-                        continue
-                    if val == 1:
-                        down_at = now
-                    elif val == 0 and down_at is not None:
-                        held, down_at = now - down_at, None
-                        if held >= 2:          # long press: logind's business
+            devs[fd] = ev, kind
+            if kind == 'keyboard':
+                # Events before this fd was opened were unobserved.
+                state['last_keyboard'] = time.monotonic()
+                save()
+            print(f'tablet-pwrkey: {ev} ({kind})', flush=True)
+    buttons = None
+    try:
+        buttons = SideButtons()
+    except OSError as error:
+        print(f'tablet-pwrkey: side volume buttons unavailable: {error}', flush=True)
+    ambient = None
+    volume_display = False
+    volume_until = 0
+    previous_level = None
+    def show_volume(until, level):
+        nonlocal ambient, volume_display, previous_level
+        previous_level = level
+        state['previous_level'] = level
+        save()
+        try:
+            ambient = subprocess.Popen(['/usr/local/bin/tablet-sentinel', '--volume-osd', '--seconds', '2'])
+            volume_display = True
+            state['active_pid'], state['ends_at'] = ambient.pid, until
+            if level == 0:
+                bl(ON_LEVEL)
+            save()
+        except OSError as error:
+            state['previous_level'] = None
+            save()
+            bl(level)
+            print(f'tablet-pwrkey: volume display unavailable: {error}', flush=True)
+    def finish(restore):
+        nonlocal ambient, volume_display
+        if ambient is None:
+            return
+        if ambient.poll() is None:
+            ambient.terminate()
+        try:
+            result = ambient.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            ambient.kill()
+            result = ambient.wait()
+        ambient = None
+        volume_display = False
+        try:
+            if result != 0:
+                restore_console()
+        finally:
+            if restore:
+                bl(previous_level)
+        state['active_pid'], state['ends_at'], state['previous_level'] = None, None, None
+        save()
+        print(f'tablet-pwrkey: ambient ended (exit {result}, restore={restore})', flush=True)
+    def stop(*_):
+        global STOP
+        STOP = True
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop)
+    off_at = now + SCREEN_TIMEOUT if bl() else None
+    down_at, next_scan, last_input = None, 0, now
+    volume_job, volume_deadline, volume_queue = None, 0, []
+    print(f'tablet-pwrkey: screen idle {SCREEN_TIMEOUT:g}s; ambient keyboard idle {IDLE_SECONDS:g}s, checks {CHECK_MIN:g}-{CHECK_MAX:g}s, show {SHOW_MIN:g}-{SHOW_MAX:g}s', flush=True)
+    try:
+        while not STOP:
+            now = time.monotonic()
+            if now >= next_scan:
+                rescan()
+                next_scan = now+RESCAN
+            wait = min(next_scan-now, max(0, state['next_check']-now))
+            if off_at is not None:
+                wait = min(wait, max(0, off_at-now))
+            if ambient is not None:
+                wait = min(wait, 0.1)
+            if buttons is not None or volume_job is not None or volume_queue:
+                wait = min(wait, 0.025)
+            ready, _, _ = select.select(list(devs), [], [], max(0, wait))
+            now = time.monotonic()
+            direction = buttons.poll(now) if buttons is not None else None
+            # Do not block screen/power handling or count volume as typing.
+            if direction is not None and len(volume_queue) < 20:
+                volume_queue.append(direction)
+            if volume_job is not None:
+                if volume_job.poll() is not None:
+                    print(f'tablet-pwrkey: {volume_job.communicate()[0].strip()}', flush=True)
+                    if volume_job.returncode == 0:
+                        volume_until = now+2
+                        if ambient is None and Path('/sys/class/tty/tty0/active').read_text().strip() == 'tty1':
+                            show_volume(volume_until, bl())
+                        elif volume_display:
+                            state['ends_at'] = volume_until
+                            save()
+                    volume_job = None
+                elif now >= volume_deadline:
+                    volume_job.kill()
+                    volume_deadline = float('inf')
+                    volume_queue.clear()
+                    print('tablet-pwrkey: volume update timed out', flush=True)
+            if volume_job is None and volume_queue:
+                try:
+                    volume_job = subprocess.Popen(['/usr/local/sbin/tablet-audio', 'volume', volume_queue.pop(0)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    volume_deadline = now + 2
+                except OSError as error:
+                    print(f'tablet-pwrkey: volume update failed: {error}', flush=True)
+            for fd in ready:
+                ev, kind = devs[fd]
+                try:
+                    data = os.read(fd, EV.size*64)
+                    if not data:
+                        raise OSError('unplugged')
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    os.close(fd)
+                    del devs[fd]
+                    print(f'tablet-pwrkey: {ev} gone', flush=True)
+                    continue
+                for i in range(0, len(data)-EV.size+1, EV.size):
+                    _, _, typ, code, val = EV.unpack_from(data, i)
+                    activity = (typ == EV_KEY and val in (1,2)) or (typ == EV_REL and val != 0) or (kind == 'touch' and typ == EV_ABS)
+                    if activity:
+                        last_input = now
+                        if kind == 'keyboard' and typ == EV_KEY and code < 256 and code != KEY_POWER:
+                            state['last_keyboard'] = now
+                            save()
+                        if ambient is not None:
+                            finish(False)
+                            off_at = now+SCREEN_TIMEOUT
+                    if kind == 'power':
+                        if typ != EV_KEY or code != KEY_POWER:
                             continue
+                        if val == 1:
+                            down_at = now
+                        elif val == 0 and down_at is not None:
+                            held, down_at = now-down_at, None
+                            if held >= 2:
+                                continue
+                            if bl() > 0:
+                                bl(0)
+                                off_at = None
+                            else:
+                                bl(ON_LEVEL)
+                                off_at = now+SCREEN_TIMEOUT
+                    elif activity:
                         if bl() > 0:
-                            bl(0)
-                            off_at = None
-                        else:
+                            off_at = now+SCREEN_TIMEOUT
+                        elif kind in ('keyboard','wake') and ((typ == EV_KEY and val == 1) or typ == EV_REL):
                             bl(ON_LEVEL)
-                            off_at = now + SCREEN_TIMEOUT
-                elif bl() > 0:                 # screen on: any input keeps it on
-                    off_at = now + SCREEN_TIMEOUT
-                elif kind == 'wake' and ((typ == EV_KEY and val == 1) or typ == EV_REL):
-                    bl(ON_LEVEL)               # screen off: key press / mouse move wakes it
-                    off_at = now + SCREEN_TIMEOUT
-                    print('tablet-pwrkey: screen on (input on %s)' % ev, flush=True)
+                            off_at = now+SCREEN_TIMEOUT
+            if ambient is not None and (ambient.poll() is not None or now >= state['ends_at']+(0 if volume_display else 5)):
+                was_volume = volume_display
+                remaining = not was_volume and now < volume_until
+                finish(not remaining)
+                if remaining:
+                    show_volume(volume_until, previous_level)
+                if not was_volume:
+                    off_at = None
+            if off_at is not None and now >= off_at and ambient is None:
+                bl(0)
+                off_at = None
+                print('tablet-pwrkey: screen off (idle)', flush=True)
+            if now >= state['next_check']:
+                rescan()  # include a keyboard plugged in since the last periodic scan
+                state['next_check'] = now+random.uniform(CHECK_MIN,CHECK_MAX)
+                if ENABLED and ambient is None and eligible(now,state['last_keyboard'],last_input,bl()) and Path('/sys/class/tty/tty0/active').read_text().strip() == 'tty1':
+                    duration = random.uniform(SHOW_MIN,SHOW_MAX)
+                    previous_level = bl()
+                    state['previous_level'] = previous_level
+                    save()  # recovery marker must precede framebuffer ownership or wake
+                    ambient = subprocess.Popen(['/usr/local/bin/tablet-sentinel', '--seconds', str(duration)])
+                    state['active_pid'], state['ends_at'] = ambient.pid, now+duration
+                    save()
+                    off_at = None
+                    bl(ON_LEVEL)
+                    print(f'tablet-pwrkey: ambient started pid={ambient.pid}, duration={duration:.2f}s', flush=True)
+                save()
+    finally:
+        try:
+            finish(True)
+        finally:
+            if volume_job is not None:
+                volume_job.kill()
+                volume_job.communicate(timeout=2)
+            for fd in devs:
+                os.close(fd)
+            if buttons is not None:
+                buttons.keypad.close()
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    main()

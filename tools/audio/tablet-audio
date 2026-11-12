@@ -3,7 +3,8 @@
 
   tablet-audio start [freq] [level]   AFE + PMIC codec on, loop a sine from AFE SRAM (amp still OFF)
   tablet-audio amp on|off             AW8736 external speaker amp (GPIO54, mode 3 = 3 pulses)
-  tablet-audio play <file|-> [volume] play anything ffmpeg decodes (file or stdin; default volume 0.3)
+  tablet-audio play <file|-> [volume] play anything ffmpeg decodes (optional initial volume 0..1)
+  tablet-audio volume [up|down|0..100] read/set playback volume without enabling audio (default 30%)
   tablet-audio stop                   amp off, DAC/codec off, AFE off
   tablet-audio status
 
@@ -13,7 +14,42 @@ Path (as stock Android plays to the speaker, register values from a capture duri
   -> MT6353 codec: digital AFE (0x2000..), DAC -> line drivers -> external AW8736 amp -> speaker.
 PMIC sequences follow the stock mt_soc_codec_6353.c (TurnOnDacPower, Speaker_Amp_Change).
 """
-import math, mmap, os, struct, sys, time
+import fcntl, math, mmap, os, struct, sys, time
+from pathlib import Path
+
+VOLUME_PATH = Path(os.environ.get('TABLET_VOLUME_PATH', '/run/tablet-volume'))
+
+
+def output_volume(value=None):
+    if value is not None:
+        with VOLUME_PATH.with_suffix('.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            level = output_volume()
+            level = max(0, min(100, level + (5 if value == 'up' else -5))) if value in ('up', 'down') else int(value)
+            if not 0 <= level <= 100:
+                raise ValueError('volume must be between 0 and 100')
+            temporary = VOLUME_PATH.with_suffix('.tmp')
+            temporary.write_text(str(level) + '\n')
+            temporary.replace(VOLUME_PATH)
+        return level
+    try:
+        level = int(VOLUME_PATH.read_text())
+        if not 0 <= level <= 100:
+            level = 0
+    except FileNotFoundError:
+        level = 30
+    except ValueError:
+        level = 0
+
+    return level
+
+
+# Volume commands never open /dev/mem, enable the codec, or start playback.
+if sys.argv[1:2] == ['volume']:
+    if len(sys.argv) > 3:
+        raise SystemExit('usage: tablet-audio volume [up|down|0..100]')
+    print(f'Playback volume: {output_volume(sys.argv[2] if len(sys.argv) == 3 else None)}%')
+    raise SystemExit(0)
 
 AFE, SRAM, SRAM_SIZE = 0x11220000, 0x11221000, 0xC000
 GPIO = 0x10005000
@@ -247,21 +283,39 @@ def amp(on):
     time.sleep(0.035)                                  # warm-up
 
 
-def play(path, volume):
+def play(path, volume=None):
     """Decode anything ffmpeg reads to 48 kHz stereo and stream it through the SRAM ring."""
     import subprocess
+    import select
     import numpy as np
+    if volume is not None:
+        if not math.isfinite(volume) or not 0 <= volume <= 1:
+            raise ValueError('initial playback volume must be between 0 and 1')
+        output_volume(round(volume * 100))
     dec = subprocess.Popen(["ffmpeg", "-v", "error", "-i", "pipe:0" if path == "-" else path, "-f", "s32le", "-ac", "2", "-ar", "48000", "-"],
-                           stdout=subprocess.PIPE)
+                           stdout=subprocess.PIPE, bufsize=0)
+    pending, eof = bytearray(), False
 
-    def chunk(nbytes):
-        raw = dec.stdout.read(nbytes)
+    def chunk(nbytes, initial=False):
+        nonlocal eof
+        # Once playback starts, a stalled decoder supplies silence, not a stuck ring.
+        while len(pending) < nbytes and not eof:
+            if not select.select([dec.stdout], [], [], None if initial else 0)[0]:
+                break
+            data = dec.stdout.read(nbytes - len(pending))
+            if not data:
+                eof = True
+                break
+            pending.extend(data)
+        count = min(nbytes, len(pending)) & ~7
+        raw = bytes(pending[:count])
+        del pending[:count]
         a = np.frombuffer(raw, dtype="<i4").astype(np.int64)
-        a = np.clip((a >> 8) * volume, -8388608, 8388607).astype(np.int64)
+        a = np.clip((a >> 8) * (output_volume() / 100), -8388608, 8388607).astype(np.int64)
         out = (a & 0xffffff).astype("<u4").tobytes()
-        return out + bytes(nbytes - len(out)), len(raw) == nbytes
+        return out + bytes(nbytes - len(out)), not eof
 
-    first, more = chunk(SRAM_SIZE)
+    first, more = chunk(SRAM_SIZE, initial=True)
     codec_on()
     afe_start(buf=first)
     amp(True)
@@ -305,7 +359,7 @@ if a[0] == "start":
     codec_on()
     afe_start(float(a[1]) if len(a) > 1 else 1000.0, float(a[2]) if len(a) > 2 else 0.3)
 elif a[0] == "play":
-    play(a[1], float(a[2]) if len(a) > 2 else 0.3)
+    play(a[1], float(a[2]) if len(a) > 2 else None)
 elif a[0] == "amp":
     amp(a[1] == "on")
 elif a[0] == "stop":

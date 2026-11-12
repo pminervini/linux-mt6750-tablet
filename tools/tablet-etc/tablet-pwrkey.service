@@ -1,11 +1,14 @@
 [Unit]
-Description=Screen on/off: power key toggles, keyboard/mouse wakes, off after 2 min without input
+Description=Tablet screen controls and keyboard-idle ambient eyes
 After=systemd-udevd.service
 
 [Service]
 ExecStart=/usr/local/sbin/tablet-pwrkey
+Environment=AMBIENT_ENABLED=1 AMBIENT_IDLE_SECONDS=21600 AMBIENT_CHECK_MIN_SECONDS=3600 AMBIENT_CHECK_MAX_SECONDS=10800 AMBIENT_SHOW_MIN_SECONDS=180 AMBIENT_SHOW_MAX_SECONDS=300
 Restart=always
 RestartSec=5
+TimeoutStopSec=10
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

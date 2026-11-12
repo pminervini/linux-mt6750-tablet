@@ -1,0 +1,323 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Monochrome ambient eyes and local telemetry on the native tablet framebuffer.
+
+Run under tablet-pwrkey (which owns wake, idle timing, and input dismissal).
+  tablet-sentinel --seconds 240
+  tablet-sentinel --render /path/preview.png --rotation 1  # no display writes
+Raw pixels follow fbcon rotation; GPS coordinates are never retained or displayed.
+Requires Debian python3-pil and fonts-dejavu-core, already installed on this tablet.
+"""
+import argparse, datetime, fcntl, glob, json, math, mmap, os, random, re, signal, socket, struct, subprocess, time
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
+
+ROTATION = '/sys/class/graphics/fbcon/rotate'
+STATE = os.environ.get('AMBIENT_STATE_PATH', '/run/tablet-ambient.json')
+FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf'
+VOLUME = Path('/run/tablet-volume')
+STOP = False
+
+
+def read(path, default='?'):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+def counters():
+    cpu = {}
+    for row in read('/proc/stat', '').splitlines():
+        name, *fields = row.split()
+        if name.startswith('cpu'):
+            v = list(map(int, fields[:8]))
+            cpu[name] = (sum(v), v[3] + v[4])
+    net = {name: tuple(int(read(f'/sys/class/net/{name}/statistics/{d}_bytes', '0')) for d in ('rx', 'tx')) for name in ('wlan0', 'tun0')}
+    return time.monotonic(), cpu, net
+
+
+def gps_poll(gps):
+    now = time.monotonic()
+    try:
+        if gps['socket'] is None and now >= gps['retry']:
+            gps['socket'] = socket.create_connection(('127.0.0.1', 2947), timeout=0.15)
+            gps['socket'].sendall(b'?WATCH={"enable":true,"json":true};\n')
+            gps['socket'].setblocking(False)
+        if gps['socket'] is not None:
+            while True:
+                chunk = gps['socket'].recv(16384)
+                if not chunk:
+                    raise ConnectionError('gpsd closed')
+                gps['buffer'] += chunk
+                while b'\n' in gps['buffer']:
+                    row, gps['buffer'] = gps['buffer'].split(b'\n', 1)
+                    j = json.loads(row)
+                    if j.get('class') == 'TPV':
+                        # Discard coordinates and all unrelated fields immediately.
+                        gps['mode'], gps['tpv_at'] = j.get('mode'), now
+                        gps['fix_time'] = j.get('time')
+                    elif j.get('class') == 'SKY':
+                        gps['used'] = j.get('uSat', sum(bool(s.get('used')) for s in j.get('satellites', [])))
+                        gps['sky_at'] = now
+                if len(gps['buffer']) > 65536:
+                    raise ValueError('oversized gpsd record')
+    except BlockingIOError:
+        pass
+    except (OSError, ValueError):
+        if gps['socket'] is not None:
+            gps['socket'].close()
+        gps['socket'], gps['buffer'], gps['retry'] = None, b'', now + 5
+
+
+def telemetry(previous, gps):
+    current = counters()
+    dt = max(0.001, current[0] - previous[0])
+    cpu = {}
+    for name, (total, idle) in current[1].items():
+        t0, i0 = previous[1].get(name, (total, idle))
+        cpu[name] = f'{100 * (1 - (idle-i0)/(total-t0)):.1f}%' if total > t0 and dt >= 0.5 else '--'
+    net = {name: tuple(f'{max(0, b-a)/dt/1024:.1f}' if dt >= 0.5 else '--' for a, b in zip(previous[2][name], values)) for name, values in current[2].items()}
+    mem = dict(re.findall(r'(\w+):\s+(\d+) kB', read('/proc/meminfo', '')))
+    used = (int(mem['MemTotal']) - int(mem['MemAvailable'])) / 1024
+    total = int(mem['MemTotal']) / 1024
+    b = '/sys/class/power_supply/battery/'
+    try:
+        amps = int(read(b+'current_now')) / 1e6
+        volts = int(read(b+'voltage_now')) / 1e6
+        power = f'{amps*1000:+.0f}mA {volts:.2f}V {abs(amps*volts):.2f}W'
+        battery_temp = f'{int(read(b+"temp"))/10:.1f}C'
+    except ValueError:
+        power, battery_temp = 'unavailable', '?'
+    temps = {read(p+'/type'): read(p+'/temp') for p in glob.glob('/sys/class/thermal/thermal_zone*')}
+    try:
+        cpu_temp = f'{int(temps["cpu-thermal"])/1000:.1f}C'
+    except (KeyError, ValueError):
+        cpu_temp = '?'
+    disk = os.statvfs('/')
+    uptime = int(float(read('/proc/uptime', '0').split()[0]))
+    try:
+        link = subprocess.run(['/usr/sbin/iw', 'dev', 'wlan0', 'link'], capture_output=True, text=True, timeout=0.5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        link = ''
+    wireless = re.search(r'signal:\s+(-?[\d.]+) dBm', link)
+    wifi = f'{float(wireless[1]):.0f}dBm' if wireless else 'signal unavailable'
+    mode = {1:'no fix', 2:'2D fix', 3:'3D fix'}.get(gps['mode'], 'awaiting reports')
+    age = time.monotonic() - gps['tpv_at']
+    if age > 10:
+        mode = 'stale reports' if gps['tpv_at'] else 'awaiting reports'
+    if gps['mode'] in (2, 3) and gps['fix_time']:
+        try:
+            fix_time = datetime.datetime.fromisoformat(gps['fix_time'].replace('Z', '+00:00'))
+            if abs(time.time() - fix_time.timestamp()) > 15:
+                mode = 'stale fix'
+        except ValueError:
+            mode = 'fix time unknown'
+    sats = str(gps['used']) if time.monotonic()-gps['sky_at'] <= 10 else '?'
+    role_paths = glob.glob('/sys/class/usb_role/*/role')
+    role = read(role_paths[0]) if role_paths else '?'
+    return current, [
+        ('CPU / MEMORY', [f'load {cpu.get("cpu", "--")} / {cpu_temp}', f'RAM {used:.0f}/{total:.0f} MiB', '0-3 '+ ' '.join(cpu.get(f'cpu{i}', '--') for i in range(4)), '4-7 '+ ' '.join(cpu.get(f'cpu{i}', '--') for i in range(4,8)), f'DVFS {read("/run/tablet-cpufreq")}', 'load '+ ' '.join(read('/proc/loadavg', '?').split()[:3])]),
+        ('NETWORK / SYSTEM', [f'wlan RX/TX {"/".join(net["wlan0"])} KiB/s', f'VPN  RX/TX {"/".join(net["tun0"])} KiB/s', f'Wi-Fi {wifi}', f'USB {role} / charger '+read('/sys/class/power_supply/usb/online'), f'disk free {disk.f_bavail*disk.f_frsize/2**30:.1f} GiB', f'up {uptime//86400}d {uptime%86400//3600:02}:{uptime%3600//60:02}:{uptime%60:02}']),
+        ('GPS / POWER', [f'GPS {mode} / {sats} used', 'position hidden', f'battery {read(b+"capacity")}% / {battery_temp}', power, read(b+'status').lower(), f'charge band {read(b+"charge_control_start_threshold")}-{read(b+"charge_control_end_threshold")}%'])
+    ]
+
+
+def background(rotation, sections, ends_at):
+    w, h = (1280, 800) if rotation % 2 else (800, 1280)
+    image = Image.new('L', (w, h), 0)
+    d = ImageDraw.Draw(image)
+    font = ImageFont.truetype(FONT, 16 if w > h else 17)
+    title = ImageFont.truetype(FONT, 18)
+    small = ImageFont.truetype(FONT, 13)
+    margin = 56 if w > h else 36
+    d.text((margin, 40), 'mediatek:~$ sentinel --ambient', font=title, fill=255)
+    clock = time.strftime('%H:%M:%S')
+    d.text((w-margin, 40), clock, anchor='ra', font=title, fill=255)
+    d.line((margin, 85, w-margin, 85), fill=255)
+    d.text((margin, 102), f'MT6750 / NATIVE LINUX / ROTATION {rotation*90:03} DEG', font=small, fill=255)
+    d.text((w-margin, 102), 'CAMERA OFF', anchor='ra', font=small, fill=255)
+    if w > h:
+        positions = [(56, 554), (466, 554), (876, 554)]
+        divider = 534
+    else:
+        positions = [(36, 590), (420, 590), (36, 896)]
+        divider = 566
+    d.line((margin, divider, w-margin, divider), fill=255)
+    for (label, rows), (x,y) in zip(sections, positions):
+        d.text((x,y), label, font=title, fill=255)
+        for n, row in enumerate(rows):
+            d.text((x,y+32+25*n), row, font=font, fill=255)
+    try:
+        state = json.loads(read(STATE, '{}'))
+    except ValueError:
+        state = {}
+    now = time.monotonic()
+    idle = max(0, int(now-state.get('last_keyboard', now)))
+    check = max(0, int(state.get('next_check', now)-now))
+    remaining = max(0, math.ceil(ends_at-now))
+    d.line((margin, h-57, w-margin, h-57), fill=255)
+    d.text((margin,h-37), f'key idle {idle//3600}h{idle%3600//60:02}m / next check {check//60}m / closes {remaining}s', font=small, fill=255)
+    return image
+
+
+def frame(base, offset, openness=1):
+    image = base.copy()
+    d = ImageDraw.Draw(image)
+    w, h = image.size
+    scale = min(w/1280, 1)
+    top = 155 if w > h else 190
+    centre = top + 177*scale
+    for mirrored in (False, True):
+        points = [(160,233),(550,283),(508,404),(305,431),(209,355)]
+        points = [((1280-x if mirrored else x)*scale+offset[0], centre+(y-332)*scale*openness+offset[1]) for x,y in points]
+        d.polygon(points, fill=255)
+    return image
+
+
+def physical(image, rotation):
+    # fbcon 1 is clockwise; Pillow ROTATE_270 is clockwise too.
+    methods = (None, Image.Transpose.ROTATE_270, Image.Transpose.ROTATE_180, Image.Transpose.ROTATE_90)
+    return image.transpose(methods[rotation]) if rotation else image
+
+
+def volume_overlay(image, level):
+    """Selected playback gain, not a measured audio signal."""
+    d = ImageDraw.Draw(image)
+    w, h = image.size
+    width = min(w-72, 640)
+    x, y = (w-width)//2, h-170
+    d.rectangle((x, y, x+width, y+126), fill=0, outline=255, width=2)
+    label = 'VOLUME  0%  /  MUTE' if level == 0 else f'VOLUME  {level}%'
+    d.text((w//2, y+18), label, anchor='ma', font=ImageFont.truetype(FONT, 25), fill=255)
+    for n in range(20):
+        left = x+24+n*(width-48)/20
+        d.rectangle((int(left), y+68, int(left+(width-48)/20-5), y+104),
+                    fill=255 if n*5 < level else 0, outline=255, width=1)
+    return image
+
+
+def volume_status():
+    try:
+        stat = VOLUME.stat()
+        level = int(VOLUME.read_text())
+        if not 0 <= level <= 100:
+            return None
+        return level, stat.st_mtime_ns
+    except (OSError, ValueError):
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--seconds', type=float, default=240)
+    ap.add_argument('--rotation', type=int, choices=range(4), help='fixed orientation for a manual check; default follows tablet-rotate')
+    ap.add_argument('--render', help='save one logical PNG without opening the display')
+    ap.add_argument('--volume-osd', action='store_true', help='brief playback-level overlay, preserving the current screen')
+    a = ap.parse_args()
+    if not 0 < a.seconds <= 300:
+        ap.error('--seconds must be greater than zero and at most 300')
+    gps = dict(socket=None, retry=0, buffer=b'', mode=None, used=None, tpv_at=0, sky_at=0, fix_time=None)
+    previous = counters()
+    tty = fb = mm = None
+    original_mode = None
+    saved_pixels = None
+    started = time.monotonic()
+    frames = 0
+    cpu_started = time.process_time()
+    def stop(*_):
+        global STOP
+        STOP = True
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop)
+    try:
+        if not a.render:
+            if read('/sys/class/tty/tty0/active') != 'tty1':
+                raise RuntimeError('tty1 is not active')
+            if read('/sys/class/graphics/fb0/virtual_size') != '800,1280' or read('/sys/class/graphics/fb0/stride') != '3200' or read('/sys/class/graphics/fb0/bits_per_pixel') != '32':
+                raise RuntimeError('unexpected framebuffer geometry')
+            tty = os.open('/dev/tty1', os.O_RDWR | os.O_NOCTTY)
+            fcntl.flock(tty, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            original_mode = struct.unpack('i', fcntl.ioctl(tty, 0x4B3B, b'\0'*4))[0]
+            if original_mode != 0:
+                raise RuntimeError('console already in graphics mode')
+            fb = os.open('/dev/fb0', os.O_RDWR)
+            mm = mmap.mmap(fb, 3200*1280, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+            if a.volume_osd:
+                saved_pixels = mm[:]
+            fcntl.ioctl(tty, 0x4B3A, 1)
+        next_stats, old_rotation, base = 0, None, None
+        target, origin, moved_at, next_move = (0,0), (0,0), started, started+2
+        blink_at = started + random.uniform(4, 7)
+        deadline = None
+        volume_stamp, volume_until = None, 0
+        # Standalone OSD lifetime belongs to the controller, avoiding expiry/update races.
+        while not STOP and (a.volume_osd or deadline is None or time.monotonic() < deadline):
+            now = time.monotonic()
+            rotation = a.rotation if a.rotation is not None else int(read(ROTATION, '0'))
+            status = volume_status()
+            if status is not None and status[1] != volume_stamp:
+                if volume_stamp is not None or time.time()-status[1]/1e9 < 2:
+                    volume_until = now+2
+                volume_stamp = status[1]
+            if not a.volume_osd:
+                gps_poll(gps)
+            if a.volume_osd:
+                if saved_pixels is not None:
+                    base = Image.frombytes('RGB', (800,1280), saved_pixels, 'raw', 'BGRX')
+                    base = physical(base, (-rotation) % 4)
+                else:
+                    base = Image.new('L', (1280,800) if rotation % 2 else (800,1280))
+            elif now >= next_stats or rotation != old_rotation:
+                previous, sections = telemetry(previous, gps)
+                base = background(rotation, sections, started+a.seconds)
+                if rotation != old_rotation:
+                    print(f'tablet-sentinel: rotation {rotation}, logical {base.width}x{base.height}', flush=True)
+                old_rotation, next_stats = rotation, now+1
+            t = min(1, (now-moved_at)/0.7)
+            eased = t*t*(3-2*t)
+            offset = tuple(origin[i]+(target[i]-origin[i])*eased for i in range(2))
+            if now >= next_move:
+                origin, target, moved_at = offset, (random.randint(-35,35), random.randint(-16,16)), now
+                next_move = now + random.uniform(2, 4)
+            openness = max(0.04, abs(now-blink_at)/0.12) if abs(now-blink_at) < 0.12 else 1
+            if now > blink_at+0.12:
+                blink_at = now+random.uniform(4, 8)
+            image = base.copy() if a.volume_osd else frame(base, offset, openness)
+            if status is not None and (a.volume_osd or now < volume_until):
+                volume_overlay(image, status[0])
+            if a.render:
+                image.save(a.render)
+                break
+            mm[:] = physical(image, rotation).convert('RGBA').tobytes('raw', 'BGRA')
+            if deadline is None:
+                deadline = time.monotonic()+a.seconds
+            frames += 1
+            time.sleep(max(0, 0.1-(time.monotonic()-now)))
+    finally:
+        try:
+            try:
+                if mm is not None:
+                    try:
+                        if saved_pixels is not None:
+                            mm[:] = saved_pixels
+                    finally:
+                        mm.close()
+            finally:
+                if fb is not None:
+                    os.close(fb)
+        finally:
+            if tty is not None:
+                try:
+                    if original_mode == 0:
+                        fcntl.ioctl(tty, 0x4B3A, original_mode)
+                finally:
+                    os.close(tty)
+        if gps['socket'] is not None:
+            gps['socket'].close()
+        elapsed = max(0.001, time.monotonic()-started)
+        print(f'tablet-sentinel: {frames} frames in {elapsed:.2f}s, {frames/elapsed:.1f} fps, {time.process_time()-cpu_started:.2f}s CPU', flush=True)
+
+
+if __name__ == '__main__':
+    main()
