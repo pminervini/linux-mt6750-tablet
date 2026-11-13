@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep SMB traffic to the selected server on its VPN
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/default/tablet-vpn-share
+ExecStart=/bin/sh -ec ': "$${SMB_SERVER:?set SMB_SERVER}" "$${VPN_INTERFACE:?set VPN_INTERFACE}"; /usr/sbin/iptables -C OUTPUT -d "$${SMB_SERVER}/32" -p tcp --dport 445 ! -o "$${VPN_INTERFACE}" -j DROP 2>/dev/null || /usr/sbin/iptables -I OUTPUT 1 -d "$${SMB_SERVER}/32" -p tcp --dport 445 ! -o "$${VPN_INTERFACE}" -j DROP'
+
+[Install]
+WantedBy=multi-user.target

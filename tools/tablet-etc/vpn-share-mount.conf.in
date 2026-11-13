@@ -1,0 +1,8 @@
+[Unit]
+Description=Private SMB share over the VPN
+Requisite=${VPN_SERVICE}
+BindsTo=sys-subsystem-net-devices-${VPN_INTERFACE}.device
+PartOf=${VPN_SERVICE}
+After=${VPN_SERVICE} sys-subsystem-net-devices-${VPN_INTERFACE}.device vpn-share-vpn-guard.service
+Requires=vpn-share-vpn-guard.service
+ConditionPathExists=/sys/class/net/${VPN_INTERFACE}
