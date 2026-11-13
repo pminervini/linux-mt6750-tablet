@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""tablet-audio: speaker playback bring-up for the MT6750 tablet on mainline (no ALSA driver yet).
+"""tablet-audio: MT6750 speaker player, ALSA candidate or guarded raw fallback.
 
   tablet-audio start [freq] [level]   AFE + PMIC codec on, loop a sine from AFE SRAM (amp still OFF)
   tablet-audio amp on|off             AW8736 external speaker amp (GPIO54, mode 3 = 3 pulses)
@@ -7,6 +7,8 @@
   tablet-audio volume [up|down|0..100] read/set playback volume without enabling audio (default 30%)
   tablet-audio stop                   amp off, DAC/codec off, AFE off
   tablet-audio status
+  tablet-audio fm-check               inspect digital-only ALSA backend readiness; no PCM open
+  tablet-audio fm-record SECONDS FILE|-  raw S16_LE stereo/48k FM capture (1..300 s; approved load required)
 
 Path (as stock Android plays to the speaker, register values from a capture during playback):
   AFE DL2 memif (16-bit stereo, 48 kHz, buffer in AFE SRAM 0x11221000..0x1122cfff)
@@ -20,6 +22,19 @@ from pathlib import Path
 VOLUME_PATH = Path(os.environ.get('TABLET_VOLUME_PATH', '/run/tablet-volume'))
 
 
+def kernel_owned():
+    # This remains true while idle and even after a card/probe failure. Only an
+    # explicit module unload permits returning to the raw fallback.
+    return Path('/sys/module/snd_soc_mt6755_tablet').exists()
+
+
+def sync_alsa_volume(level):
+    if kernel_owned():
+        import subprocess
+        subprocess.run(['amixer', '-q', '-c', 'MT6755', 'cset',
+                        'name=PCM Playback Volume', str(level)], check=True, timeout=2)
+
+
 def output_volume(value=None):
     if value is not None:
         with VOLUME_PATH.with_suffix('.lock').open('a') as lock:
@@ -31,6 +46,9 @@ def output_volume(value=None):
             temporary = VOLUME_PATH.with_suffix('.tmp')
             temporary.write_text(str(level) + '\n')
             temporary.replace(VOLUME_PATH)
+            # Keep concurrent side-button updates and mixer commands ordered.
+            # This software control never enables a DAC, stream or amplifier.
+            sync_alsa_volume(level)
         return level
     try:
         level = int(VOLUME_PATH.read_text())
@@ -44,12 +62,122 @@ def output_volume(value=None):
     return level
 
 
+def play_alsa(path, volume=None):
+    """Use the card's real DL2 DMA route; never fall back after an ALSA error."""
+    import subprocess
+    if volume is not None:
+        if not math.isfinite(volume) or not 0 <= volume <= 1:
+            raise ValueError('initial playback volume must be between 0 and 1')
+        output_volume(round(volume * 100))
+    else:
+        with VOLUME_PATH.with_suffix('.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            sync_alsa_volume(output_volume())
+    dec = sink = None
+    try:
+        dec = subprocess.Popen(['ffmpeg', '-v', 'error', '-i', 'pipe:0' if path == '-' else path,
+                                '-f', 's16le', '-ac', '2', '-ar', '48000', '-'],
+                               stdout=subprocess.PIPE, bufsize=0)
+        sink = subprocess.Popen(['aplay', '-q', '-D', 'hw:CARD=MT6755,DEV=0', '-t', 'raw',
+                                 '-f', 'S16_LE', '-c', '2', '-r', '48000'], stdin=dec.stdout)
+        dec.stdout.close()
+        status = sink.wait()
+        if status:
+            raise RuntimeError(f'ALSA playback failed: aplay={status}')
+        decoded = dec.wait()
+        if decoded:
+            raise RuntimeError(f'ALSA playback failed: aplay={status}, ffmpeg={decoded}')
+    finally:
+        def finish(child):
+            if child is not None:
+                if child.poll() is None:
+                    try:
+                        child.terminate()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+        try:
+            finish(sink)
+        finally:
+            try:
+                finish(dec)
+            finally:
+                if dec is not None and dec.stdout is not None:
+                    dec.stdout.close()
+
+
+def fm_check():
+    """Check the existing digital-only ALSA backend without opening a PCM."""
+    import shutil
+    parameters = Path('/sys/module/snd_soc_mt6755_tablet/parameters')
+    if not kernel_owned():
+        raise RuntimeError('FM capture unavailable: MT6755 ALSA module is not loaded')
+    if (parameters/'allow_playback').read_text().strip() != 'N' or (parameters/'legacy_quiesced').read_text().strip() != 'Y':
+        raise RuntimeError('FM capture requires allow_playback=0 and legacy_quiesced=1')
+    if (parameters/'allow_capture').read_text().strip() != 'Y':
+        raise RuntimeError('FM capture is disabled by the module activation policy')
+    card = Path('/proc/asound/MT6755')
+    if (card/'id').read_text().strip() != 'MT6755' or 'stream: CAPTURE' not in (card/'pcm1c/info').read_text().splitlines():
+        raise RuntimeError('FM capture endpoint is unavailable')
+    recorder = shutil.which('arecord')
+    if recorder is None:
+        raise RuntimeError('FM capture requires arecord')
+    return recorder
+
+
+def hardware_admission():
+    """Shared with the approved load/unload command, held for this process.
+
+    An old unguarded deployed helper must be replaced/stopped before a load.
+    /dev/mem access by an unrelated root process cannot be sandboxed here.
+    """
+    lock = Path('/run/tablet-audio-hardware.lock').open('a')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if kernel_owned():
+        command = sys.argv[1:2] or ['status']
+        if command == ['play']:
+            play_alsa(sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else None)
+        elif command == ['status']:
+            print(Path('/sys/bus/platform/devices/mt6755-tablet/analogue_status').read_text(), end='')
+        else:
+            raise SystemExit('ALSA owns the AFE until explicit unload; raw start/amp/stop blocked')
+        raise SystemExit(0)
+    return lock
+
+
 # Volume commands never open /dev/mem, enable the codec, or start playback.
 if sys.argv[1:2] == ['volume']:
     if len(sys.argv) > 3:
         raise SystemExit('usage: tablet-audio volume [up|down|0..100]')
     print(f'Playback volume: {output_volume(sys.argv[2] if len(sys.argv) == 3 else None)}%')
     raise SystemExit(0)
+
+if sys.argv[1:2] in (['fm-check'], ['fm-record']):
+    recording = sys.argv[1] == 'fm-record'
+    if len(sys.argv) != (4 if recording else 2):
+        raise SystemExit('usage: tablet-audio fm-check | fm-record SECONDS FILE|-')
+    if recording:
+        seconds = int(sys.argv[2])
+        if not 1 <= seconds <= 300:
+            raise ValueError('FM capture duration must be 1..300 integer seconds')
+    with Path('/run/tablet-audio-hardware.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        recorder = fm_check()
+        if recording:
+            # Replace this process: the dashboard owns the real recorder PID,
+            # and its admission flock survives exec until capture exits.
+            os.set_inheritable(lock.fileno(), True)
+            os.execv(recorder, [recorder, '-q', '--nonblock', '-D', 'hw:CARD=MT6755,DEV=1',
+                               '-t', 'raw', '-f', 'S16_LE', '-c', '2', '-r', '48000',
+                               '--buffer-size=8192', '--period-size=2048', '-d', str(seconds), '--', sys.argv[3]])
+        print('MT6755 FM capture backend available; hardware reception remains unverified')
+    raise SystemExit(0)
+
+HARDWARE_LOCK = hardware_admission()
 
 AFE, SRAM, SRAM_SIZE = 0x11220000, 0x11221000, 0xC000
 GPIO = 0x10005000
@@ -130,7 +258,8 @@ def aud_pins():
     for p in AUD_PINS:
         reg, i = 0x300 + (p // 10) * 0x10, p % 10
         sh = i * 3 if i < 5 else 16 + (i - 5) * 3
-        wr(gpio, reg, (rd(gpio, reg) & ~(7 << sh)) | (1 << sh))
+        wr(gpio, reg + 8, 7 << sh)                           # MODE_CLR, own pin only
+        wr(gpio, reg + 4, 1 << sh)                           # MODE_SET
         wr(gpio, (p // 32) * 0x10 + 8, 1 << (p % 32))     # DIR_CLR
 
 
@@ -259,7 +388,7 @@ def gpio_out(p, v):
 def gpio_mode0(p):
     reg, i = 0x300 + (p // 10) * 0x10, p % 10
     sh = i * 3 if i < 5 else 16 + (i - 5) * 3
-    wr(gpio, reg, rd(gpio, reg) & ~(7 << sh))
+    wr(gpio, reg + 8, 7 << sh)                               # MODE_CLR, own pin only
 
 
 def amp(on):
@@ -315,12 +444,12 @@ def play(path, volume=None):
         out = (a & 0xffffff).astype("<u4").tobytes()
         return out + bytes(nbytes - len(out)), not eof
 
-    first, more = chunk(SRAM_SIZE, initial=True)
-    codec_on()
-    afe_start(buf=first)
-    amp(True)
-    w, silence_left = 0, None          # write offset == read pointer at start (buffer is full)
     try:
+        first, more = chunk(SRAM_SIZE, initial=True)
+        codec_on()
+        afe_start(buf=first)
+        amp(True)
+        w, silence_left = 0, None      # write offset == read pointer at start (buffer is full)
         while True:
             time.sleep(0.01)
             hw = rd(afe, 0x054) - SRAM
@@ -342,8 +471,16 @@ def play(path, volume=None):
                 sram_write(0, data[end:])
             w = (w + n) % SRAM_SIZE
     finally:
-        amp(False); afe_stop(); codec_off()
-        dec.kill()
+        try:
+            amp(False)
+        finally:
+            try:
+                afe_stop()
+            finally:
+                try:
+                    codec_off()
+                finally:
+                    dec.kill()
 
 
 def status():

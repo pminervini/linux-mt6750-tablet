@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0
+obj-m += mt6750_camera.o
+mt6750_camera-y := mt6750-camera.o

@@ -29,7 +29,8 @@ It is not a polished distribution.
 - FM receiver: tuning/retuning and RDS PI, station name, and RadioText verified under native Debian;
   requires the matching receiver-capable connsys revision and stock DSP firmware (see "Not included").
   FM digital audio capture/playback and reboot persistence are not verified; module loading is manual.
-- speaker audio from userspace (`tools/audio/tablet-audio`, no ALSA driver yet)
+- established userspace speaker path (`tools/audio/tablet-audio`) retained as an
+  unload fallback; the new guarded ALSA deployment keeps playback disabled
 - side-button playback volume in 5% steps, with a rotating two-second bar and percentage
   (`tablet-pwrkey` plus `tablet-sentinel`); zero mutes playback samples. Changing the selected
   level never starts audio. Install the renderer in `/usr/local/bin/` and the controller and
@@ -57,9 +58,15 @@ It is not a polished distribution.
   the kernel config carries the netfilter/overlay/veth pieces it needs
 - cameras: rear OV8856 (8 MP) and front GC2365 (2 MP) take still photos with `tablet-camera`, a
   userspace capture pipeline (sensor -> SENINF -> CAMSV raw dump -> demosaic/AE/AWB) with no kernel
-  camera driver (`tools/camera`)
+  camera driver needed (`tools/camera`); the installed ownership guard refuses this raw path
+  while the new kernel camera owner is loaded
+- standard audio/camera interfaces: the ASoC card/endpoints/mixer and both V4L2 RAW
+  nodes' formats/controls/media topology enumerate; ordinary unload and reload passed.
+  Playback, FM PCM capture, and camera streaming remain disabled. The four-panel
+  muted RF display still works. See [the verified scope](STANDARD-INTERFACES.md).
 
-Not working yet: video and V4L2 cameras (`/dev/video*`), autofocus, CPU frequency scaling beyond
+Not accepted yet: actual PCM/DMA, V4L2 images/video/Bayer phase and app support,
+autofocus, microphone/jack support, reboot persistence, CPU frequency scaling beyond
 the boot loader's operating point (a small userspace governor switches between two points), GPU.
 
 ## Building
@@ -109,7 +116,9 @@ lk boots `recovery` (mainline) when either
 
 ## Not included
 
-Nothing here is MediaTek's or the device vendor's code or firmware; take those from your own device:
+Proprietary firmware and per-device data are not included; take them from your own
+device. Board register sequences derived from GPL BSP source retain their provenance
+in the component READMEs.
 
 - **connsys firmware and NVRAM** (`WIFI_RAM_CODE_6755`, `ROMv2_lm_patch_*`, `WMT_SOC.cfg`, Wi-Fi
   calibration): from the stock `vendor`/`nvdata` partitions.

@@ -1,7 +1,16 @@
 # Cameras on mainline (MT6750 tablet)
 
-Both cameras work with `tablet-camera`: no kernel camera driver yet, the capture pipeline is
-programmed from userspace through `/dev/mem`, with the register values stock Android uses.
+Both cameras have an established still-photo `tablet-camera` path, programmed
+from userspace through `/dev/mem` with the register values stock Android uses.
+
+The V4L2/media-controller RAW candidate in [`v4l2/`](v4l2/README.md) is now installed
+and idle-loaded: both nodes, formats/controls, media topology, and ordinary unload/reload
+passed silent runtime checks. Streaming remains disabled and unvalidated. It preserves these tables and the old capture
+path, uses genuine vb2 buffer ownership and rearmed CAMSV DMA, and unpacks the non-MIPI packing
+to standard SBGGR10. Do not infer working native video or app support from its build/mock tests.
+The source helper now takes a cooperative lock and refuses capture while that candidate is
+loaded; this guard is deployed. Explicitly unload the kernel owner under the same
+lock before using the retained still path. Never run old unguarded experiments concurrently.
 
 | | rear | front |
 |---|---|---|
@@ -16,6 +25,9 @@ programmed from userspace through `/dev/mem`, with the register values stock And
 Supplies (MT6353): VCAMIO 1.8 V, VCAMA 2.8 V, VCAMD 1.22 V (shared by both sensors).
 
 ## Use
+
+The following are capture commands, not idle checks. Use them only with capture
+approval and the kernel camera owner explicitly unloaded; they refuse otherwise.
 
     sudo /usr/local/bin/tablet-camera -o rear.jpg
     sudo /usr/local/bin/tablet-camera --full -o rear-8mp.jpg
@@ -68,10 +80,12 @@ M=$PWD/physbuf ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules`):
 
 ## Not done
 
-No V4L2 driver (no `/dev/video*`, so no standard camera apps); no ISP features (lens shading,
+V4L2 idle registration/enumeration and unload are verified, but real images,
+streaming, Bayer phase, and standard-app acceptance remain open. No ISP features (lens shading,
 denoise, sharpening, autofocus: the rear focus motor on VLDO28 is not driven, so focus is fixed);
 no video; image orientation is the sensor's (rear flipped vertically to undo the mirroring).
-The I2C2 controller has no DT node: I2C is bit-banged from userspace.
+The helper uses the I2C2 controller when its DT node exists (current s7x+ kernels), with a
+userspace bit-bang fallback on older kernels. The candidate requires the real controller.
 
 `cam-up.py`, `cam-stream.py`, `cam-sv.py`, `cam-front.py`, `ov-exp.py`, `raw2png.py` are the
 bring-up experiments, kept for reference.

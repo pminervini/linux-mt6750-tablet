@@ -24,6 +24,25 @@ import argparse, ctypes, fcntl, glob, mmap, os, struct, subprocess, sys, time
 DATA = os.environ.get("TABLET_CAMERA_DATA", "/usr/local/share/tablet-camera")
 PHYSBUF = os.environ.get("TABLET_CAMERA_KO", "/usr/local/lib/tablet-camera/physbuf.ko")
 PMIC = "/sys/kernel/mt6755_pmic/reg"
+def _legacy_guard():
+    """Hold until process exit; the candidate loader must take this same lock.
+
+    The module's mere presence excludes the raw /dev/mem path, including when
+    no V4L2 stream is active. Never bypass this guard to use both paths.
+    """
+    lock = os.open("/run/lock/tablet-camera.lock",
+                   os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.path.isdir("/sys/module/mt6750_camera"):
+            raise RuntimeError("tablet-camera: V4L2 candidate loaded; legacy capture excluded")
+    except BaseException:
+        os.close(lock)
+        raise
+    return lock
+
+
+_legacy_lock = _legacy_guard()
 fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
 
 
