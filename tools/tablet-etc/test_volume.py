@@ -1,6 +1,7 @@
 """Offline tests: hardware and decoder are replaced, except real local pipes."""
 import ast
 import io
+import itertools
 import os
 from pathlib import Path
 import runpy
@@ -327,17 +328,25 @@ class OverlayTests(unittest.TestCase):
 
     def test_bars_and_rotation_bounds(self):
         Image = self.sentinel['Image']
-        for rotation in range(4):
+        for mode, rotation in itertools.product(('L', 'RGB'), range(4)):
             w, h = (1280,800) if rotation % 2 else (800,1280)
+            white, black = (255, 0) if mode == 'L' else ((255,255,255), (0,0,0))
             for level in (0,5,50,100):
-                image = Image.new('L', (w,h))
+                image = Image.new(mode, (w,h))
                 self.sentinel['volume_overlay'](image,level)
                 self.assertEqual(self.sentinel['physical'](image,rotation).size,(800,1280))
                 width = min(w-72,640)
                 for n in range(20):
                     x = int((w-width)//2+24+n*(width-48)/20)+2
-                    self.assertEqual(image.getpixel((x,h-85)),255 if n*5 < level else 0)
+                    self.assertEqual(image.getpixel((x,h-85)),white if n*5 < level else black)
                 self.assertIsNone(image.crop((0,0,w,h-170)).getbbox())
+                if mode == 'RGB':
+                    self.assertTrue(image.tobytes() == image.convert('L').convert('RGB').tobytes())
+
+    def test_rgb_snapshot_outside_overlay_keeps_its_colours(self):
+        image = self.sentinel['Image'].new('RGB', (1280,800), (7,13,29))
+        self.sentinel['volume_overlay'](image,35)
+        self.assertEqual(image.getpixel((0,0)), (7,13,29))
 
     def test_volume_state_missing_invalid_and_fresh(self):
         scope = self.sentinel['volume_status'].__globals__

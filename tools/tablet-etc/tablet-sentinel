@@ -187,13 +187,13 @@ def volume_overlay(image, level):
     w, h = image.size
     width = min(w-72, 640)
     x, y = (w-width)//2, h-170
-    d.rectangle((x, y, x+width, y+126), fill=0, outline=255, width=2)
+    d.rectangle((x, y, x+width, y+126), fill='black', outline='white', width=2)
     label = 'VOLUME  0%  /  MUTE' if level == 0 else f'VOLUME  {level}%'
-    d.text((w//2, y+18), label, anchor='ma', font=ImageFont.truetype(FONT, 25), fill=255)
+    d.text((w//2, y+18), label, anchor='ma', font=ImageFont.truetype(FONT, 25), fill='white')
     for n in range(20):
         left = x+24+n*(width-48)/20
         d.rectangle((int(left), y+68, int(left+(width-48)/20-5), y+104),
-                    fill=255 if n*5 < level else 0, outline=255, width=1)
+                    fill='white' if n*5 < level else 'black', outline='white', width=1)
     return image
 
 
