@@ -34,6 +34,15 @@ It is not a polished distribution.
   (`tablet-pwrkey` plus `tablet-sentinel`); zero mutes playback samples. Changing the selected
   level never starts audio. Install the renderer in `/usr/local/bin/` and the controller and
   audio helper in `/usr/local/sbin/`; the renderer needs `python3-pil` and `fonts-dejavu-core`.
+- ambient eyes with four live telemetry panels (2x2 portrait, four columns landscape),
+  retaining the six-hour keyboard-idle gate, random 1-3-hour checks, and 3-5-minute appearances.
+  An available, unowned FM receiver performs a timestamped sequential RSSI sweep and
+  dwells for received RDS names. Analogue outputs must be off; receiver mute/volume zero
+  remain selected. Missing PCM is labelled unavailable, without invented spectra/levels.
+  Install the HUP-aware `fmctl` from the receiver-capable connsys source in `/usr/local/bin/`;
+  the display neither loads drivers nor enables playback. FM module loading remains manual,
+  and reboot persistence is unverified. Offline checks:
+  `python3 -B -m unittest discover -s tools/tablet-etc -p 'test_*.py' -v`.
 - boot splash: own boot logo (lk), lk's "Orange State" screen and 5 s delay patched out, quiet boot
   with an optional animation until the login prompt, console rotated for landscape
   (`tools/splash`)

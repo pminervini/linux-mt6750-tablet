@@ -8,15 +8,268 @@ Run under tablet-pwrkey (which owns wake, idle timing, and input dismissal).
 Raw pixels follow fbcon rotation; GPS coordinates are never retained or displayed.
 Requires Debian python3-pil and fonts-dejavu-core, already installed on this tablet.
 """
-import argparse, datetime, fcntl, glob, json, math, mmap, os, random, re, signal, socket, struct, subprocess, time
+import argparse, datetime, fcntl, glob, json, math, mmap, os, random, re, signal, socket, struct, subprocess, sys, textwrap, time
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 ROTATION = '/sys/class/graphics/fbcon/rotate'
 STATE = os.environ.get('AMBIENT_STATE_PATH', '/run/tablet-ambient.json')
-FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf'
+FONT = os.environ.get('SENTINEL_TEST_FONT', '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf')
 VOLUME = Path('/run/tablet-volume')
 STOP = False
+
+
+class FM:
+    """One muted tuner: sweep first, then dwell for RDS and digital audio."""
+    def __init__(self, enabled=True):
+        self.tuner = self.capture = None
+        self.samples, self.names, self.bins = {}, {}, []
+        self.buffer, self.pcm = b'', b''
+        self.frequency = self.target = None
+        self.status, self.audio = 'FM unavailable', 'audio unavailable'
+        self.phase, self.deadline, self.audio_at = 'off', 0, 0
+        self.tuned_at, self.rds_pi = 0, None
+        self.capture_ready = False
+        self.capture_status = 'PCM unavailable: kernel FM capture absent'
+        self.audio = self.capture_status
+        self.level_dbfs = self.peak_dbfs = self.clipped = None
+        self.targets = []
+        self.index = 0
+        if not enabled or not Path('/dev/fm').exists():
+            return
+        try:
+            # Do not steal an already-open receiver, or activate an analogue path.
+            busy = subprocess.run(['fuser', '/dev/fm'], capture_output=True, timeout=2)
+            if busy.returncode != 1:
+                raise RuntimeError('receiver busy or ownership unknown')
+            self.silent_preflight()
+            # PCM is optional. The deployed legacy helper treats unknown commands as
+            # status, so require both the module and the new backend's exact reply.
+            if Path('/sys/module/snd_soc_mt6755_tablet').exists():
+                self.capture_status = 'PCM unavailable: backend not verified'
+                try:
+                    check = subprocess.run(['/usr/local/sbin/tablet-audio', 'fm-check'], capture_output=True, text=True, timeout=2)
+                    self.capture_ready = check.returncode == 0 and check.stdout.strip() == 'MT6755 FM capture backend available; hardware reception remains unverified'
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            self.audio = self.capture_status
+            self.tuner = subprocess.Popen(['/usr/local/bin/fmctl', '-m', '87.5'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            os.set_blocking(self.tuner.stdout.fileno(), False)
+            self.target, self.phase, self.status = 8750, 'tuning', 'awaiting tune: 87.5 MHz'
+            self.deadline = time.monotonic()+8
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            self.status = f'FM unavailable: {error}'
+            self.close()
+
+    def silent_preflight(self):
+        """Fail closed on unknown codec state or an enabled amplifier pin.
+
+        The audited legacy status path reads aligned registers and only selects
+        PMIC read addresses. GPIO inspection below maps device memory read-only;
+        it never changes the amplifier, pin mux, or output levels.
+        """
+        status = subprocess.run(['/usr/local/sbin/tablet-audio', 'status'], capture_output=True, text=True, timeout=2)
+        expected = {'PWR_STATUS.audio': '0', 'DAC_CON0': '0x00000000',
+                    'ADDA_DL': '0x00000000', 'AUDDEC0': '0x0000', 'UL_DL': '0x0000'}
+        if status.returncode or any(re.findall(r'(?<!\S)'+re.escape(key)+r'=([^\s]+)', status.stdout) != [value] for key, value in expected.items()):
+            raise RuntimeError('silent preflight failed: codec state unsafe or unknown')
+        fd = os.open('/dev/mem', os.O_RDONLY | os.O_SYNC)
+        try:
+            with mmap.mmap(fd, 4096, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ, offset=0x10005000) as gpio:
+                for pin in (0, 54, 62):
+                    mode_word = struct.unpack_from('<I', gpio, 0x300+(pin//10)*0x10)[0]
+                    index = pin % 10
+                    shift = index*3 if index < 5 else 16+(index-5)*3
+                    output = struct.unpack_from('<I', gpio, 0x100+(pin//32)*0x10)[0]
+                    if (mode_word >> shift) & 7 or (output >> (pin % 32)) & 1:
+                        raise RuntimeError(f'silent preflight failed: GPIO{pin} must be MODE0/DOUT0')
+        finally:
+            os.close(fd)
+
+    def tune(self, frequency, phase):
+        self.stop_capture()
+        # Discard queued old-channel reports before sending the next tune. A
+        # matching acknowledgement is still required before consuming new data.
+        drained = 0
+        while True:
+            try:
+                pending = os.read(self.tuner.stdout.fileno(), 16384)
+            except BlockingIOError:
+                break
+            if not pending:
+                raise RuntimeError('receiver exited before retune')
+            drained += len(pending)
+            if drained > 65536:
+                raise RuntimeError('oversized receiver output before retune')
+        self.target, self.frequency, self.phase = frequency, None, phase
+        self.tuned_at, self.rds_pi, self.buffer = 0, None, b''
+        # Retained band labels keep their old observation times; revisiting this
+        # channel cannot present an old name as a newly decoded current station.
+        self.names.pop(frequency, None)
+        self.status = f'awaiting tune: {frequency/100:.1f} MHz'
+        self.bins, self.audio = [], ('audio waiting for station dwell' if self.capture_ready else self.capture_status)
+        self.level_dbfs = self.peak_dbfs = self.clipped = None
+        self.audio_at = 0
+        self.tuner.stdin.write(f't {frequency/100:.2f}\nr\n'.encode())
+        self.tuner.stdin.flush()
+        self.deadline = time.monotonic()+8
+
+    def stop_capture(self):
+        if self.capture is not None:
+            if self.capture.poll() is None:
+                self.capture.terminate()
+            try:
+                self.capture.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.capture.kill()
+                self.capture.wait(timeout=1)
+            self.capture.stdout.close()
+            self.capture = None
+        self.pcm = b''
+
+    def poll(self):
+        if self.tuner is None:
+            return
+        now = time.monotonic()
+        try:
+            if self.tuner.poll() is not None:
+                raise RuntimeError('receiver exited')
+            try:
+                self.buffer += os.read(self.tuner.stdout.fileno(), 16384)
+            except BlockingIOError:
+                pass
+            if len(self.buffer) > 65536:
+                raise RuntimeError('oversized receiver output')
+            while b'\n' in self.buffer:
+                raw, self.buffer = self.buffer.split(b'\n', 1)
+                line = raw.decode('ascii', errors='replace')
+                if line.startswith('tuned '):
+                    frequency = round(float(line.split()[1])*100)
+                    if frequency != self.target:
+                        raise RuntimeError('unexpected tuned frequency')
+                    self.frequency, self.tuned_at = frequency, now
+                elif line.startswith('rssi ') and self.frequency is not None:
+                    rssi = int(line.split()[1])
+                    self.samples[self.frequency] = (rssi, now)
+                    if self.phase == 'tuning':
+                        self.phase, self.deadline = 'sweep', now+0.12
+                    elif self.phase == 'station-tuning':
+                        self.phase, self.deadline = 'dwell', now+6
+                        if self.capture_ready:
+                            try:
+                                import numpy  # Optional transform dependency, never an RF prerequisite.
+                                self.capture = subprocess.Popen(['/usr/local/sbin/tablet-audio', 'fm-record', '5', '-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                os.set_blocking(self.capture.stdout.fileno(), False)
+                                self.audio = 'starting digital capture'
+                            except (OSError, ImportError):
+                                self.stop_capture()
+                                self.audio = 'FM digital capture unavailable'
+                        else:
+                            self.audio = self.capture_status
+                elif line.startswith('rds PI ') and self.frequency is not None and self.phase in ('station-tuning', 'dwell'):
+                    pi = int(line.split()[2], 16)
+                    if pi != self.rds_pi:
+                        self.names.pop(self.frequency, None)
+                    self.rds_pi = pi
+                elif line.startswith('rds PS "') and self.frequency is not None and self.phase in ('station-tuning', 'dwell') and self.rds_pi is not None:
+                    name = line[len('rds PS "'):].rstrip('"').strip()
+                    if name:
+                        self.names[self.frequency] = (name[:8], now)
+                elif any(line.startswith(prefix) for prefix in ('tune:', 'power up:', 'muted startup:', 'mute:', 'volume:', 'rssi:')):
+                    raise RuntimeError('receiver command failed')
+            if self.capture is not None:
+                try:
+                    chunk = os.read(self.capture.stdout.fileno(), 65536)
+                    new_frames = (len(self.pcm) % 4 + len(chunk)) // 4
+                    self.pcm += chunk
+                    if len(self.pcm) > 16384:
+                        self.pcm = self.pcm[((len(self.pcm)-16384+3)//4)*4:]
+                    if len(self.pcm) >= 4096 and new_frames:
+                        import numpy as np
+                        complete = len(self.pcm)//4*4
+                        stereo = np.frombuffer(self.pcm[complete-4096:complete], dtype='<i2').reshape(-1, 2).astype(float)/32768
+                        self.level_dbfs = float(20*np.log10(max(float(np.sqrt(np.mean(stereo**2))), 1e-6)))
+                        self.peak_dbfs = float(20*np.log10(max(float(np.abs(stereo).max()), 1e-6)))
+                        self.clipped = bool(np.any(np.abs(stereo) >= 32767/32768))
+                        pcm = stereo.mean(axis=1)
+                        spectrum = np.abs(np.fft.rfft(pcm*np.hanning(len(pcm))))*4/len(pcm)
+                        edges = np.geomspace(1, len(spectrum)-1, 41).astype(int)
+                        self.bins = [float(20*np.log10(max(float(spectrum[a:max(a+1,b)].max()), 1e-6))) for a,b in zip(edges, edges[1:])]
+                        self.audio_at = now
+                        self.audio = 'FM audio / dBFS' if np.any(stereo) else 'digital silence / no audio signal'
+                except BlockingIOError:
+                    pass
+                if self.capture.poll() is not None:
+                    if self.capture.returncode or not self.pcm:
+                        self.audio, self.bins = 'FM digital capture unavailable', []
+                        self.level_dbfs = self.peak_dbfs = self.clipped = None
+                        self.audio_at = 0
+                    self.stop_capture()
+            if self.bins and now-self.audio_at > 0.5:
+                self.bins = []
+                self.level_dbfs = self.peak_dbfs = self.clipped = None
+                self.audio = 'audio capture ended / not live'
+            if now >= self.deadline:
+                if self.phase in ('tuning', 'station-tuning'):
+                    raise RuntimeError('tuner response timeout')
+                if self.phase == 'sweep':
+                    if self.target < 10800:
+                        self.tune(self.target+10, 'tuning')
+                    else:
+                        # Separate nearby peaks; decode names over the air, never guess.
+                        self.targets = []
+                        for frequency in sorted(self.samples, key=lambda f: self.samples[f][0], reverse=True):
+                            if all(abs(frequency-other) >= 20 for other in self.targets):
+                                self.targets.append(frequency)
+                            if len(self.targets) == 8:
+                                break
+                        self.index = 0
+                        self.tune(self.targets[0], 'station-tuning')
+                elif self.phase == 'dwell':
+                    self.index += 1
+                    if self.index < len(self.targets):
+                        self.tune(self.targets[self.index], 'station-tuning')
+                    else:
+                        self.tune(8750, 'tuning')
+            if self.phase in ('tuning', 'station-tuning'):
+                self.status = f'awaiting tune: {self.target/100:.1f} MHz'
+            else:
+                self.status = 'RDS dwell' if self.phase == 'dwell' else 'sequential band sweep'
+        except (OSError, ValueError, RuntimeError, ImportError, subprocess.TimeoutExpired) as error:
+            self.status, self.audio, self.bins = f'FM stopped: {error}', 'audio unavailable', []
+            self.close()
+
+    def close(self):
+        self.frequency = self.target = None
+        self.phase, self.rds_pi = 'off', None
+        self.bins = []
+        self.level_dbfs = self.peak_dbfs = self.clipped = None
+        self.audio_at = 0
+        try:
+            self.stop_capture()
+        finally:
+            if self.tuner is not None:
+                try:
+                    if self.tuner.poll() is None:
+                        self.tuner.stdin.write(b'q\n')
+                        self.tuner.stdin.flush()
+                except (OSError, ValueError):
+                    pass
+                try:
+                    self.tuner.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    self.tuner.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    self.tuner.terminate()
+                    try:
+                        self.tuner.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        self.tuner.kill()
+                        self.tuner.wait(timeout=0.5)
+                self.tuner.stdout.close()
+                self.tuner = None
 
 
 def read(path, default='?'):
@@ -116,18 +369,42 @@ def telemetry(previous, gps):
     sats = str(gps['used']) if time.monotonic()-gps['sky_at'] <= 10 else '?'
     role_paths = glob.glob('/sys/class/usb_role/*/role')
     role = read(role_paths[0]) if role_paths else '?'
+    try:
+        failed = subprocess.run(['systemctl', '--failed', '--no-legend', '--plain', '--no-pager'], capture_output=True, text=True, timeout=0.5)
+        failed_count = str(len(failed.stdout.splitlines())) if failed.returncode == 0 else 'unknown'
+    except (OSError, subprocess.TimeoutExpired):
+        failed_count = 'unknown'
+    warnings = []
+    # Display-only low-battery indication; this does not change power policy.
+    capacity = read(b+'capacity')
+    if capacity.isdigit() and int(capacity) <= 15:
+        warnings.append('battery <=15%')
+    health = read(b+'health', 'unknown').lower()
+    if health not in ('good', 'unknown'):
+        warnings.append('battery '+health)
+    for path in glob.glob('/sys/class/thermal/thermal_zone*'):
+        for trip in glob.glob(path+'/trip_point_*_type'):
+            limit = read(trip.replace('_type', '_temp'), '')
+            value = read(path+'/temp', '')
+            if read(trip) in ('hot', 'critical') and limit.isdigit() and value.isdigit() and int(value) >= int(limit):
+                warnings.append('thermal '+read(trip))
+    if cpu_temp == '?' or battery_temp == '?' or not capacity.isdigit():
+        warnings.append('sensor missing')
+    if health == 'unknown':
+        warnings.append('battery health unknown')
     return current, [
         ('CPU / MEMORY', [f'load {cpu.get("cpu", "--")} / {cpu_temp}', f'RAM {used:.0f}/{total:.0f} MiB', '0-3 '+ ' '.join(cpu.get(f'cpu{i}', '--') for i in range(4)), '4-7 '+ ' '.join(cpu.get(f'cpu{i}', '--') for i in range(4,8)), f'DVFS {read("/run/tablet-cpufreq")}', 'load '+ ' '.join(read('/proc/loadavg', '?').split()[:3])]),
         ('NETWORK / SYSTEM', [f'wlan RX/TX {"/".join(net["wlan0"])} KiB/s', f'VPN  RX/TX {"/".join(net["tun0"])} KiB/s', f'Wi-Fi {wifi}', f'USB {role} / charger '+read('/sys/class/power_supply/usb/online'), f'disk free {disk.f_bavail*disk.f_frsize/2**30:.1f} GiB', f'up {uptime//86400}d {uptime%86400//3600:02}:{uptime%3600//60:02}:{uptime%60:02}']),
-        ('GPS / POWER', [f'GPS {mode} / {sats} used', 'position hidden', f'battery {read(b+"capacity")}% / {battery_temp}', power, read(b+'status').lower(), f'charge band {read(b+"charge_control_start_threshold")}-{read(b+"charge_control_end_threshold")}%'])
+        ('GPS / POWER', [f'GPS {mode} / {sats} used', 'position hidden', f'battery {capacity}% / {battery_temp}', power, read(b+'status').lower(), f'charge band {read(b+"charge_control_start_threshold")}-{read(b+"charge_control_end_threshold")}%']),
+        ('HEALTH / AUDIO', [f'failed services: {failed_count}', 'warnings: '+(', '.join(dict.fromkeys(warnings)) or 'none observed'), 'GPS data: '+('stale/unknown' if age > 10 or mode in ('stale fix', 'fix time unknown') else 'fresh')])
     ]
 
 
-def background(rotation, sections, ends_at):
+def background(rotation, sections, ends_at, fm=None):
     w, h = (1280, 800) if rotation % 2 else (800, 1280)
     image = Image.new('L', (w, h), 0)
     d = ImageDraw.Draw(image)
-    font = ImageFont.truetype(FONT, 16 if w > h else 17)
+    font = ImageFont.truetype(FONT, 14 if w > h else 17)
     title = ImageFont.truetype(FONT, 18)
     small = ImageFont.truetype(FONT, 13)
     margin = 56 if w > h else 36
@@ -137,17 +414,83 @@ def background(rotation, sections, ends_at):
     d.line((margin, 85, w-margin, 85), fill=255)
     d.text((margin, 102), f'MT6750 / NATIVE LINUX / ROTATION {rotation*90:03} DEG', font=small, fill=255)
     d.text((w-margin, 102), 'CAMERA OFF', anchor='ra', font=small, fill=255)
+    now = time.monotonic()
+    audio_age = now-fm.audio_at if fm is not None and fm.audio_at else None
+    fresh_audio = bool(fm is not None and fm.bins and audio_age is not None and audio_age <= 0.5)
+    if fm is not None:
+        top = 327 if w > h else 380
+        frequency = f'{fm.frequency/100:.1f} MHz' if fm.frequency is not None else '-- MHz'
+        name, named_at = fm.names.get(fm.frequency, ('RDS awaiting name', 0))
+        if named_at < fm.tuned_at:
+            name, named_at = 'RDS awaiting name', 0
+        if named_at:
+            name += f' ({max(0, int(time.monotonic()-named_at))}s)'
+        d.text((margin, top), f'FM {frequency} / {name} / {fm.status}'[:100 if w > h else 78], font=small, fill=255)
+        left, right, bottom = margin, w-margin, top+84
+        d.line((left, bottom, right, bottom), fill=255)
+        now = time.monotonic()
+        for frequency, (rssi, measured) in fm.samples.items():
+            x = left+(right-left)*(frequency-8750)/2050
+            height = max(0, min(1, (rssi+120)/80))*48
+            d.line((x, bottom-height, x, bottom), fill=255 if now-measured < 120 else 100, width=2)
+        for frequency, (name, measured) in sorted(fm.names.items())[:8]:
+            x = left+(right-left)*(frequency-8750)/2050
+            d.text((max(left, min(right-70, x)), top+20+(frequency//10%2)*15), name, font=small, fill=255 if now-measured < 120 else 100)
+        d.text((left, bottom+3), '87.5', font=small, fill=255)
+        ages = [max(0, now-measured) for _, measured in fm.samples.values()]
+        youngest, oldest = min(ages, default=0), max(ages, default=0)
+        d.text((right, bottom+3), f'108 MHz / -120..-40 dBm / age {youngest:.0f}..{oldest:.0f}s', anchor='ra', font=small, fill=255)
+        audio_top, audio_bottom = top+112, top+159
+        audio_label = 'audio stale / not live' if audio_age is not None and audio_age > 0.5 else fm.audio
+        d.text((left, audio_top), audio_label, font=small, fill=255)
+        d.text((right, audio_top), '47 Hz - 24 kHz / -90..0 dBFS', anchor='ra', font=small, fill=255)
+        for i, value in enumerate(fm.bins if fresh_audio else []):
+            x = left+(right-left)*i/len(fm.bins)
+            height = max(0, min(1, (value+90)/90))*29
+            d.rectangle((x, audio_bottom-height, x+(right-left)/len(fm.bins)-3, audio_bottom), fill=255)
     if w > h:
-        positions = [(56, 554), (466, 554), (876, 554)]
+        positions = [(56, 548), (354, 548), (652, 548), (950, 548)]
+        panel_width, line_height = 274, 20
         divider = 534
     else:
-        positions = [(36, 590), (420, 590), (36, 896)]
+        positions = [(36, 590), (420, 590), (36, 896), (420, 896)]
+        panel_width, line_height = 344, 25
         divider = 566
+    sections = [(label, list(rows)) for label, rows in sections]
+    if len(sections) == 3:
+        sections.append(('HEALTH / AUDIO', ['failed services: not sampled', 'warnings: not sampled', 'GPS data: not sampled']))
+    if fresh_audio and fm.level_dbfs is not None:
+        audio_rows = ['capture: '+('digital silence' if fm.peak_dbfs <= -120 else 'live PCM'), f'RMS {fm.level_dbfs:.1f} / peak {fm.peak_dbfs:.1f} dBFS', f'clip {"YES" if fm.clipped else "no"} / age {audio_age:.1f}s']
+    else:
+        state = 'unavailable' if fm is None else ('stale / not live' if audio_age is not None and audio_age > 0.5 else fm.audio)
+        audio_rows = ['capture: '+state, 'RMS / peak: unavailable', 'clip: unknown / age '+(f'{audio_age:.1f}s' if audio_age is not None else '--')]
+    sections[3][1].extend(audio_rows)
     d.line((margin, divider, w-margin, divider), fill=255)
     for (label, rows), (x,y) in zip(sections, positions):
-        d.text((x,y), label, font=title, fill=255)
-        for n, row in enumerate(rows):
-            d.text((x,y+32+25*n), row, font=font, fill=255)
+        d.text((x,y), label, font=ImageFont.truetype(FONT, 16) if w > h else title, fill=255)
+        panel_font = font
+        bottom = (862 if y == 590 else h-70) if w < h else h-70
+        meter_space = 16 if label == 'HEALTH / AUDIO' and fresh_audio else 0
+        # Shrink only this panel's font when many real warnings wrap. Never
+        # squeeze baselines closer than the font's height or drop warning rows.
+        while True:
+            lines = [line for row in rows for line in textwrap.wrap(row, width=int(panel_width/panel_font.getlength('M')))]
+            spacing = min(line_height, panel_font.size+5)
+            if y+32+spacing*len(lines)+meter_space <= bottom:
+                break
+            if panel_font.size <= 9:
+                raise ValueError(f'telemetry panel exceeds readable cell: {label}')
+            panel_font = ImageFont.truetype(FONT, panel_font.size-1)
+        for n, line in enumerate(lines):
+            d.text((x,y+32+spacing*n), line, font=panel_font, fill=255)
+        if label == 'HEALTH / AUDIO' and fresh_audio and fm.level_dbfs is not None:
+            meter_y = y+32+spacing*len(lines)+3
+            d.rectangle((x, meter_y, x+panel_width, meter_y+6), outline=255)
+            level = max(0, min(1, (fm.level_dbfs+90)/90))*panel_width
+            peak = max(0, min(1, (fm.peak_dbfs+90)/90))*panel_width
+            if level > 0:
+                d.rectangle((x, meter_y, x+level, meter_y+6), fill=255)
+            d.line((x+peak, meter_y-2, x+peak, meter_y+8), fill=255)
     try:
         state = json.loads(read(STATE, '{}'))
     except ValueError:
@@ -161,16 +504,18 @@ def background(rotation, sections, ends_at):
     return image
 
 
-def frame(base, offset, openness=1):
+def frame(base, offset, openness=1, compact=False):
     image = base.copy()
     d = ImageDraw.Draw(image)
     w, h = image.size
     scale = min(w/1280, 1)
     top = 155 if w > h else 190
     centre = top + 177*scale
+    if compact and w > h:
+        centre = 225
     for mirrored in (False, True):
         points = [(160,233),(550,283),(508,404),(305,431),(209,355)]
-        points = [((1280-x if mirrored else x)*scale+offset[0], centre+(y-332)*scale*openness+offset[1]) for x,y in points]
+        points = [((1280-x if mirrored else x)*scale+offset[0], centre+(y-332)*scale*openness*(0.6 if compact and w > h else 1)+offset[1]) for x,y in points]
         d.polygon(points, fill=255)
     return image
 
@@ -212,16 +557,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--seconds', type=float, default=240)
     ap.add_argument('--rotation', type=int, choices=range(4), help='fixed orientation for a manual check; default follows tablet-rotate')
-    ap.add_argument('--render', help='save one logical PNG without opening the display')
-    ap.add_argument('--volume-osd', action='store_true', help='brief playback-level overlay, preserving the current screen')
+    modes = ap.add_mutually_exclusive_group()
+    modes.add_argument('--fm-probe', type=float, metavar='SECONDS', help='bounded muted RF probe; JSON only, no display or GPS')
+    modes.add_argument('--render', help='save one logical PNG without opening the display')
+    modes.add_argument('--volume-osd', action='store_true', help='brief playback-level overlay, preserving the current screen')
     a = ap.parse_args()
     if not 0 < a.seconds <= 300:
         ap.error('--seconds must be greater than zero and at most 300')
+    if a.fm_probe is not None and not 0 < a.fm_probe <= 300:
+        ap.error('--fm-probe must be greater than zero and at most 300')
     gps = dict(socket=None, retry=0, buffer=b'', mode=None, used=None, tpv_at=0, sky_at=0, fix_time=None)
     previous = counters()
     tty = fb = mm = None
     original_mode = None
     saved_pixels = None
+    fm = None
     started = time.monotonic()
     frames = 0
     cpu_started = time.process_time()
@@ -231,6 +581,18 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, stop)
     try:
+        if a.fm_probe is not None:
+            fm = FM()
+            probe_deadline = started+a.fm_probe
+            while not STOP and time.monotonic() < probe_deadline:
+                fm.poll()
+                time.sleep(min(0.1, max(0, probe_deadline-time.monotonic())))
+            # These are receiver/PCM observations, never GPS coordinates.
+            print(json.dumps(dict(status=fm.status, phase=fm.phase, frequency=fm.frequency,
+                                  audio=fm.audio, samples=fm.samples, names=fm.names,
+                                  bins=fm.bins, audio_at=fm.audio_at, rms_dbfs=fm.level_dbfs,
+                                  peak_dbfs=fm.peak_dbfs, clipped=fm.clipped)), flush=True)
+            return
         if not a.render:
             if read('/sys/class/tty/tty0/active') != 'tty1':
                 raise RuntimeError('tty1 is not active')
@@ -246,7 +608,10 @@ def main():
             if a.volume_osd:
                 saved_pixels = mm[:]
             fcntl.ioctl(tty, 0x4B3A, 1)
+        if not a.volume_osd:
+            fm = FM(enabled=not a.render)
         next_stats, old_rotation, base = 0, None, None
+        old_fm_view, next_draw = None, 0
         target, origin, moved_at, next_move = (0,0), (0,0), started, started+2
         blink_at = started + random.uniform(4, 7)
         deadline = None
@@ -262,18 +627,24 @@ def main():
                 volume_stamp = status[1]
             if not a.volume_osd:
                 gps_poll(gps)
+                fm.poll()
             if a.volume_osd:
                 if saved_pixels is not None:
                     base = Image.frombytes('RGB', (800,1280), saved_pixels, 'raw', 'BGRX')
                     base = physical(base, (-rotation) % 4)
                 else:
                     base = Image.new('L', (1280,800) if rotation % 2 else (800,1280))
-            elif now >= next_stats or rotation != old_rotation:
-                previous, sections = telemetry(previous, gps)
-                base = background(rotation, sections, started+a.seconds)
-                if rotation != old_rotation:
-                    print(f'tablet-sentinel: rotation {rotation}, logical {base.width}x{base.height}', flush=True)
-                old_rotation, next_stats = rotation, now+1
+            else:
+                if now >= next_stats or rotation != old_rotation:
+                    previous, sections = telemetry(previous, gps)
+                    next_stats = now+1
+                fm_view = (fm.frequency, fm.status, fm.audio, fm.audio_at,
+                           bool(fm.audio_at and now-fm.audio_at <= 0.5), len(fm.samples), len(fm.names))
+                if now >= next_draw or rotation != old_rotation or fm_view != old_fm_view:
+                    base = background(rotation, sections, started+a.seconds, fm)
+                    if rotation != old_rotation:
+                        print(f'tablet-sentinel: rotation {rotation}, logical {base.width}x{base.height}', flush=True)
+                    old_rotation, old_fm_view, next_draw = rotation, fm_view, now+0.25
             t = min(1, (now-moved_at)/0.7)
             eased = t*t*(3-2*t)
             offset = tuple(origin[i]+(target[i]-origin[i])*eased for i in range(2))
@@ -283,7 +654,7 @@ def main():
             openness = max(0.04, abs(now-blink_at)/0.12) if abs(now-blink_at) < 0.12 else 1
             if now > blink_at+0.12:
                 blink_at = now+random.uniform(4, 8)
-            image = base.copy() if a.volume_osd else frame(base, offset, openness)
+            image = base.copy() if a.volume_osd else frame(base, offset, openness, compact=True)
             if status is not None and (a.volume_osd or now < volume_until):
                 volume_overlay(image, status[0])
             if a.render:
@@ -296,27 +667,34 @@ def main():
             time.sleep(max(0, 0.1-(time.monotonic()-now)))
     finally:
         try:
-            try:
-                if mm is not None:
-                    try:
-                        if saved_pixels is not None:
-                            mm[:] = saved_pixels
-                    finally:
-                        mm.close()
-            finally:
-                if fb is not None:
-                    os.close(fb)
+            if fm is not None:
+                fm.close()
         finally:
-            if tty is not None:
+            try:
                 try:
-                    if original_mode == 0:
-                        fcntl.ioctl(tty, 0x4B3A, original_mode)
+                    try:
+                        if mm is not None:
+                            try:
+                                if saved_pixels is not None:
+                                    mm[:] = saved_pixels
+                            finally:
+                                mm.close()
+                    finally:
+                        if fb is not None:
+                            os.close(fb)
                 finally:
-                    os.close(tty)
-        if gps['socket'] is not None:
-            gps['socket'].close()
-        elapsed = max(0.001, time.monotonic()-started)
-        print(f'tablet-sentinel: {frames} frames in {elapsed:.2f}s, {frames/elapsed:.1f} fps, {time.process_time()-cpu_started:.2f}s CPU', flush=True)
+                    if tty is not None:
+                        try:
+                            if original_mode == 0:
+                                fcntl.ioctl(tty, 0x4B3A, original_mode)
+                        finally:
+                            os.close(tty)
+            finally:
+                if gps['socket'] is not None:
+                    gps['socket'].close()
+                elapsed = max(0.001, time.monotonic()-started)
+                print(f'tablet-sentinel: {frames} frames in {elapsed:.2f}s, {frames/elapsed:.1f} fps, {time.process_time()-cpu_started:.2f}s CPU', file=sys.stderr, flush=True)
+
 
 
 if __name__ == '__main__':
