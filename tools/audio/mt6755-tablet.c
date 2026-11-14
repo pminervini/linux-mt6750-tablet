@@ -56,6 +56,7 @@ struct mt_audio {
 	struct mt_stream stream[2];
 	unsigned int users, volume;
 	u32 saved_top;
+	u32 saved_fm[ARRAY_SIZE(mt_fm_config)];
 	bool powered_before, codec_on, fault;
 	struct gpio_desc *pins[6];
 	struct gpio_device *gpio_device;
@@ -377,6 +378,7 @@ static int mt_sync_stop(struct snd_soc_component *c, struct snd_pcm_substream *s
 {
 	struct mt_stream *s = mt_get_stream(c, substream);
 	struct mt_audio *a = s->audio;
+	unsigned int i;
 	int ret = 0;
 
 	hrtimer_cancel(&s->timer);
@@ -384,6 +386,13 @@ static int mt_sync_stop(struct snd_soc_component *c, struct snd_pcm_substream *s
 	if (!substream->stream) {
 		ret = mt_codec_off(a);
 		mt_update(a, 0, BIT(25) | BIT(26), a->saved_top);
+	} else if (s->prepared) {
+		/* STOP disabled AWB/I2S/ASRC; restore configuration, never enables.
+		 * Use masks so a concurrent playback START/STOP keeps its fields.
+		 */
+		for (i = 0; i < ARRAY_SIZE(mt_fm_config); i++)
+			mt_update(a, mt_fm_config[i].reg, mt_fm_config[i].mask,
+				  a->saved_fm[i]);
 	}
 	s->prepared = false;
 	mutex_unlock(&a->mutex);
@@ -470,10 +479,15 @@ static int mt_prepare(struct snd_soc_component *c, struct snd_pcm_substream *sub
 	dma_wmb();
 	writel(lower_32_bits(s->dma), a->afe + base);
 	writel(lower_32_bits(s->dma + s->allocated - 1), a->afe + base + 8);
-	mt_update(a, 0x0cc, substream->stream ? BIT(3) : BIT(1), 0);
 	if (substream->stream) {
+		/* Read all fields before any config writes (some masks overlap).
+		 * prepared commits this snapshot after the infallible MMIO setup.
+		 */
+		for (i = 0; i < ARRAY_SIZE(mt_fm_config); i++)
+			a->saved_fm[i] = readl(a->afe + mt_fm_config[i].reg);
 		AFE_STEPS(a, mt_fm_config);
 	} else {
+		mt_update(a, 0x0cc, BIT(1), 0);
 		for (i = 0; i < ARRAY_SIZE(mt_pins); i++) {
 			mt_pin_mode(a, mt_pins[i], i < 3 ? 0 : 1);
 			if (i >= 3)
@@ -673,8 +687,7 @@ static void mt_free_pins(void *data)
 /* The owner reports actual idle registers; never invent a silence attestation.
  * Use the serialized PMIC API, not the global userspace debug-address selector.
  */
-static ssize_t analogue_status_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
+static ssize_t mt_status_show(struct device *dev, char *buf, bool idle_only)
 {
 	struct snd_soc_card *card = dev_get_drvdata(dev);
 	struct mt_audio *a = snd_soc_card_get_drvdata(card);
@@ -683,7 +696,7 @@ static ssize_t analogue_status_show(struct device *dev,
 
 	mutex_lock(&a->mutex);
 	ret = -EBUSY;
-	if (a->users)
+	if (idle_only && a->users)
 		goto out;
 	ret = mt6755_pmic_read(0x0cf2, &auddec);
 	if (ret)
@@ -691,16 +704,40 @@ static ssize_t analogue_status_show(struct device *dev,
 	ret = mt6755_pmic_read(0x2000, &ul_dl);
 	if (ret)
 		goto out;
-	ret = sysfs_emit(buf,
-		"PWR_STATUS.audio=%u DAC_CON0=0x%08x ADDA_DL=0x%08x AUDDEC0=0x%04x UL_DL=0x%04x\n",
-		!!(readl(a->spm + 0x180) & BIT(24)), readl(a->afe + 0x010),
-		readl(a->afe + 0x108), auddec, ul_dl);
-out:
+	if (idle_only)
+		ret = sysfs_emit(buf,
+			"PWR_STATUS.audio=%u DAC_CON0=0x%08x ADDA_DL=0x%08x AUDDEC0=0x%04x UL_DL=0x%04x\n",
+			!!(readl(a->spm + 0x180) & BIT(24)), readl(a->afe + 0x010),
+			readl(a->afe + 0x108), auddec, ul_dl);
+	else
+		ret = sysfs_emit(buf,
+			"users=%u capture_prepared=%u capture_running=%u codec_on=%u gpio_mapped=%u "
+			"PWR_STATUS.audio=%u DAC_CON0=0x%08x ADDA_DL=0x%08x AUDDEC0=0x%04x UL_DL=0x%04x "
+			"AWB_BASE=0x%08x AWB_CUR=0x%08x AWB_END=0x%08x capture_xrun=%u\n",
+			a->users, a->stream[1].prepared, READ_ONCE(a->stream[1].running),
+			a->codec_on, !!a->gpio, !!(readl(a->spm + 0x180) & BIT(24)),
+			readl(a->afe + 0x010), readl(a->afe + 0x108), auddec, ul_dl,
+			readl(a->afe + 0x070), readl(a->afe + 0x07c), readl(a->afe + 0x078),
+			READ_ONCE(a->stream[1].ring.xrun));
+	out:
 	mutex_unlock(&a->mutex);
 	return ret;
 }
+static ssize_t analogue_status_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	return mt_status_show(dev, buf, true);
+}
+static ssize_t capture_status_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	return mt_status_show(dev, buf, false);
+}
 static DEVICE_ATTR_RO(analogue_status);
-static struct attribute *mt_status_attrs[] = { &dev_attr_analogue_status.attr, NULL };
+static DEVICE_ATTR_RO(capture_status);
+static struct attribute *mt_status_attrs[] = {
+	&dev_attr_analogue_status.attr, &dev_attr_capture_status.attr, NULL
+};
 static const struct attribute_group mt_status_group = { .attrs = mt_status_attrs };
 
 static int mt_probe(struct platform_device *pdev)

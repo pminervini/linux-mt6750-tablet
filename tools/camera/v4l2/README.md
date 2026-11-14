@@ -1,9 +1,13 @@
-# MT6750 k50v1 V4L2 RAW candidate - idle deployment verified
+# MT6750 k50v1 V4L2 RAW - bounded capture and photo release
 
-The guarded driver and helper were installed on 2026-11-13. Both RAW nodes,
-format/control queries, and media topology now enumerate; ordinary unload and
-reload passed on the unchanged native kernel, with `allow_streaming=0` and
-sensors unpowered. No real image or stream was captured. An earlier trial had
+The 2026-11-14 native camera release passed fifteen real capture/lifecycle phases across
+rear preview/full and front, including sensor patterns, scenes, starvation/EBUSY,
+cancellation and reopen. The deployed helper now produces JPEG/PNG using V4L2,
+and a guarded camera loader has passed manual startup. After separate approval,
+automatic loading is enabled on the qualified installation; reboot persistence
+has not been tested.
+Sensors are unpowered when idle. The earlier 2026-11-13 idle-only trial had
+streaming disabled; an earlier failed trial had
 deadlocked QUERY_EXT_CTRL on shared ioctl/control locking and required an approved
 recovery reboot; the separate-lock repair has now passed this idle runtime gate.
 
@@ -15,7 +19,7 @@ updating exposure limits. The control callback only updates atomic cached values
 and never takes the queue or board-owner mutex. Matching-core query/ioctl and
 production format/control bodies pass host tests with real nonrecursive locks;
 reversing either repair fails its regression. The matching AArch64 module builds.
-Keep the still helper/data as an unload fallback until capture acceptance.
+Keep the still helper/data as a coordinated unload fallback.
 Detailed trial receipts remain operator-local and are not included in this export.
 
 ## Design and exact interface
@@ -40,10 +44,10 @@ of these actual modes. `S_FMT` is rejected once vb2 buffers are allocated.
 `bytesperline=width*2`, `sizeimage=width*height*2`, progressive BGGR, raw colour
 space and no transfer function. The input orientation is not modified. The
 legacy rear display flip is an optional **post-demosaic** software operation.
-BGGR is the existing still helper's source-derived expectation, not a newly
-measured Bayer-phase result. Rear preview/full and front each need independently
-approved colour-target capture before their fourcc is accepted as board-validated.
-Streaming remains disabled pending that controlled test plan.
+BGGR is supported by exact rear hardware-pattern pixels in both modes, and front
+vendor mirror/crop settings plus compound-chart RGB cores. Front exact low-bit
+pattern arithmetic and scene colour calibration remain unclaimed. Current deployment
+uses `allow_streaming=1`; defaults remain false for unapproved loads.
 
 The CAMSV DMA input is **not MIPI-packed RAW10**. It is a little-endian stream of
 four consecutive 10-bit samples per five bytes, as decoded by the existing still
@@ -65,7 +69,8 @@ rearmed frame-by-frame rather than using an unproven continuous IRQ ring.
 `QBUF/DQBUF`, nonblocking operation, poll, STREAMON/STREAMOFF and last-close
 cancellation are the standard vb2/V4L2 implementations. DMABUF import/export,
 USERPTR, read(), media requests and simultaneous cameras are not advertised.
-The worker polls raw PASS1_DONE every 0.5 ms, does not enable an unowned IRQ,
+The worker polls enabled local completion/error events, reserves the board IRQ
+exclusively with CPU delivery disabled,
 and has a 3-second frame deadline. A sensor/I2C error, CAMSV TG/DMA error, reset
 timeout or cancelled frame is never delivered as valid image data. Completed
 buffers have monotonic timestamps recorded at the polled PASS1_DONE observation
@@ -141,10 +146,11 @@ PM-post notification. This is an explicit refusal policy, not suspend/resume
 support; actual system-PM behaviour has not been tested. A wakeup-source hold alone
 would not establish exclusion for every explicit system-suspend request.
 
-`tablet-camera` now obtains `/run/lock/tablet-camera.lock` before its existing
-`/dev/mem` open and rejects `/sys/module/mt6750_camera` even while the candidate
-is idle. Its entire former capture/development AST is tested unchanged after
-removing the new guard. The guard is installed on the tablet. Every
+`tablet-camera` dispatches to V4L2 before any legacy MMIO initialisation and holds
+`/run/lock/tablet-camera.lock` through capture/development. If the module is absent,
+the retained legacy path takes the same lock and rechecks exclusion before `/dev/mem`.
+Its former work-body AST is preserved apart from that dispatch, moved initialisation
+and updated CLI documentation. Every
 loader **must hold the same flock across module loading**, and confirm the
 installed helper is the guarded version; otherwise an already-running legacy
 capture can race loading. Unguarded old experiment scripts/root /dev/mem access
@@ -257,9 +263,10 @@ this build and must not be deployed. Fresh media dependencies are the individual
 
 Tests: five ASan/UBSan C mock executables exercise shared production DMA/FBC/reset,
 RAW10 unpack, bounded FIFO, and extracted production lifecycle/cleanup/GPIO
-functions and the matching-core ioctl/control lock path. Ten Python tests cover exact table dimensions/timing/bounds, corrupt
+functions and the matching-core ioctl/control lock path. Twenty Python tests cover exact table dimensions/timing/bounds, corrupt
 tables, format conversion, old-helper AST preservation, mocked guard failures
-and real flock contention on an offline temporary file. A saved synthetic RAW
+and real flock contention on an offline temporary file, native photo modes/AE,
+packed10 compatibility, delivery failures, and owned-child timeout/TERM/INT reaping. A saved synthetic RAW
 file is processed by the real new CLI and its PNG signature checked. These are
 **not real vb2-core, V4L2-compliance, I2C, sensor, DMA, FPS, suspend, AF or app
 acceptance tests**. No hardware result is inferred from the mocked pass count.
@@ -280,11 +287,42 @@ Ordinary applications that only accept processed YUV/RGB/JPEG will still need an
 appropriate raw/software camera pipeline. This is not a libcamera integration,
 hardware ISP or promise that every standard webcam app will accept RAW10.
 
-## Remaining capture and persistence gates
+## Installing a qualified camera release
+
+Build for the target kernel and establish ABI/capture acceptance before installing.
+Use the actual fresh module products, not a stale copied install-staging directory.
+The required closure is `mc`, `videodev`, `videobuf2-common`, `videobuf2-memops`,
+`videobuf2-v4l2`, `videobuf2-vmalloc`, and `mt6750_camera`. Install the matching
+`.ko` files under `/lib/modules/$(uname -r)/updates/tablet-camera/`, run
+`depmod -a`, and inspect `modprobe --show-depends mt6750_camera`. Require the
+intended paths and `legacy_excluded=1 allow_streaming=1` for an approved capture
+load; metadata-only trials should keep streaming disabled.
+
+Keep an original-module/helper rollback and a bounded independent recovery path.
+Confirm no camera client, physbuf, or foreign raw controller is active, verify idle
+rails/pins, and hold `/run/lock/tablet-camera.lock` across load or ordinary unload.
+Do not force-unload a busy driver.
+
+For optional startup, create an operator-local oneshot `tablet-camera.service`
+with `RemainAfterExit=yes` and ordering after `systemd-modules-load.service`.
+Require the PMIC provider, the qualified kernel release and build banner, and an
+operator-generated SHA-256 manifest of the installed modules/policy. Its start
+command should run `modprobe mt6750_camera` under the same flock; verify the loaded
+GNU build-ID note and both policy parameters afterwards, since modprobe may leave
+an older already-loaded variant untouched. Keep guard values, manifests, notes,
+and rendered units outside Git, and fail closed after a kernel/ABI change.
+
+Validate with `systemd-analyze verify`, manually test the loader and installed photo
+command, and check idle power/allocation recovery. Only after separate startup
+approval use `systemctl enable tablet-camera.service`; omit `--now` when no restart
+is intended. Enablement prepares driver availability, not automatic photography.
+A separately approved reboot is required to establish boot persistence.
+
+## Historical idle gate and checklist for future trials
 
 The 2026-11-13 silent deployment passed real format/control queries, media
 topology, ordinary unload, and reload after source/configuration/layout/import
-checks. Both nodes remain idle-loaded with streaming disabled. The first checker
+checks. At that checkpoint both nodes were idle-loaded with streaming disabled. The first checker
 mistook a media directory for a device; guarded rollback unloaded the stack and
 restored the helpers, then the corrected character-device check passed. Neither
 that checker error nor earlier driver failures are hidden as successful trials.
@@ -313,4 +351,5 @@ This establishes the bounded idle gate, not capture or universal ABI compatibili
    queue starvation/requeue, two-process EBUSY, timeout/disconnect, cancellation,
    CPU/memory use and cleanup. Never infer this milestone from one saved frame
    or the synthetic 384-frame test. V4L2-compliance and actual app acceptance,
-   raw-software processing integration and then any persistence are later gates.
+   live system-PM stress, long soak, calibrated colour and reboot persistence remain
+   separate gates. Native software photos and boot configuration are now accepted as above.

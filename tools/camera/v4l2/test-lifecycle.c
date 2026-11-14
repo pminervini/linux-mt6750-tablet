@@ -29,7 +29,7 @@ struct camera {
 };
 struct board {
 	struct camera *owner;
-	bool poisoned, safe, pm_transition;
+	bool poisoned, safe, pm_transition, snapshot;
 	int owner_lock;
 	struct platform *pdev;
 	void *dma_cpu;
@@ -68,16 +68,23 @@ static void dma_free_coherent(struct device *d, size_t size, void *p, u64 addr)
 {
 	(void)d; (void)size; (void)addr; assert(p == storage); frees++;
 }
-static int power_up(struct camera *c) { (void)c; powered++; return fail == 4 || fail == 6 ? -44 : 0; }
-static int power_down(struct camera *c) { cleanups++; if (fail == 6) c->board->safe = false; return fail == 6 ? -66 : 0; }
-static void *mock_kthread_run(struct camera *c) { (void)c; return fail == 5 ? (void *)(intptr_t)-55 : storage; }
-#define kthread_run(fn, c, ...) mock_kthread_run(c)
+static int power_up(struct camera *c) { c->board->snapshot = true; powered++; return fail == 4 || fail == 6 ? -44 : 0; }
+static int power_down(struct camera *c) { assert(c->board->snapshot); c->board->snapshot = false; cleanups++; if (fail == 6 || fail >= 10) c->board->poisoned = true; if (fail == 6 || fail == 11) c->board->safe = false; return fail == 6 || fail >= 10 ? -66 : 0; }
+static unsigned int task_refs;
+static struct camera *worker_camera;
+static void *mock_kthread_create(struct camera *c) { worker_camera = c; task_refs = fail == 5 ? 0 : 1; return fail == 5 ? (void *)(intptr_t)-55 : storage; }
+#define kthread_create(fn, c, ...) mock_kthread_create(c)
+#define get_task_struct(worker) do { assert((worker) == storage); task_refs++; } while (0)
+static void wake_up_process(void *worker) { assert(worker == storage); if (fail >= 9) { power_down(worker_camera); task_refs--; } }
+#define kthread_run(fn, c, ...) ({ void *task = mock_kthread_create(c); if (!IS_ERR(task)) wake_up_process(task); task; })
 static void wake_up(int *wait) { (void)wait; }
 static void kthread_stop(void *worker)
 {
-	assert(worker == storage); joins++;
-	/* Simulate the actual worker's power-down-before-exit contract. */
+	assert(worker == storage && task_refs); joins++;
+	if (fail < 9) task_refs--;
+	/* A stopped-before-entry worker never executes its cleanup body. */
 }
+static void __attribute__((unused)) kthread_stop_put(void *worker) { kthread_stop(worker); assert(task_refs); task_refs--; }
 static void return_buffers(struct camera *c, enum vb2_buffer_state state)
 {
 	unsigned int *p;
@@ -135,7 +142,7 @@ int main(void)
 		assert(!allocations && !powered && !b.owner);
 		assert(camera_pm_event(NULL, event + 3, NULL) == NOTIFY_OK && !b.pm_transition);
 	}
-	for (fail = 0; fail <= 8; fail++) {
+	for (fail = 0; fail <= 11; fail++) {
 		struct platform platform = { 0 };
 		struct board b = { .pdev = &platform };
 		struct camera c = { .board = &b }, other = { .board = &b };
@@ -143,13 +150,13 @@ int main(void)
 		unsigned int buffers[8];
 		int ret;
 
-		frees = allocations = pipelines = powered = cleanups = joins = returns = 0;
+		frees = allocations = pipelines = powered = cleanups = joins = returns = task_refs = 0;
 		memset(returned, 0, sizeof(returned)); memset(states, 0, sizeof(states));
 		for (unsigned int i = 0; i < 8; i++) { buffers[i] = i; assert(!mtk_fifo_push(&c.queued, &buffers[i])); }
 		if (fail == 1) b.owner = &other;
 		if (fail == 7) b.poisoned = true;
 		ret = start_streaming(&q, 8);
-		if (fail == 0 || fail == 8) {
+		if (fail == 0 || fail >= 8) {
 			assert(!ret && b.owner == &c && c.worker && !returns);
 			assert(!mtk_fifo_push(&other.queued, &buffers[0]));
 			struct vb2_queue other_q = { .c = &other };
@@ -159,8 +166,9 @@ int main(void)
 			if (fail == 8) b.safe = false;
 			stop_streaming(&q);
 			assert(!b.owner && c.stopping && !c.worker && joins == 1);
-			assert(frees == (fail == 0 ? 1 : 0));
-			assert(b.poisoned == (fail == 8));
+			assert(cleanups == 1 && !task_refs);
+			assert(frees == (fail == 8 || fail == 11 ? 0 : 1));
+			assert(b.poisoned == (fail == 8 || fail >= 10));
 			for (unsigned int i = 0; i < 8; i++) assert(states[i] == VB2_BUF_STATE_ERROR);
 		} else {
 			assert(ret < 0 && !b.owner_lock && !c.worker);

@@ -1,9 +1,9 @@
 #!/usr/bin/python3
 # SPDX-License-Identifier: GPL-2.0
 """tablet-camera: take a photo with the MT6750 tablet's rear (OV8856, 8 MP) or front (GC2365,
-2 MP) camera on mainline Linux. Root only. No kernel camera driver: the pipeline is driven from
-here through /dev/mem, as stock Android programs it (register values recorded from Android,
-tools/regdiff/and-cam-*), with a raw-dump path that bypasses the ISP:
+2 MP) camera on mainline Linux. Root only. Uses native V4L2 when mt6750_camera is loaded;
+otherwise uses the guarded legacy /dev/mem pipeline below. Both paths bypass the ISP and
+develop RAW10 in software; colour is uncalibrated:
 
   sensor --MIPI CSI--> SENINF --mux 3--> CAMSV (timing generator, RAW10 packer, IMGO DMA)
          --> physically contiguous CMA buffer (physbuf.ko) --> demosaic/AE/AWB here --> JPEG/PNG
@@ -17,7 +17,7 @@ Sensor control is over the I2C2 controller (/dev/i2c-N for i2c@11009000; bit-ban
 GPIO112/113 as a fallback on kernels without that DT node).
 Auto exposure: a few frames adjusting exposure, then gain, towards a mid-grey mean. White
 balance: grey world. No lens shading, denoise or sharpening: expect a plain, noisy-in-the-dark
-picture. ~5-15 s per photo.
+picture. Duration depends on resolution and up to eight auto-exposure attempts.
 """
 import argparse, ctypes, fcntl, glob, mmap, os, struct, subprocess, sys, time
 
@@ -40,10 +40,6 @@ def _legacy_guard():
         os.close(lock)
         raise
     return lock
-
-
-_legacy_lock = _legacy_guard()
-fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
 
 
 class Blk:
@@ -74,7 +70,6 @@ def load(name):
     return out
 
 
-spm, gpio = Blk(0x10006000), Blk(0x10005000)
 PDN_REAR, PDN_FRONT, RST, SCL, SDA = 107, 108, 110, 112, 113
 
 
@@ -490,6 +485,138 @@ def develop(raw, black, path, flip=False):
         else Image.fromarray(out).save(path)
 
 
+def _native_run(command, timeout=30):
+    """Own, bound and reap v4l2-ctl, including TERM/INT during child creation."""
+    import signal
+    cancelled = []
+    previous = {}
+    child = None
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous[sig] = signal.signal(sig, lambda signum, frame: cancelled.append(signum))
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, start_new_session=True)
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancelled:
+                raise SystemExit(128 + cancelled[0])
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                output, _ = child.communicate(timeout=min(0.2, remaining))
+                if cancelled:
+                    raise SystemExit(128 + cancelled[0])
+                if child.returncode:
+                    raise subprocess.CalledProcessError(child.returncode, command, output)
+                return output
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, timeout)
+    finally:
+        try:
+            if child is not None and child.poll() is None:
+                child.terminate()
+                try:
+                    child.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.communicate(timeout=5)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
+def _native_capture(device, cam, lines, gain_units):
+    import tempfile
+    import numpy as np
+    with tempfile.TemporaryDirectory(prefix="tablet-camera-", dir=os.environ.get("TMPDIR", "/run")) as directory:
+        path = os.path.join(directory, "frame.raw")
+        output = _native_run([
+            "v4l2-ctl", "-d", device, "--verbose",
+            f"--set-fmt-video=width={cam.w},height={cam.h},pixelformat=BG10",
+            f"--set-ctrl=test_pattern=0,exposure={lines},analogue_gain={gain_units}",
+            "--stream-no-query", "--stream-mmap=3", "--stream-count=1", "--stream-skip=2",
+            "--stream-to=" + path])
+        # v4l2-ctl can exit zero without delivering a frame. A fresh private
+        # stream-to file AND a successful DQBUF are required, not exit status alone.
+        expected = cam.w * cam.h * 2
+        delivered = [line for line in output.splitlines() if "cap dqbuf:" in line]
+        if not delivered or f"bytesused: {expected} " not in delivered[-1] or "error" in delivered[-1].lower():
+            raise RuntimeError("tablet-camera: no successful V4L2 frame delivery\n" + output)
+        with open(path, "rb") as frame:
+            data = frame.read()
+        if not data or len(data) != expected:
+            raise ValueError(f"V4L2 frame size mismatch: expected {expected}, got {len(data)}")
+        raw = np.frombuffer(data, dtype="<u2").reshape(cam.h, cam.w)
+        if np.any(raw > 1023):
+            raise ValueError("V4L2 SBGGR10 has nonzero bits 15:10")
+        return raw
+
+
+def _pack_mtk10(raw):
+    """Inverse of unpack(): keep --raw's MediaTek LE bitstream contract."""
+    import numpy as np
+    px = raw.reshape(raw.shape[0], -1, 4)
+    b = np.empty((*px.shape[:2], 5), np.uint8)
+    b[..., 0] = px[..., 0] & 255
+    b[..., 1] = (px[..., 0] >> 8) | ((px[..., 1] & 63) << 2)
+    b[..., 2] = (px[..., 1] >> 6) | ((px[..., 2] & 15) << 4)
+    b[..., 3] = (px[..., 2] >> 4) | ((px[..., 3] & 3) << 6)
+    b[..., 4] = px[..., 3] >> 2
+    return b.tobytes()
+
+
+def _native_main(a):
+    import numpy as np
+    if a.front and a.full:
+        raise ValueError("tablet-camera: --full is rear-only")
+    cam = GC2365(False) if a.front else OV8856(a.full)
+    max_lines = cam.vts - 8
+    max_gain = 493 / 64 if a.front else 1984 / 128
+    if a.exposure is not None and not 6 <= a.exposure <= max_lines:
+        raise ValueError(f"tablet-camera: native --exposure must be 6..{max_lines} lines")
+    if not 1 <= a.gain <= max_gain:
+        raise ValueError(f"tablet-camera: native --gain must be 1..{max_gain:g}")
+    if a.exposure is None and a.gain != 1.0:
+        raise ValueError("tablet-camera: --gain requires --exposure")
+    lock = os.open("/run/lock/tablet-camera.lock",
+                   os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if not os.path.isdir("/sys/module/mt6750_camera"):
+            raise RuntimeError("tablet-camera: V4L2 owner disappeared; retry explicitly")
+        name = "mt6750-front-raw" if a.front else "mt6750-rear-raw"
+        devices = []
+        for path in glob.glob("/sys/class/video4linux/video*/name"):
+            with open(path) as entry:
+                if entry.read().strip() == name:
+                    devices.append("/dev/" + os.path.basename(os.path.dirname(path)))
+        if len(devices) != 1:
+            raise RuntimeError(f"tablet-camera: expected one {name} node, found {len(devices)}")
+        t0 = time.time()
+        lines, gain = (a.exposure, a.gain) if a.exposure is not None else (cam.vts // 2, 1.0)
+        for it in range(1 if a.exposure is not None else 8):
+            raw = _native_capture(devices[0], cam, lines, int(gain * (64 if a.front else 128)))
+            if a.exposure is not None:
+                break
+            m = float(np.mean(raw[::4, ::4])) - cam.black
+            print(f"AE {it}: exposure {lines} lines, gain {gain:.2f}, level {m:.0f}")
+            if 90 < m < 200:
+                break
+            k = 140 / max(m, 1.0)
+            tot = min(lines * gain * k, max_lines * max_gain)
+            lines = int(min(max(tot, 8), max_lines))
+            gain = max(1.0, min(tot / lines, max_gain))
+        if a.raw:
+            with open(a.raw, "wb") as frame:
+                frame.write(_pack_mtk10(raw))
+        develop(raw, cam.black, a.output, cam.flip)
+        print(f"{cam.name}: {cam.w}x{cam.h} -> {a.output} in {time.time() - t0:.1f} s (V4L2)")
+    finally:
+        os.close(lock)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-f", "--front", action="store_true", help="front camera (GC2365)")
@@ -501,6 +628,12 @@ def main():
     a = ap.parse_args()
     if os.geteuid():
         sys.exit("tablet-camera: run as root")
+    if os.path.isdir("/sys/module/mt6750_camera"):
+        return _native_main(a)
+    global _legacy_lock, fd, spm, gpio
+    _legacy_lock = _legacy_guard()
+    fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+    spm, gpio = Blk(0x10006000), Blk(0x10005000)
     cam = GC2365(False) if a.front else OV8856(a.full)
     phys = physbuf(12 if a.full else 4)
     t0 = time.time()

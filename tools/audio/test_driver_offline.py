@@ -180,6 +180,7 @@ parts = [shim, *drvdata_apis, structs, *intervals, r'''
 static pthread_mutex_t schedule_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t schedule_cond=PTHREAD_COND_INITIALIZER;
 static int pause_clear, at_clear, release_clear, start_attempt, start_done;
+static int check_fm_restore, fm_restores;
 static void host_lock(spinlock_t *lock)
 {
     if(starter && lock==&test_audio->state_lock) {
@@ -194,6 +195,11 @@ static void host_lock(spinlock_t *lock)
 static void before_update(struct mt_audio *a, u32 reg, u32 mask, u32 value)
 {
     (void)a;
+    if(check_fm_restore && reg==0x0cc && mask==8 && (value&8)) {
+        assert(!(readl(a->afe+0x010)&0x40));
+        assert(!(readl(a->afe+0x018)&1));assert(!(readl(a->afe+0x500)&0x41));
+        assert(!a->stream[1].running && !a->stream[1].timer.active);fm_restores++;
+    }
     if(pause_clear && !starter && reg==0x010 && mask==1 && !value) {
         assert(!pthread_mutex_lock(&schedule_lock));at_clear=1;
         assert(!pthread_cond_broadcast(&schedule_cond));
@@ -218,7 +224,7 @@ parts.append(declaration('static const struct snd_pcm_hardware mt_hw'))
 for name in ['mt_codec_write', 'mt_codec_off', 'mt_codec_on', 'mt_get_stream',
              'mt_open', 'mt_stop', 'mt_sync_stop', 'mt_hw_free', 'mt_close', 'mt_hw_params',
              'mt_prepare', 'mt_trigger', 'mt_copy', 'mt_volume_get', 'mt_volume_put',
-             'mt_pointer', 'mt_poll', 'analogue_status_show']:
+             'mt_pointer', 'mt_poll', 'mt_status_show', 'analogue_status_show', 'capture_status_show']:
     parts.append(function(name))
 parts.append(r'''
 static u32 afe[1024], gpio[1024], spm[1024];
@@ -272,6 +278,66 @@ static void test_fm_lifecycle(void)
     assert(!audio.stream[1].area);assert(!runtime[1].dma_area);
     assert(mt_hw_free(&component,&sub[1])==0);
     puts("PASS FM prepare/start/stop/duplex/idempotent free: no codec/GPIO/DAC enable");
+}
+static void test_fm_restore(void)
+{
+    u32 owned[1024]={0}, original[1024], expected[1024];
+    for(unsigned i=0;i<ARRAY_SIZE(mt_fm_config);i++)
+        owned[mt_fm_config[i].reg/4]|=mt_fm_config[i].mask;
+    for(unsigned i=0;i<ARRAY_SIZE(mt_fm_start);i++)
+        assert(!(owned[mt_fm_start[i].reg/4]&mt_fm_start[i].mask));
+    for(unsigned i=0;i<ARRAY_SIZE(mt_dl_config);i++)
+        assert(!(owned[mt_dl_config[i].reg/4]&mt_dl_config[i].mask));
+    assert(owned[0x0cc/4]==8); /* capture MSB, never playback's bit 1 */
+    for(int mode=0;mode<7;mode++) {
+        reset();allocate(1);audio.users=1;audio.powered_before=true;
+        for(unsigned i=0;i<ARRAY_SIZE(afe);i++)afe[i]=0xa5a5a5a5U^(i*0x10204081U);
+        afe[0x010/4]&=~0x41U;afe[0x018/4]&=~1U;afe[0x500/4]&=~0x41U;afe[0x0cc/4]|=8;
+        memcpy(original,afe,sizeof(afe));
+        assert(mt_prepare(&component,&sub[1])==0);
+        if(mode==0)assert(mt_prepare(&component,&sub[1])==0); /* PREPARED -> PREPARE */
+        if(mode!=1)assert(mt_trigger(&component,&sub[1],SNDRV_PCM_TRIGGER_START)==0);
+        /* Change shared playback fields after snapshot, then keep them running. */
+        allocate(0);assert(mt_prepare(&component,&sub[0])==0);
+        assert(mt_trigger(&component,&sub[0],SNDRV_PCM_TRIGGER_START)==0);
+        for(unsigned i=0;i<ARRAY_SIZE(afe);i++) {
+            expected[i]=(afe[i]&~owned[i])|(original[i]&owned[i]);
+        }
+        expected[0x010/4]&=~0x40U;expected[0x018/4]&=~1U;expected[0x500/4]&=~0x41U;
+        int pmic_before=pmic_calls;u32 gpio_before[1024];memcpy(gpio_before,gpio,sizeof(gpio));
+        check_fm_restore=1;fm_restores=0;
+        switch(mode) {
+        case 0: case 1:
+            assert(mt_trigger(&component,&sub[1],SNDRV_PCM_TRIGGER_STOP)==0);
+            assert(mt_sync_stop(&component,&sub[1])==0);break;
+        case 2: assert(mt_hw_free(&component,&sub[1])==0);break;
+        case 3: audio.users=2;assert(mt_close(&component,&sub[1])==0);break;
+        case 4: audio.fault=true;assert(mt_prepare(&component,&sub[1])==-EIO);break;
+        case 5: {
+            void *area=audio.stream[1].area;audio.stream[1].area=NULL;
+            assert(mt_prepare(&component,&sub[1])==-EIO);audio.stream[1].area=area;break;
+        }
+        case 6:
+            /* Last close must also restore when an already-on domain stays on. */
+            mt_stop(&audio.stream[0]);assert(mt_sync_stop(&component,&sub[0])==0);
+            pmic_before=pmic_calls;memcpy(gpio_before,gpio,sizeof(gpio));
+            for(unsigned i=0;i<ARRAY_SIZE(afe);i++)expected[i]=(afe[i]&~owned[i])|(original[i]&owned[i]);
+            expected[0x010/4]&=~0x41U;expected[0x018/4]&=~1U;expected[0x500/4]&=~0x41U;
+            expected[0]&=~0x06004044U; /* last-close saved_top is zero in this fixture */
+            assert(mt_close(&component,&sub[1])==0);break;
+        }
+        assert(fm_restores==1);assert(!memcmp(expected,afe,sizeof(afe)));
+        assert(!audio.stream[1].prepared);assert(!audio.stream[1].running);
+        assert(mt_trigger(&component,&sub[1],SNDRV_PCM_TRIGGER_START)==-EINVAL);
+        assert(mt_sync_stop(&component,&sub[1])==0);assert(fm_restores==1);
+        assert(pmic_calls==pmic_before);assert(!memcmp(gpio_before,gpio,sizeof(gpio)));
+        check_fm_restore=0;assert(mt_hw_free(&component,&sub[1])==0);
+        assert(mt_hw_free(&component,&sub[0])==0);
+    }
+    reset();memset(afe,0x5a,sizeof(afe));memcpy(expected,afe,sizeof(afe));
+    assert(mt_prepare(&component,&sub[1])==-EIO); /* no committed snapshot */
+    assert(mt_sync_stop(&component,&sub[1])==0);assert(!memcmp(expected,afe,sizeof(afe)));
+    puts("PASS FM masked snapshot/restore: repeated prepare, STOP/sync, free/close, failed prepare; disable first, playback preserved");
 }
 static void test_card_drvdata(void)
 {
@@ -427,6 +493,18 @@ static void test_owner_status(void)
     assert(analogue_status_show(&component_device,NULL,buf)>0);
     assert(!strcmp(buf,"PWR_STATUS.audio=1 DAC_CON0=0x00000005 ADDA_DL=0x00000003 AUDDEC0=0xe080 UL_DL=0x0001\n"));
     audio.users=1;assert(analogue_status_show(&component_device,NULL,buf)==-EBUSY);audio.users=0;
+    audio.users=1;audio.stream[1].prepared=true;audio.stream[1].running=true;
+    audio.codec_on=false;audio.gpio=NULL;spm[0x180/4]=1<<24;afe[0x010/4]=0x41;afe[0x108/4]=0;
+    pmic[0x0cf2]=pmic[0x2000]=0;
+    afe[0x070/4]=0x40000000;afe[0x07c/4]=0x40002000;afe[0x078/4]=0x40007fff;
+    audio.stream[1].ring.xrun=false;
+    assert(capture_status_show(&component_device,NULL,buf)>0);
+    assert(!strcmp(buf,"users=1 capture_prepared=1 capture_running=1 codec_on=0 gpio_mapped=0 PWR_STATUS.audio=1 DAC_CON0=0x00000041 ADDA_DL=0x00000000 AUDDEC0=0x0000 UL_DL=0x0000 AWB_BASE=0x40000000 AWB_CUR=0x40002000 AWB_END=0x40007fff capture_xrun=0\n"));
+    afe[0x07c/4]=0x40003000;audio.stream[1].ring.xrun=true;
+    assert(capture_status_show(&component_device,NULL,buf)>0);
+    assert(strstr(buf,"AWB_CUR=0x40003000") && strstr(buf,"capture_xrun=1"));
+    audio.users=0;audio.stream[1].prepared=false;audio.stream[1].running=false;
+    spm[0x180/4]=1<<24;afe[0x010/4]=5;afe[0x108/4]=3;pmic[0x0cf2]=0xe080;pmic[0x2000]=1;
     read_fail=0x0cf2;assert(analogue_status_show(&component_device,NULL,buf)==-EIO);
     read_fail=0x2000;assert(analogue_status_show(&component_device,NULL,buf)==-EIO);read_fail=0;
     assert(!pmic_calls);assert(afe[0x010/4]==5 && afe[0x108/4]==3 && spm[0x180/4]==1<<24);
@@ -472,7 +550,7 @@ int main(void)
 {
     test_card_drvdata();test_owner_status();
     test_open_constraints();test_duplex_state_transaction();
-    test_ring();test_fm_lifecycle();test_codec_errors();test_pcm_copy();test_poll_xrun();
+    test_ring();test_fm_lifecycle();test_fm_restore();test_codec_errors();test_pcm_copy();test_poll_xrun();
     puts("SOURCE-EXTRACTED OFFLINE CALLBACK TESTS PASSED (no hardware)");return 0;
 }
 ''')

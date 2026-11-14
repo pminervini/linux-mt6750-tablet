@@ -24,6 +24,7 @@ struct mt_step { u16 reg; u32 mask, value; };
  * O05/O06, including shifted connections. No ADDA, PMIC, GPIO or DAC writes.
  */
 static const struct mt_step mt_fm_config[] = {
+	{0x0cc, 1U << 3, 0}, /* AWB DMA address below 4GB */
 	{0x028, 0x03fd0000, 0}, {0x420, 0x3000, 0},
 	{0x438, 0x3000, 0}, {0x030, 0x1803e0, 0},
 	{0x460, 0x03c00000, 0},

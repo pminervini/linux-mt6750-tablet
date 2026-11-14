@@ -125,6 +125,8 @@ static inline int mtk_dma_frame(struct mtk_io *io, u32 width, u32 height,
 	mtk_wr(io, 0x418, width << 16);
 	mtk_wr(io, 0x41c, height << 16);
 	mtk_wr(io, 0x420, 0x1000);
+	/* Enable polled completion/error events; CPU delivery remains disabled. */
+	mtk_wr(io, 0x008, (1U << 4) | (1U << 5) | (1U << 10) | (1U << 16));
 	mtk_wr(io, 0x000, (1U << 30) | 1 | 4);
 	mtk_wr(io, 0x004, (1U << 24) | 1);
 	mtk_wr(io, 0x03c, 2);

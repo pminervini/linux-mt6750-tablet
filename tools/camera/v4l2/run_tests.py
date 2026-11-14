@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0
-"""SYNTHETIC/OFFLINE tests only. Never import or execute tablet-camera.
+"""SYNTHETIC/OFFLINE tests only. Actual tablet-camera execution is --help only.
 
+Photo definitions run with synthetic sysfs/frames and offline lock files; owned
+children are local fixtures, never a device-facing v4l2-ctl process.
 C tests compile shared production DMA/packing/FIFO code, and extracted actual
 STREAMON/STREAMOFF and shutdown bodies against explicit kernel-boundary mocks.
 They are not vb2-core integration tests and do not prove hardware behaviour.
@@ -75,6 +77,8 @@ class Tables(unittest.TestCase):
                 bank = value
             else:
                 regs[bank, reg] = value
+        for reg, value in ((0x17, 0xC0), (0x92, 3), (0x94, 2)):
+            self.assertEqual(regs[0, reg], value)  # BSP NO_MIRROR / STARTY / STARTX
         self.assertEqual(regs[0, 0x95] * 256 + regs[0, 0x96], 1200)
         self.assertEqual(regs[0, 0x97] * 256 + regs[0, 0x98], 1600)
         self.assertEqual(regs[0, 0x0D] * 256 + regs[0, 0x0E] + regs[0, 0x07] * 256 + regs[0, 0x08] + 16, 1240)
@@ -145,11 +149,32 @@ class LegacyGuard(unittest.TestCase):
         original = LEGACY_HELPER.read_text()
         original_tree = ast.parse(original)
         current_tree = ast.parse((CAMERA / "tablet-camera").read_text())
+        self.assertIn("V4L2", ast.get_docstring(current_tree))
+        current_tree.body[0] = original_tree.body[0]  # Native-backend CLI documentation only.
+        native_names = {"_legacy_guard", "_native_run", "_native_capture", "_pack_mtk10", "_native_main"}
         current_tree.body = [node for node in current_tree.body if not (
-            isinstance(node, ast.FunctionDef) and node.name == "_legacy_guard" or
-            isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_legacy_lock" for t in node.targets))]
+            isinstance(node, ast.FunctionDef) and node.name in native_names)]
+        # Only dispatch and the exact original fd/MMIO initialization move into
+        # main. Compare the entire remaining AST, including the legacy work body.
+        moved = ast.parse('''
+if os.path.isdir("/sys/module/mt6750_camera"):
+    return _native_main(a)
+global _legacy_lock, fd, spm, gpio
+_legacy_lock = _legacy_guard()
+fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+spm, gpio = Blk(0x10006000), Blk(0x10005000)
+''').body
+        main = next(node for node in current_tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        index = next(i for i, node in enumerate(main.body) if ast.dump(node) == ast.dump(moved[0]))
+        self.assertEqual([ast.dump(n) for n in main.body[index:index + len(moved)]],
+                         [ast.dump(n) for n in moved])
+        del main.body[index:index + len(moved)]
+        for node in moved[-2:]:
+            match = next(n for n in original_tree.body if ast.dump(n) == ast.dump(node))
+            original_tree.body.remove(match)
         self.assertEqual(ast.dump(original_tree), ast.dump(current_tree))
         source = (CAMERA / "tablet-camera").read_text()
+        self.assertLess(source.index("return _native_main(a)"), source.index("_legacy_lock = _legacy_guard()"))
         self.assertLess(source.index("_legacy_lock = _legacy_guard()"), source.index('fd = os.open("/dev/mem"'))
 
     def test_real_flock_offline(self):
@@ -171,6 +196,297 @@ class LegacyGuard(unittest.TestCase):
             finally:
                 os.close(held)
             os.close(ns["_legacy_guard"]())
+
+
+class NativePhoto(unittest.TestCase):
+    """Extracted photo CLI with synthetic sysfs/frames and real offline flock."""
+    def setUp(self):
+        import ctypes
+        import fcntl
+        import glob
+        import os
+        import tempfile
+        import time
+        self.directory = tempfile.TemporaryDirectory(dir=TEST_OUTPUT)
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.lock = self.root / "camera.lock"
+        tree = ast.parse((CAMERA / "tablet-camera").read_text())
+        nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) or
+                 isinstance(n, ast.Assign) and any(isinstance(t, ast.Tuple) for t in n.targets)]
+        self.ns = dict(argparse=argparse, ctypes=ctypes, fcntl=fcntl, glob=glob, os=os,
+                       subprocess=subprocess, sys=sys, time=time, __doc__="offline photo test")
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "extracted-photo-cli", "exec"), self.ns)
+        self.names = [str(self.root / "video7/name"), str(self.root / "video2/name")]
+        for path, name in zip(self.names, ("mt6750-rear-raw", "mt6750-front-raw")):
+            Path(path).parent.mkdir()
+            Path(path).write_text(name + "\n")
+        self.os = SimpleNamespace(**{name: getattr(os, name) for name in (
+            "close", "environ", "O_RDWR", "O_CREAT", "O_CLOEXEC", "O_NOFOLLOW")})
+        def lock_open(path, flags, mode):
+            self.assertEqual(path, "/run/lock/tablet-camera.lock")
+            self.assertEqual(mode, 0o600)
+            return os.open(self.lock, flags, mode)
+        self.os.open = lock_open
+        self.os.geteuid = lambda: 0
+        self.os.path = SimpleNamespace(isdir=lambda path: True, basename=os.path.basename,
+                                       dirname=os.path.dirname, join=os.path.join)
+        self.ns["os"] = self.os
+        self.ns["glob"] = SimpleNamespace(glob=lambda pattern: self.names)
+        self.args = SimpleNamespace(front=False, full=False, exposure=600, gain=1.0,
+                                    raw=None, output=str(self.root / "photo.png"))
+
+    def assert_locked(self):
+        import fcntl
+        import os
+        fd = os.open(self.lock, os.O_RDWR)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+    def assert_unlocked(self):
+        import fcntl
+        import os
+        fd = os.open(self.lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+    def test_native_dispatch_and_help_never_open_legacy(self):
+        from unittest.mock import patch
+        self.os.open = lambda *a: self.fail("unexpected OS open")
+        self.ns["_native_main"] = lambda a: "native"
+        for argv in (("tablet-camera",), ("tablet-camera", "--help")):
+            with self.subTest(argv=argv), patch.object(sys, "argv", argv):
+                if "--help" in argv:
+                    with self.assertRaises(SystemExit) as caught:
+                        self.ns["main"]()
+                    self.assertEqual(caught.exception.code, 0)
+                else:
+                    self.assertEqual(self.ns["main"](), "native")
+        # Actual script help also exercises all real top-level initialization.
+        subprocess.run([sys.executable, "-B", str(CAMERA / "tablet-camera"), "--help"],
+                       check=True, capture_output=True, timeout=5)
+
+    def test_legacy_dispatch_race_refuses_kernel_owner(self):
+        from unittest.mock import patch
+        checks = iter((False, True))
+        self.os.path.isdir = lambda path: next(checks)
+        self.ns["_native_main"] = lambda a: self.fail("unexpected native dispatch")
+        with patch.object(sys, "argv", ["tablet-camera"]), self.assertRaisesRegex(RuntimeError, "legacy capture excluded"):
+            self.ns["main"]()
+        self.assert_unlocked()
+
+    def test_modes_gain_units_orientation_and_lock(self):
+        import numpy as np
+        for front, full, size, gain_units, flip in (
+            (False, False, (1632, 1224), 128, True),
+            (False, True, (3264, 2448), 128, True),
+            (True, False, (1600, 1200), 64, False),
+        ):
+            with self.subTest(front=front, full=full):
+                self.args.front, self.args.full = front, full
+                calls = []
+                def capture(device, cam, lines, gain):
+                    self.assert_locked()
+                    calls.append((device, cam.w, cam.h, lines, gain))
+                    return np.zeros((4, 8), np.uint16)
+                def develop(raw, black, path, flipped):
+                    self.assert_locked()
+                    self.assertEqual((black, flipped), (32 if front else 64, flip))
+                self.ns.update(_native_capture=capture, develop=develop)
+                self.ns["_native_main"](self.args)
+                self.assertEqual(calls, [("/dev/video2" if front else "/dev/video7", *size, 600, gain_units)])
+                self.assert_unlocked()
+
+    def test_native_ae_bounded_dark_bright_and_converged(self):
+        import numpy as np
+        self.args.exposure = None
+        for front, full in ((False, False), (False, True), (True, False)):
+            self.args.front, self.args.full = front, full
+            for level, count in ((0, 8), (1023, 8), (172 if front else 204, 1)):
+                calls = []
+                def capture(device, cam, lines, gain):
+                    self.assert_locked()
+                    self.assertTrue(6 <= lines <= cam.vts - 8)
+                    self.assertTrue((64 if front else 128) <= gain <= (493 if front else 1984))
+                    calls.append((lines, gain))
+                    return np.full((4, 8), level, np.uint16)
+                self.ns.update(_native_capture=capture, develop=lambda *a: self.assert_locked())
+                self.ns["_native_main"](self.args)
+                self.assertEqual(len(calls), count)
+                if level == 0:
+                    self.assertGreater(calls[-1][1], calls[0][1])
+                self.assert_unlocked()
+
+    def test_invalid_native_options_fail_before_capture(self):
+        cases = (dict(front=True, full=True), dict(exposure=0), dict(exposure=5),
+                 dict(exposure=1239), dict(full=True, exposure=2475),
+                 dict(front=True, exposure=1233), dict(gain=0.9), dict(gain=15.6),
+                 dict(front=True, gain=8), dict(gain=float("nan")), dict(gain=float("inf")),
+                 dict(exposure=None, gain=2))
+        self.ns["_native_capture"] = lambda *a: self.fail("invalid capture")
+        self.os.open = lambda *a: self.fail("invalid options reached lock")
+        for changes in cases:
+            a = SimpleNamespace(**(vars(self.args) | changes))
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.ns["_native_main"](a)
+
+    def test_discovery_busy_and_failures_never_fall_back(self):
+        import fcntl
+        import os
+        self.ns["_legacy_guard"] = lambda: self.fail("legacy fallback")
+        self.ns["_native_capture"] = lambda *a: self.fail("unexpected capture")
+        for names in ([], [self.names[1]], [self.names[0], self.names[0]]):
+            self.names = names
+            with self.assertRaisesRegex(RuntimeError, "expected one"):
+                self.ns["_native_main"](self.args)
+            self.assert_unlocked()
+        fd = os.open(self.lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                self.ns["_native_main"](self.args)
+        finally:
+            os.close(fd)
+        self.os.path.isdir = lambda path: False
+        with self.assertRaisesRegex(RuntimeError, "owner disappeared"):
+            self.ns["_native_main"](self.args)
+        self.assert_unlocked()
+
+    def test_capture_command_and_delivery_validation(self):
+        import numpy as np
+        cam = SimpleNamespace(w=8, h=4)
+        pixels = np.arange(32, dtype="<u2").reshape(4, 8) * 31
+        payload = pixels.tobytes()
+        log = "cap dqbuf: 0 seq: 2 bytesused: 64 ts: 1.000000 (ts-monotonic, ts-src-eof)\n"
+        calls = []
+        def run(command):
+            calls.append(command)
+            Path(next(arg.split("=", 1)[1] for arg in command if arg.startswith("--stream-to="))).write_bytes(payload)
+            return log
+        self.ns["_native_run"] = run
+        np.testing.assert_array_equal(self.ns["_native_capture"]("/dev/video7", cam, 600, 128), pixels)
+        command = calls[-1]
+        for required in ("v4l2-ctl", "--verbose", "--stream-no-query", "--stream-mmap=3",
+                         "--stream-count=1", "--stream-skip=2", "--set-fmt-video=width=8,height=4,pixelformat=BG10",
+                         "--set-ctrl=test_pattern=0,exposure=600,analogue_gain=128"):
+            self.assertIn(required, command)
+        for payload, log in ((b"", log), (bytes(62), log), (bytes(66), log),
+                             (b"\xff" * 64, log), (bytes(64), ""),
+                             (bytes(64), log.replace("bytesused: 64", "bytesused: 0")),
+                             (bytes(64), log.replace("ts-monotonic", "error, ts-monotonic"))):
+            with self.subTest(size=len(payload), log=log), self.assertRaises((ValueError, RuntimeError)):
+                self.ns["_native_capture"]("/dev/video7", cam, 600, 128)
+        self.ns["_native_run"] = lambda command: (_ for _ in ()).throw(FileNotFoundError("no v4l2-ctl"))
+        with self.assertRaises(FileNotFoundError):
+            self.ns["_native_capture"]("/dev/video7", cam, 600, 128)
+
+    def test_mtk_roundtrip_and_real_development(self):
+        import numpy as np
+        from PIL import Image
+        raw = np.random.default_rng(0).integers(0, 1024, (8, 16), dtype=np.uint16)
+        packed = self.ns["_pack_mtk10"](raw)
+        self.assertEqual(len(packed), raw.size * 5 // 4)
+        np.testing.assert_array_equal(self.ns["unpack"](packed, 16, 8), raw)
+        np.testing.assert_array_equal(raw_develop.decode(packed, 16, 8, "mtk-packed10"), raw)
+        self.ns["_native_capture"] = lambda *a: raw
+        self.args.raw = str(self.root / "saved-mtk.raw")
+        for front in (False, True):
+            self.args.front = front
+            for suffix in ("png", "jpg"):
+                self.args.output = str(self.root / ("photo." + suffix))
+                self.ns["_native_main"](self.args)
+                self.assertEqual(Path(self.args.raw).read_bytes(), packed)
+                with Image.open(self.args.output) as image:
+                    self.assertEqual(image.size, (16, 8))
+                    self.assertEqual(image.format, "PNG" if suffix == "png" else "JPEG")
+                    if suffix == "png":
+                        rgb = raw_develop.develop(raw, 32 if front else 64)
+                        np.testing.assert_array_equal(np.asarray(image), rgb if front else rgb[::-1])
+                self.assert_unlocked()
+        self.ns["develop"] = lambda *a: (_ for _ in ()).throw(OSError("synthetic save failure"))
+        with self.assertRaises(OSError):
+            self.ns["_native_main"](self.args)
+        self.assert_unlocked()
+        self.ns["_native_capture"] = lambda *a: (_ for _ in ()).throw(KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.ns["_native_main"](self.args)
+        self.assert_unlocked()
+
+    def test_native_photo_with_owned_synthetic_v4l2_child(self):
+        from unittest.mock import patch
+        import numpy as np
+        from PIL import Image
+        fake = self.root / "synthetic-v4l2-ctl.py"
+        fake.write_text('''import pathlib, sys
+args = sys.argv[1:]
+assert "--set-fmt-video=width=8,height=4,pixelformat=BG10" in args
+assert "--set-ctrl=test_pattern=0,exposure=600,analogue_gain=128" in args
+assert all(flag in args for flag in ("--stream-no-query", "--stream-mmap=3", "--stream-count=1", "--stream-skip=2"))
+path = next(a.split("=", 1)[1] for a in args if a.startswith("--stream-to="))
+pathlib.Path(path).write_bytes(b"".join((i * 31).to_bytes(2, "little") for i in range(32)))
+print("cap dqbuf: 0 seq: 2 bytesused: 64 ts: 1.000000 (ts-monotonic, ts-src-eof)")
+''')
+        # Small synthetic mode only; actual sensor dimensions are checked above.
+        self.ns["OV8856"] = lambda full: SimpleNamespace(w=8, h=4, vts=1246, black=64,
+                                                          flip=True, name="SYNTHETIC rear")
+        self.args.raw = str(self.root / "photo-mtk.raw")
+        popen = subprocess.Popen
+        def spawn(command, **kwargs):
+            self.assert_locked()
+            self.assertEqual(command[0], "v4l2-ctl")
+            return popen([sys.executable, "-B", str(fake), *command[1:]], **kwargs)
+        with patch.object(subprocess, "Popen", spawn):
+            self.ns["_native_main"](self.args)
+        with Image.open(self.args.output) as image:
+            self.assertEqual((image.format, image.size), ("PNG", (8, 4)))
+        pixels = np.arange(32, dtype=np.uint16).reshape(4, 8) * 31
+        np.testing.assert_array_equal(self.ns["unpack"](Path(self.args.raw).read_bytes(), 8, 4), pixels)
+        self.assert_unlocked()
+
+    def test_owned_child_success_failure_timeout_and_signals(self):
+        import os
+        import signal
+        import time
+        import threading
+        from unittest.mock import patch
+        runner = self.ns["_native_run"]
+        self.assertEqual(runner([sys.executable, "-c", "print('delivered')"]), "delivered\n")
+        with self.assertRaises(subprocess.CalledProcessError):
+            runner([sys.executable, "-c", "raise SystemExit(7)"])
+        with self.assertRaises(FileNotFoundError):
+            runner([str(self.root / "missing-executable")])
+        for sig in (None, signal.SIGTERM, signal.SIGINT):
+            children = []
+            popen = subprocess.Popen
+            def spawn(*args, **kwargs):
+                child = popen(*args, **kwargs)
+                children.append(child)
+                return child
+            handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+            timer = threading.Timer(0.4, lambda: os.kill(os.getpid(), sig)) if sig else None
+            start = time.monotonic()
+            try:
+                if timer:
+                    timer.start()
+                with patch.object(subprocess, "Popen", spawn):
+                    with self.assertRaises(SystemExit if sig else subprocess.TimeoutExpired) as caught:
+                        runner([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"], timeout=0.4 if not sig else 5)
+                if sig:
+                    self.assertEqual(caught.exception.code, 128 + sig)
+            finally:
+                if timer:
+                    timer.join()
+            self.assertLess(time.monotonic() - start, 8)
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(children[0].pid, os.WNOHANG)
+            self.assertEqual(handlers, {s: signal.getsignal(s) for s in handlers})
 
 
 class Processing(unittest.TestCase):
@@ -220,6 +536,7 @@ def main():
         assert "mutex_lock(&c->lock)" not in body and "mutex_lock(c->controls.lock)" not in body, name
     (args.output / "extracted-locking.h").write_text(locking)
     (args.output / "extracted-cleanup.h").write_text(c_function(source, "power_down"))
+    (args.output / "extracted-sensor-controls.h").write_text(c_function(source, "sensor_controls"))
     (args.output / "extracted-lifecycle.h").write_text(c_function(source, "queue_setup") + c_function(source, "start_streaming") + c_function(source, "stop_streaming") + c_function(source, "camera_pm_event"))
     (args.output / "extracted-pins.h").write_text("\n".join(c_function(source, name)
         for name in ("mode_reg", "mode_shift", "pin_mode", "pin_out")))

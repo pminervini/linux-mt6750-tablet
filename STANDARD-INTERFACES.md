@@ -1,30 +1,41 @@
 # Guarded standard audio and camera interfaces
 
-This release includes hardware-backed ASoC and V4L2 drivers, guarded legacy
-helpers, and saved-RAW software processing. On 2026-11-13, authorised silent
-checks verified installation, idle enumeration, ordinary unload, and reload on
-the unchanged native Linux 7.3.1 kernel. This is not media-stream acceptance.
+The MT6750/k50v1 tablet has hardware-backed ASoC and V4L2 drivers with guarded
+legacy fallbacks. Bounded digital FM capture, camera streams, and ordinary photos
+have passed on the unchanged native Linux 7.3.1 kernel. Results apply to this
+qualified board/module combination, not every kernel with the same release name.
 
-- [Audio](tools/audio/README.md): the MT6755 card, speaker/FM endpoints, and
-  software mixer enumerate. The owner supplies actual idle-register status,
-  preserving the existing muted RF sweep. `allow_playback=0` and
-  `allow_capture=0` keep both PCM directions disabled.
-- [Camera](tools/camera/v4l2/README.md): both RAW nodes, format/control queries,
-  and media topology enumerate after the ioctl/control-lock repair. Ordinary
-  unload and reload complete. `allow_streaming=0` keeps sensors unpowered.
-- [Saved RAW](tools/camera/raw-develop.py): offline unpack/demosaic/AWB reads
-  saved files only. Synthetic CLI tests do not establish camera capture.
-- The unchanged four-panel renderer still starts and closes the muted FM
-  receiver. Selected volume and its display remain separate from playback.
+- [Audio](tools/audio/README.md): broadcast-derived stereo PCM passed DMA-progress,
+  receiver/gain reversal, normal-close, and reopen checks with analogue outputs
+  independently off. The deployed policy is `legacy_quiesced=1 allow_capture=1
+  allow_playback=0`; defaults still deny capture and playback.
+- [Camera](tools/camera/v4l2/README.md): rear preview 1632x1224, rear full 3264x2448,
+  and front 1600x1200 passed real scene/pattern capture, starvation/competing-owner
+  rejection, cancellation, and reopen. BGGR is supported per mode; delivered
+  cadence is software-rearmed rather than a sensor-FPS guarantee.
+- [Photos](tools/camera/README.md): the existing `tablet-camera` command uses V4L2
+  when its kernel owner is loaded, producing JPEG/PNG with automatic or fixed
+  exposure/gain. `--raw` retains MediaTek packed10 compatibility. Front is unchanged;
+  rear uses the practical vertical flip, with no added horizontal mirror.
+- The four-panel display consumes actual FM PCM for FFT/RMS/peak/clipping and age,
+  clears stale measurements, and preserves input dismissal and console recovery.
+  Missing or unsafe capture remains explicitly unavailable.
 
-Actual PCM/DMA, broadcast-derived audio, either camera's images/video/Bayer
-phase, autofocus, microphone/jack support, and reboot persistence remain open.
-No automatic driver-loading service or new kernel image was installed. The
-legacy helpers/data are retained, but their raw hardware paths correctly refuse
-access while the corresponding kernel driver owns that hardware; explicit
-unload releases that exclusion. Never run old unguarded copies concurrently.
+Camera close returns owned rails, pins, and DMA allocations to idle. The raw
+legacy paths remain excluded while their kernel owner exists; loading and legacy
+access share cooperative locks. Old unguarded copies must not run concurrently.
 
-The new payload contains portable source/tests/documentation, not operator
-settings, identifiers, credentials, firmware, calibration, captures, or trial
-logs. Runtime and rollback receipts remain operator-local. Earlier failed
-trials remain historical evidence; their failures are not represented as passes.
+A guarded camera startup unit is enabled on the qualified installation, without
+a reboot. Its manual loading path and enablement were checked; actual reboot
+persistence remains untested. FM activation remains current-boot-only. Reproduce
+camera startup with operator-local guards as described in the camera README;
+this source release neither enables services nor authorises hardware operation.
+
+Analogue playback, microphones/jack wiring, autofocus, calibrated colour/physical
+chirality, standard-app/libcamera compliance, live suspend stress, and indefinite
+soak remain unaccepted. No kernel image was replaced for these module trials.
+
+Only portable source, tests, and documentation are published. Operator settings,
+identifiers, credentials, firmware, calibration, captures, and trial logs remain
+outside the repositories. Offline synthetic checks and hardware acceptance are
+reported separately; earlier failed trials are retained privately.

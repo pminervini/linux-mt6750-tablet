@@ -1,4 +1,4 @@
-# MT6755 tablet ASoC candidate - guarded idle deployment verified
+# MT6755 tablet ASoC - silent digital FM capture
 
 The board-specific k50v1 MT6750/MT6755 + MT6353 candidate exposes a real ALSA card.
 The approved idle trial verified MT6755 speaker/FM digital endpoint listings,
@@ -7,8 +7,10 @@ Callbacks now use dedicated card drvdata because ASoC card registration owns the
 device drvdata slot; matching-core host API tests reproduce the old wrong read.
 The guarded helper and module set were installed on 2026-11-13. Idle card/mixer
 enumeration, ordinary unload, and reload passed without changing the running
-kernel. Playback and capture are disabled in this deployment. Actual playback,
-recording, DMA/XRUN recovery and genuine received FM PCM remain unverified.
+kernel. Subsequent bounded tests accepted real broadcast-derived FM PCM and
+DMA, receiver/gain reversal controls, natural recorder close, and reopen with
+analogue outputs independently off. Capture is enabled for the current boot;
+playback remains disabled. Microphones and audible output remain unaccepted.
 Detailed hardware-trial receipts remain operator-local and are not shipped
 with this source checkpoint. Earlier build receipts do not identify current
 module bytes or establish PCM acceptance.
@@ -53,8 +55,10 @@ Its `fmradio/core/fm_config.c` selects I2S master/32k/internal-CONNSYS for a SoC
 chip. The receiver must remain open while capturing. A muted receiver may
 supply zero PCM: zero, missing clocks or an XRUN must not be called successful
 broadcast-audio capture. No generated samples are returned by this driver.
-A future approved digital stream may be consumed by arecord on device 1, or
-piped to aplay device 0 **only after separate analogue-playback approval**.
+Approved digital capture uses arecord on device 1. Receiver mute/zero gain can
+produce near-zero DMA even when the route works: the accepted gain/unmute dwell
+keeps codec/DAC/amplifier enables independently off and verifies receiver readbacks.
+Any aplay/device-0 route still requires separate analogue-playback approval.
 
 ## FM dashboard backend
 
@@ -67,10 +71,12 @@ prerequisites are missing; idle loading alone does not opt the dashboard into PC
 across exec into the recorder, so the caller owns and can stop the actual PID.
 Neither command loads modules, tunes a receiver, or enables analogue outputs.
 
-The helper is installed; the four-panel renderer/controller remain byte-identical.
-An actual eye appearance retained all four panels and real muted RF samples,
-then closed the receiver and restored the dark console. Genuine broadcast PCM,
-capture termination/recovery, and displayed live audio metrics remain unverified.
+The four-panel renderer now displays measured FFT/RMS/peak/clipping and sample
+age from accepted FM PCM. It verifies analogue-off state and receiver gain/mute
+readbacks before recording, remutes/zeros gain on retune or dismissal, clears stale
+windows, and drains recorder output during cleanup. Real rotated framebuffer output,
+normal dismissal, owned-renderer termination recovery, and the full sweep deadline
+passed. Existing controller timing, volume feedback, and console recovery are retained.
 
 ## Ownership and approval boundary
 
@@ -86,7 +92,8 @@ opening `/dev/mem`. Even an idle card or failed probe blocks raw start, amp,
 stop until explicit module unload. `status` instead reads the owner's read-only
 `analogue_status` platform attribute: real idle SPM/AFE fields and serialized PMIC
 reads, with errors/busy state propagated and no userspace `/dev/mem` access. The
-renderer retains its independent amplifier-pin checks. The helper holds
+renderer reads the active-safe `capture_status` attribute while recording and
+retains its independent amplifier-pin checks. The helper holds
 `/run/tablet-audio-hardware.lock` for a whole hardware invocation. An approved
 administrator must hold that same flock while loading/unloading the module,
 with old unguarded deployed processes stopped and persistent raw `start`
@@ -100,8 +107,8 @@ are not authorization to execute hardware operations.
 
 `allow_capture` also defaults false and is immutable while loaded. Capture open
 returns EPERM before power/clock/DMA setup unless it is explicitly enabled in a
-separately approved load. The deployed idle configuration keeps both stream
-permissions false; endpoint enumeration does not authorise automatic capture.
+separately approved load. The accepted current-boot deployment uses
+`allow_capture=1 allow_playback=0`; enumeration alone does not authorise capture.
 
 This cooperative guard cannot stop arbitrary root programs using `/dev/mem`
 (the running kernel has STRICT_DEVMEM disabled), old copies of the helper, or
@@ -229,7 +236,7 @@ Evidence directory `$BUILD_OUTPUT/`:
 
 ## Limitations and next approval
 
-**Idle-only runtime evidence.** The original running kernel has CONFIG_SOUND disabled and
+The original running kernel has CONFIG_SOUND disabled and
 MODVERSIONS disabled. The unchanged prepared config hash is
 `d18cfea64d6f7fcbaea7d800ca5473b6c612a6051a3107f6c6e862d887ff0a45`;
 this build has a different, explicitly recorded sound-enabled config.
@@ -245,8 +252,10 @@ setup. The 2026-11-13 deployment then checked the unchanged source/configuration
 framework-private layout differences, and complete imported-symbol/dependency
 closure before a bounded silent load. Card/endpoints/mixer, owner status,
 ordinary unload/reload, and coexistence with the RF display passed. These results
-do not establish PCM operation or general ABI compatibility on another kernel.
-Modules/helpers are installed and idle-loaded; no boot-autoload policy was added.
+establish the earlier idle gate, not general ABI compatibility on another kernel.
+Later bounded digital capture verified broadcast-derived PCM, changing AWB DMA,
+receiver/gain reversals, natural close, and reopen with analogue outputs off.
+Modules/helpers are installed; FM boot autoload remains unconfigured.
 
 The board lacks an audio genpd/CCF consumer in the current DTS, so this candidate
 retains narrowly scoped BSP-derived AUDIO MTCMOS and AFE gates plus the
@@ -256,7 +265,8 @@ power-domain driver. Playback still uses the known codec shutdown sequence
 not a new complete codec DAPM/regulator/runtime-PM implementation. No suspend/
 resume, long-running DMA stability, thermal/power or audible acceptance exists.
 The ALSA path is S16, unlike the raw fallback's 24-in-32 samples. DMA/ASRC input
-clocking and actual RDS-preserving digital audio remain unverified on silicon.
+clocking and RDS-preserving digital capture passed the bounded tests above;
+long-duration stability, explicit hardware XRUN stress, and reboot persistence remain untested.
 
 No microphone or headphone-jack detection/playback capability is implemented
 or promised. HPL/HPR in the speaker sequence is evidence for the AW8736 feed,
@@ -264,15 +274,8 @@ not proof of a fitted usable headphone jack. Wiring, mic source/type/bias,
 ACCDET/jack polarity and headphone protection remain blockers pending separate
 board evidence. No guessed microphone/jack register writes were added.
 
-Next ask is **not permission to enable sound**: obtain explicit authorization
-for a bounded **digital-only** FM DMA test, under the admission lock, with
-allow_playback=0 and explicit allow_capture=1
-and independently established codec/amplifier-off state before/after. Keep WMT
-and receiver/RDS ownership intact. Do not advertise captured broadcast PCM
-until real changing hardware DMA and broadcast-derived samples are evidenced.
-Analogue speaker testing needs a separate approval; mic/jack work needs wiring
-before implementation. Rootfs deployment and idle loading are now verified;
-persistent loading/services, common build integration, and kernel/DT changes
-remain separate actions. A separately authorised recovery
-reboot restored the original setup after the camera trial; it was not a
-persistence test. This source checkpoint does not authorise hardware activation.
+Further hardware work needs separate approval: analogue speaker playback,
+microphone/jack implementation after wiring evidence, live suspend/stress, and
+FM startup/reboot acceptance. Retain `allow_playback=0` and the independent
+analogue-off checks during digital capture. Do not unload shared WMT. A source
+checkout or successful build does not authorise loading or recording.

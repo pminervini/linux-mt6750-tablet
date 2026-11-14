@@ -54,7 +54,7 @@ struct v4l2_device { struct media_device *mdev; };
 struct file;
 struct v4l2_ioctl_ops { long (*vidioc_default)(struct file *,void *,bool,unsigned int,void *); };
 struct video_device { struct mutex *lock; struct vb2_queue *queue; struct v4l2_device *v4l2_dev; const struct v4l2_ioctl_ops *ioctl_ops; int dev_debug,prio; };
-struct camera { struct mutex lock; struct v4l2_ctrl_handler controls; struct v4l2_ctrl *exposure; struct v4l2_ctrl_ref reference; struct v4l2_ctrl storage; unsigned index,mode; struct vb2_queue queue; struct video_device video; struct v4l2_fh fh; _Atomic int exposure_lines,gain_units; };
+struct camera { struct mutex lock; struct v4l2_ctrl_handler controls; struct v4l2_ctrl *exposure; struct v4l2_ctrl_ref reference; struct v4l2_ctrl storage; unsigned index,mode; struct vb2_queue queue; struct video_device video; struct v4l2_fh fh; _Atomic int exposure_lines,gain_units,test_pattern; };
 struct file { struct camera *c; };
 struct board_mode { unsigned width,height,vts; };
 static const struct board_mode board_modes[]={{1632,1224,1246},{3264,2448,2482},{1600,1200,1240}};
@@ -87,7 +87,16 @@ static struct v4l2_ioctl_info v4l2_ioctls[V4L2_IOCTLS];
 static bool v4l2_is_known_ioctl(unsigned cmd) { return v4l2_ioctls[_IOC_NR(cmd)].ioctl==cmd; }
 static bool is_valid_ioctl(struct video_device *d,unsigned cmd) { (void)d;(void)cmd; return true; }
 static void v4l_print_default(const void *a,bool b) { (void)a;(void)b; }
+static struct camera *format_camera;
+static unsigned format_mode;
+static void *format_memset(void *dest, int value, size_t size) {
+ if (format_camera) assert(format_camera->mode == format_mode);
+ return memset(dest, value, size);
+}
+#define memset format_memset
 #include "extracted-locking.h"
+#undef memset
+static long try_format(const struct v4l2_ioctl_ops *o,struct file *f,void *a) { (void)o; return try_fmt(f,NULL,a); }
 static long query(const struct v4l2_ioctl_ops *o,struct file *f,void *a) { (void)o; return v4l2_query_ext_ctrl(&f->c->controls,a); }
 static long format(const struct v4l2_ioctl_ops *o,struct file *f,void *a) { (void)o; return set_fmt(f,NULL,a); }
 static long set_control(const struct v4l2_ioctl_ops *o,struct file *f,void *a) { (void)o; struct v4l2_control *v=a; mutex_lock(f->c->controls.lock); int ret=__v4l2_ctrl_s_ctrl(f->c->exposure,v->value); mutex_unlock(f->c->controls.lock); return ret; }
@@ -114,15 +123,32 @@ static void *concurrent(void *arg) {
 }
 int main(void) {
  v4l2_ioctls[_IOC_NR(VIDIOC_QUERY_EXT_CTRL)]=(struct v4l2_ioctl_info){.ioctl=VIDIOC_QUERY_EXT_CTRL,.flags=INFO_FL_CTRL,.func=query};
+ v4l2_ioctls[_IOC_NR(VIDIOC_TRY_FMT)]=(struct v4l2_ioctl_info){.ioctl=VIDIOC_TRY_FMT,.func=try_format};
  v4l2_ioctls[_IOC_NR(VIDIOC_S_FMT)]=(struct v4l2_ioctl_info){.ioctl=VIDIOC_S_FMT,.func=format};
  v4l2_ioctls[_IOC_NR(VIDIOC_S_CTRL)]=(struct v4l2_ioctl_info){.ioctl=VIDIOC_S_CTRL,.flags=INFO_FL_CTRL,.func=set_control};
  v4l2_ioctls[_IOC_NR(VIDIOC_QBUF)]=(struct v4l2_ioctl_info){.ioctl=VIDIOC_QBUF,.flags=INFO_FL_QUEUE,.func=queue};
  for(unsigned index=0;index<2;index++) {
   struct camera c; init_camera(&c,index); struct file f={.c=&c};
+  struct v4l2_ctrl pattern={.handler=&c.controls,.id=V4L2_CID_TEST_PATTERN};
+  for(unsigned value=0;value<2;value++) {
+   pattern.val=value; mutex_lock(c.controls.lock); assert(!control_set(&pattern)); mutex_unlock(c.controls.lock);
+   assert(atomic_load(&c.test_pattern)==(int)value);
+  }
   struct v4l2_query_ext_ctrl q={.id=V4L2_CTRL_FLAG_NEXT_CTRL}; assert(!__video_do_ioctl(&f,VIDIOC_QUERY_EXT_CTRL,&q)); assert(q.id==V4L2_CID_EXPOSURE);
   struct v4l2_format fmt={.fmt.pix={.width=3264,.height=2448}}; assert(!__video_do_ioctl(&f,VIDIOC_S_FMT,&fmt)); assert(fmt.fmt.pix.width==(index?1600U:3264U));
   q=(struct v4l2_query_ext_ctrl){.id=V4L2_CID_EXPOSURE}; assert(!__video_do_ioctl(&f,VIDIOC_QUERY_EXT_CTRL,&q)); assert(q.maximum==(index?1232:2474));
-  c.queue.busy=true; assert(__video_do_ioctl(&f,VIDIOC_S_FMT,&fmt)==-EBUSY); c.queue.busy=false;
+  c.queue.busy=true; assert(__video_do_ioctl(&f,VIDIOC_S_FMT,&fmt)==-EBUSY);
+  for(unsigned mode=0;mode<(index?1U:2U);mode++) {
+   c.mode=mode;
+   for(unsigned requested=0;requested<2;requested++) {
+    fmt=(struct v4l2_format){.fmt.pix={.width=requested?3264:1632,.height=requested?2448:1224}};
+    format_camera=&c; format_mode=mode;
+    assert(!__video_do_ioctl(&f,VIDIOC_TRY_FMT,&fmt));
+    format_camera=NULL;
+    assert(c.mode==mode && fmt.fmt.pix.width==(index?1600U:requested?3264U:1632U));
+   }
+  }
+  c.queue.busy=false;
   modify_error=-EIO; assert(__video_do_ioctl(&f,VIDIOC_S_FMT,&fmt)==-EIO); modify_error=0; assert(!held);
   pthread_t threads[3]; for(unsigned i=0;i<3;i++) assert(!pthread_create(&threads[i],NULL,concurrent,&c)); for(unsigned i=0;i<3;i++) assert(!pthread_join(threads[i],NULL));
   destroy_camera(&c);

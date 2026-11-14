@@ -1,16 +1,13 @@
 # Cameras on mainline (MT6750 tablet)
 
-Both cameras have an established still-photo `tablet-camera` path, programmed
-from userspace through `/dev/mem` with the register values stock Android uses.
-
-The V4L2/media-controller RAW candidate in [`v4l2/`](v4l2/README.md) is now installed
-and idle-loaded: both nodes, formats/controls, media topology, and ordinary unload/reload
-passed silent runtime checks. Streaming remains disabled and unvalidated. It preserves these tables and the old capture
-path, uses genuine vb2 buffer ownership and rearmed CAMSV DMA, and unpacks the non-MIPI packing
-to standard SBGGR10. Do not infer working native video or app support from its build/mock tests.
-The source helper now takes a cooperative lock and refuses capture while that candidate is
-loaded; this guard is deployed. Explicitly unload the kernel owner under the same
-lock before using the retained still path. Never run old unguarded experiments concurrently.
+`tablet-camera` uses the native driver in [`v4l2/`](v4l2/README.md) when
+`mt6750_camera` is loaded, otherwise the retained guarded `/dev/mem` path.
+The native driver release passed real scene/pattern and bounded stream/lifecycle
+checks for rear preview, rear full and front on 2026-11-14. JPEG/PNG capture,
+automatic exposure, fixed exposure/gain, cancellation and reopen also passed.
+This is software-developed RAW, not hardware ISP, full-rate video or general app support.
+Both paths hold the same cooperative lock; native capture never falls back to raw
+MMIO while the kernel owner exists. Never run old unguarded experiments concurrently.
 
 | | rear | front |
 |---|---|---|
@@ -27,17 +24,19 @@ Supplies (MT6353): VCAMIO 1.8 V, VCAMA 2.8 V, VCAMD 1.22 V (shared by both senso
 ## Use
 
 The following are capture commands, not idle checks. Use them only with capture
-approval and the kernel camera owner explicitly unloaded; they refuse otherwise.
+approval. A loaded kernel owner selects V4L2 without opening `/dev/mem`.
 
     sudo /usr/local/bin/tablet-camera -o rear.jpg
     sudo /usr/local/bin/tablet-camera --full -o rear-8mp.jpg
     sudo /usr/local/bin/tablet-camera --front -o front.jpg
     sudo /usr/local/bin/tablet-camera --raw frame.raw ...   # also keep the packed RAW10 frame
 
-5-17 s per photo (auto exposure in a few frames, then demosaic in numpy). sudo's PATH on this
-system has no /usr/local/bin: use the full path.
+Native auto exposure uses at most eight attempts, each V4L2 child bounded to 30 s;
+full resolution takes longer. Both paths demosaic in numpy. Native `--raw` preserves
+the documented MediaTek packed10 file format by repacking LE16 capture data.
+sudo's PATH on this system has no /usr/local/bin: use the full path.
 
-Install (on the tablet; `physbuf.ko` must be built against the running kernel: `make -C ../../out
+Legacy fallback installation (on the tablet; `physbuf.ko` must be built against the running kernel: `make -C ../../out
 M=$PWD/physbuf ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules`):
 
     install -m755 tablet-camera /usr/local/bin/
@@ -45,7 +44,7 @@ M=$PWD/physbuf ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules`):
     cp data/* /usr/local/share/tablet-camera/
     cp physbuf/physbuf.ko /usr/local/lib/tablet-camera/
 
-## Pipeline
+## Legacy pipeline (native DMA/buffering is described in v4l2/)
 
     sensor --MIPI--> CSI analog (0x10217000 / 0x10218000) --> SENINF (0x15008000)
       --mux 3--> CAMSV (0x15009000: TG +0x400, RAW10 packer, IMGO DMA +0x208)
@@ -80,10 +79,11 @@ M=$PWD/physbuf ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules`):
 
 ## Not done
 
-V4L2 idle registration/enumeration and unload are verified, but real images,
-streaming, Bayer phase, and standard-app acceptance remain open. No ISP features (lens shading,
+Bounded native capture and BGGR are accepted; standard-app/libcamera compliance,
+full-rate video and colour calibration are not. No ISP features (lens shading,
 denoise, sharpening, autofocus: the rear focus motor on VLDO28 is not driven, so focus is fixed);
-no video; image orientation is the sensor's (rear flipped vertically to undo the mirroring).
+no full-rate video. Practical output defaults are front unchanged, rear vertical flip,
+and no extra horizontal mirror. Exact physical chirality/rear upright proof remains unclaimed.
 The helper uses the I2C2 controller when its DT node exists (current s7x+ kernels), with a
 userspace bit-bang fallback on older kernels. The candidate requires the real controller.
 

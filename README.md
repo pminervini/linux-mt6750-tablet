@@ -28,7 +28,8 @@ It is not a polished distribution.
 - GPS: open-source engine [opengps-mtk](https://github.com/pminervini/opengps-mtk) (no mnld/libmnl)
 - FM receiver: tuning/retuning and RDS PI, station name, and RadioText verified under native Debian;
   requires the matching receiver-capable connsys revision and stock DSP firmware (see "Not included").
-  FM digital audio capture/playback and reboot persistence are not verified; module loading is manual.
+  bounded broadcast-derived digital PCM capture is verified with analogue outputs off.
+  Playback and reboot persistence remain unverified; FM module loading is manual.
 - established userspace speaker path (`tools/audio/tablet-audio`) retained as an
   unload fallback; the new guarded ALSA deployment keeps playback disabled
 - side-button playback volume in 5% steps, with a rotating two-second bar and percentage
@@ -37,9 +38,10 @@ It is not a polished distribution.
   audio helper in `/usr/local/sbin/`; the renderer needs `python3-pil` and `fonts-dejavu-core`.
 - ambient eyes with four live telemetry panels (2x2 portrait, four columns landscape),
   retaining the six-hour keyboard-idle gate, random 1-3-hour checks, and 3-5-minute appearances.
-  An available, unowned FM receiver performs a timestamped sequential RSSI sweep and
-  dwells for received RDS names. Analogue outputs must be off; receiver mute/volume zero
-  remain selected. Missing PCM is labelled unavailable, without invented spectra/levels.
+  An available, unowned FM receiver performs a timestamped sequential RSSI sweep,
+  dwells for RDS names, and supplies measured FFT/RMS/peak/clipping and sample age.
+  Analogue outputs remain off; approved PCM dwell verifies receiver gain/mute and
+  cleanup remutes/zeros gain. Missing or unsafe PCM is labelled unavailable.
   Install the HUP-aware `fmctl` from the receiver-capable connsys source in `/usr/local/bin/`;
   the display neither loads drivers nor enables playback. FM module loading remains manual,
   and reboot persistence is unverified. Offline checks:
@@ -56,18 +58,19 @@ It is not a polished distribution.
 - auto-rotation: the text console follows the tablet's orientation (accelerometer, `tablet-rotate`)
 - containers: Docker (Debian's `docker.io`) with its default bridge networking and published ports;
   the kernel config carries the netfilter/overlay/veth pieces it needs
-- cameras: rear OV8856 (8 MP) and front GC2365 (2 MP) take still photos with `tablet-camera`, a
-  userspace capture pipeline (sensor -> SENINF -> CAMSV raw dump -> demosaic/AE/AWB) with no kernel
-  camera driver needed (`tools/camera`); the installed ownership guard refuses this raw path
-  while the new kernel camera owner is loaded
-- standard audio/camera interfaces: the ASoC card/endpoints/mixer and both V4L2 RAW
-  nodes' formats/controls/media topology enumerate; ordinary unload and reload passed.
-  Playback, FM PCM capture, and camera streaming remain disabled. The four-panel
-  muted RF display still works. See [the verified scope](STANDARD-INTERFACES.md).
+- cameras: rear OV8856 (1632x1224 or 3264x2448) and front GC2365 (1600x1200)
+  pass native V4L2 scene/pattern, cancellation, starvation/competing-owner, and reopen
+  checks. `tablet-camera` produces software-developed JPEG/PNG with automatic or fixed
+  exposure/gain; its guarded legacy path remains an unload fallback.
+- standard interfaces: real digital FM DMA/PCM and camera RAW streams are accepted
+  within the bounded test scope. Camera close recovers owned power and allocations.
+  Camera startup is enabled after separate approval and manual loader tests; actual
+  reboot persistence remains untested. See [the verified scope](STANDARD-INTERFACES.md).
 
-Not accepted yet: actual PCM/DMA, V4L2 images/video/Bayer phase and app support,
-autofocus, microphone/jack support, reboot persistence, CPU frequency scaling beyond
-the boot loader's operating point (a small userspace governor switches between two points), GPU.
+Not accepted yet: analogue playback, microphones/jack wiring, autofocus, calibrated
+colour/physical chirality, standard-app/libcamera compliance, live suspend stress,
+indefinite soak, and reboot persistence. CPU frequency scaling beyond the boot
+loader's operating point uses a small two-point userspace governor; the GPU is unsupported.
 
 ## Building
 

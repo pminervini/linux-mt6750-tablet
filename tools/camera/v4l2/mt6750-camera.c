@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
-/* MT6750 k50v1 board candidate. NO hardware is touched at registration.
+/* MT6750 k50v1 board candidate. Registration leaves sensors unpowered;
+ * its reserved CPU interrupt remains masked while status is polled.
  * STREAMON is the only power-on path. See README.md before any activation.
  * Board tables: existing still helper/data; CAMSV sequence adapted from
  * BayLibre ISP3.0 v8 (Copyright 2020 BayLibre / 2022 MediaTek Inc.).
@@ -9,10 +10,14 @@
 #include <linux/i2c.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdomain.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
+#include <linux/sched/task.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 #include <linux/wait.h>
@@ -60,7 +65,7 @@ struct camera {
 	struct media_pad sensor_pad, receiver_pads[2];
 	struct v4l2_ctrl_handler controls;
 	struct v4l2_ctrl *exposure, *gain;
-	atomic_t exposure_lines, gain_units;
+	atomic_t exposure_lines, gain_units, test_pattern;
 	unsigned int sequence;
 	bool stopping, registered, sensor_started;
 };
@@ -249,6 +254,8 @@ static int sensor_read(struct camera *c, u16 reg)
 	};
 	int ret = i2c_transfer(c->client->adapter, msgs, 2);
 
+	if (ret != 2)
+		dev_err(&c->board->pdev->dev, "sensor%u read %#x: I2C result %d\n", c->index, reg, ret);
 	return ret == 2 ? value : ret < 0 ? ret : -EIO;
 }
 static int sensor_table(struct camera *c, const struct board_reg *table, unsigned int count)
@@ -285,16 +292,22 @@ static const struct board_mode *current_mode(struct camera *c)
 static int sensor_controls(struct camera *c)
 {
 	unsigned int lines = atomic_read(&c->exposure_lines), gain = atomic_read(&c->gain_units);
+	bool pattern = atomic_read(&c->test_pattern);
 	int ret;
 	unsigned int i;
 	struct board_reg regs[10];
 
 	if (!c->index) {
+		/* Preserve unrelated processing bits, as in the stock sensor driver. */
+		int processing = sensor_read(c, 0x5000);
 		struct board_reg r[] = {
 			{ 0x3500, (lines >> 12) & 15 }, { 0x3501, (lines >> 4) & 255 },
 			{ 0x3502, (lines << 4) & 255 }, { 0x3508, gain >> 8 }, { 0x3509, gain & 255 },
+			{ 0x5e00, pattern ? 0x80 : 0 }, { 0x5000, (processing & 0xbf) | (pattern ? 0 : 0x40) },
 		};
 
+		if (processing < 0)
+			return processing;
 		return sensor_table(c, r, ARRAY_SIZE(r));
 	} else {
 		static const unsigned int thresholds[] = { 64, 89, 123, 170, 248, 344, 494 };
@@ -312,7 +325,8 @@ static int sensor_controls(struct camera *c)
 		regs[4] = (struct board_reg){ 0xb6, stage };
 		regs[5] = (struct board_reg){ 0xb1, fine >> 6 };
 		regs[6] = (struct board_reg){ 0xb2, (fine << 2) & 252 };
-		ret = sensor_table(c, regs, 7);
+		regs[7] = (struct board_reg){ 0x8c, pattern ? 1 : 0 };
+		ret = sensor_table(c, regs, 8);
 		return ret;
 	}
 }
@@ -348,6 +362,7 @@ static int power_down(struct camera *c)
 		if (!ret)
 			b->safe = true;
 		writel(0, b->sen + 0x200);
+		writel(0, b->sen + 0x600);
 	}
 	if (b->snapshot) {
 		pin_out(b, 110, false);
@@ -396,8 +411,10 @@ static int power_up(struct camera *c)
 	for (i = 0; i < ARRAY_SIZE(pins); i++)
 		pin_mode(b, pins[i], 0);
 	pin_out(b, 107, false); pin_out(b, 108, true); pin_out(b, 110, false);
-	/* Only selected MCLK pin muxed; inactive camera stays in PDN. */
-	pin_mode(b, c->index ? 109 : 161, 1);
+	/* Keep the legacy TG1 pad enabled; inactive camera stays in PDN. */
+	pin_mode(b, 161, 1);
+	if (c->index)
+		pin_mode(b, 109, 1);
 	for (i = 0; i < 3; i++) {
 		ret = mt6755_pmic_rmw(pmic_regs[i], pmic_masks[i], 0, 0x300);
 		if (ret)
@@ -613,12 +630,15 @@ static int start_streaming(struct vb2_queue *q, unsigned int count)
 	ret = power_up(c);
 	if (ret)
 		goto power_fail;
-	c->worker = kthread_run(capture_worker, c, "mt6750-cam%u", c->index);
+	c->worker = kthread_create(capture_worker, c, "mt6750-cam%u", c->index);
 	if (IS_ERR(c->worker)) {
 		ret = PTR_ERR(c->worker);
 		c->worker = NULL;
 		goto power_fail;
 	}
+	/* Keep an error-exited worker valid until STREAMOFF joins it. */
+	get_task_struct(c->worker);
+	wake_up_process(c->worker);
 	mutex_unlock(&b->owner_lock);
 	return 0;
 
@@ -649,9 +669,12 @@ static void stop_streaming(struct vb2_queue *q)
 	WRITE_ONCE(c->stopping, true);
 	wake_up(&c->wait);
 	if (c->worker) {
-		kthread_stop(c->worker); /* includes bounded DMA fence and power-down */
+		kthread_stop_put(c->worker);
 		c->worker = NULL;
 	}
+	/* A never-entered worker leaves its power snapshot for us to unwind. */
+	if (b->snapshot)
+		power_down(c);
 	return_buffers(c, VB2_BUF_STATE_ERROR);
 	if (b->dma_cpu && b->safe) {
 		dma_free_coherent(&b->pdev->dev, b->dma_size, b->dma_cpu, b->dma_address);
@@ -671,10 +694,8 @@ static const struct vb2_ops queue_ops = {
 	.start_streaming = start_streaming,
 	.stop_streaming = stop_streaming,
 };
-static void fill_format(struct camera *c, struct v4l2_pix_format *pix)
+static void fill_format(const struct board_mode *m, struct v4l2_pix_format *pix)
 {
-	const struct board_mode *m = current_mode(c);
-
 	memset(pix, 0, sizeof(*pix));
 	pix->width = m->width; pix->height = m->height;
 	pix->pixelformat = V4L2_PIX_FMT_SBGGR10;
@@ -701,18 +722,16 @@ static int enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 }
 static int get_fmt(struct file *file, void *priv, struct v4l2_format *fmt)
 {
-	fill_format(video_drvdata(file), &fmt->fmt.pix);
+	fill_format(current_mode(video_drvdata(file)), &fmt->fmt.pix);
 	return 0;
 }
 static int try_fmt(struct file *file, void *priv, struct v4l2_format *fmt)
 {
 	struct camera *c = video_drvdata(file);
-	unsigned int saved = c->mode;
+	unsigned int mode = c->index ? 2 :
+		fmt->fmt.pix.width > 2448 || fmt->fmt.pix.height > 1836;
 
-	if (!c->index)
-		c->mode = fmt->fmt.pix.width > 2448 || fmt->fmt.pix.height > 1836;
-	fill_format(c, &fmt->fmt.pix);
-	c->mode = saved;
+	fill_format(&board_modes[mode], &fmt->fmt.pix);
 	return 0;
 }
 static int set_fmt(struct file *file, void *priv, struct v4l2_format *fmt)
@@ -811,9 +830,12 @@ static int control_set(struct v4l2_ctrl *ctrl)
 		atomic_set(&c->exposure_lines, ctrl->val);
 	else if (ctrl->id == V4L2_CID_ANALOGUE_GAIN)
 		atomic_set(&c->gain_units, ctrl->val);
+	else if (ctrl->id == V4L2_CID_TEST_PATTERN)
+		atomic_set(&c->test_pattern, ctrl->val);
 	return 0; /* worker applies controls over I2C; no idle sensor activation */
 }
 static const struct v4l2_ctrl_ops ctrl_ops = { .s_ctrl = control_set };
+static const char * const test_pattern_menu[] = { "Disabled", "Colour bars" };
 static int pad_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *state,
 		   struct v4l2_subdev_format *fmt)
 {
@@ -852,12 +874,14 @@ static int register_path(struct board *b, struct camera *c, unsigned int index,
 	if (IS_ERR(c->client))
 		return PTR_ERR(c->client);
 	m = current_mode(c);
-	v4l2_ctrl_handler_init(&c->controls, 2);
+	v4l2_ctrl_handler_init(&c->controls, 3);
 	/* Keep the handler's own mutex: video_ioctl2 already holds c->lock. */
 	c->exposure = v4l2_ctrl_new_std(&c->controls, &ctrl_ops, V4L2_CID_EXPOSURE,
 		6, m->vts - 8, 1, m->vts / 2);
 	c->gain = v4l2_ctrl_new_std(&c->controls, &ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
 		index ? 64 : 128, index ? 493 : 1984, 1, index ? 64 : 128);
+	v4l2_ctrl_new_std_menu_items(&c->controls, &ctrl_ops, V4L2_CID_TEST_PATTERN,
+		1, 0, 0, test_pattern_menu);
 	ret = c->controls.error;
 	if (ret)
 		goto free_controls;
@@ -1011,11 +1035,25 @@ static int camera_pm_event(struct notifier_block *nb, unsigned long event, void 
 }
 static struct notifier_block camera_pm_notifier = { .notifier_call = camera_pm_event };
 
+static irqreturn_t unexpected_camera_irq(int irq, void *data)
+{
+	disable_irq_nosync(irq);
+	pr_err("mt6750-camera: unexpected CPU interrupt masked\n");
+	return IRQ_HANDLED;
+}
+static void dispose_camera_irq(void *data)
+{
+	irq_dispose_mapping((unsigned long)data);
+}
 static int camera_probe(struct platform_device *pdev)
 {
 	struct board *b;
 	struct i2c_adapter *adapter;
 	struct resource resource;
+	struct device_node *irq_node;
+	struct irq_domain *irq_domain;
+	struct irq_fwspec irq_spec;
+	unsigned int irq;
 	int ret;
 
 	b = kzalloc(sizeof(*b), GFP_KERNEL);
@@ -1037,6 +1075,37 @@ static int camera_probe(struct platform_device *pdev)
 	/* Shared syscon blocks: never claim them against pinctrl / PM domains. */
 	MAP(spm, 0x10006000, 0x1000, true);
 	MAP(gpio, 0x10005000, 0x1000, true);
+	/* Exact-board stock CAMSV SPI 0xd5. CPU delivery remains disabled:
+	 * completion/error status is polled, never IRQ-led.
+	 */
+	irq_node = of_find_compatible_node(NULL, NULL, "mediatek,mt6755-sysirq");
+	if (!irq_node) {
+		ret = -ENODEV;
+		goto free_board;
+	}
+	irq_domain = irq_find_host(irq_node);
+	ret = of_address_to_resource(irq_node, 0, &resource);
+	if (ret || resource.start != 0x10200620 || !irq_domain || irq_find_mapping(irq_domain, 0xd5)) {
+		of_node_put(irq_node);
+		ret = -EBUSY;
+		goto free_board;
+	}
+	irq_spec = (struct irq_fwspec){ .fwnode = of_fwnode_handle(irq_node),
+		.param_count = 3, .param = { 0, 0xd5, IRQ_TYPE_LEVEL_HIGH } };
+	irq = irq_create_fwspec_mapping(&irq_spec);
+	of_node_put(irq_node);
+	if (!irq) {
+		ret = -ENODEV;
+		goto free_board;
+	}
+	/* devres releases the later IRQ action before disposing this mapping. */
+	ret = devm_add_action_or_reset(&pdev->dev, dispose_camera_irq, (void *)(unsigned long)irq);
+	if (ret)
+		goto free_board;
+	ret = devm_request_irq(&pdev->dev, irq, unexpected_camera_irq,
+		IRQF_NO_AUTOEN, "mt6750-camera-poll", NULL);
+	if (ret)
+		goto free_board;
 	b->io = (struct mtk_io){
 		.ctx = b, .read = cam_read, .write = cam_write,
 		.sleep_us = cam_sleep, .now_us = cam_now, .cancelled = cam_cancelled,

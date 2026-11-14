@@ -26,6 +26,19 @@ SAFE_STATUS = ('PWR_STATUS.audio=0 DAC_CON0=0x00000000 ADDA_DL=0x00000000 '
                'PMIC AUDDEC0=0x0000 UL_DL=0x0000\n')
 
 
+# Synthetic owner states only; these are not captured hardware receipts.
+IDLE_CAPTURE = ('users=0 capture_prepared=0 capture_running=0 codec_on=0 gpio_mapped=0 '
+                'PWR_STATUS.audio=0 DAC_CON0=0x28000000 ADDA_DL=0x0f000000 '
+                'AUDDEC0=0x0000 UL_DL=0x0000 AWB_BASE=0x00000000 '
+                'AWB_CUR=0x00000000 AWB_END=0x00000000 capture_xrun=0')
+LIVE_CAPTURE = (IDLE_CAPTURE.replace('users=0', 'users=1').replace('capture_prepared=0', 'capture_prepared=1')
+                .replace('capture_running=0', 'capture_running=1').replace('PWR_STATUS.audio=0', 'PWR_STATUS.audio=1')
+                .replace('DAC_CON0=0x28000000', 'DAC_CON0=0x28000041')
+                .replace('AWB_BASE=0x00000000', 'AWB_BASE=0xbda48000')
+                .replace('AWB_CUR=0x00000000', 'AWB_CUR=0xbda49000')
+                .replace('AWB_END=0x00000000', 'AWB_END=0xbda4ffff'))
+
+
 class Process:
     def __init__(self, output=b'', returncode=None):
         r, self.w = os.pipe()
@@ -42,6 +55,19 @@ class Process:
     def wait(self, timeout=None):
         self.returncode = self.returncode or 0
         return self.returncode
+
+    def communicate(self, timeout=None):
+        chunks = []
+        while True:
+            try:
+                chunk = os.read(self.stdout.fileno(), 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        self.wait(timeout)
+        return b''.join(chunks), None
 
     def terminate(self):
         self.returncode = -15
@@ -223,6 +249,244 @@ class SentinelTests(unittest.TestCase):
         self.assertIsNone(self.fm.clipped)
         self.assertEqual(self.fm.audio_at, 0)
 
+    def arm_capture(self):
+        self.receiver(b'tuned 87.50 MHz\nrssi -95 dBm, mono\n')
+        self.fm.phase, self.fm.capture_ready = 'station-tuning', True
+        with patch.object(self.fm, 'silent_preflight', return_value=False), patch.object(s.subprocess, 'Popen', side_effect=AssertionError('capture before readback')):
+            self.fm.poll()
+        self.assertTrue(self.fm.audio_armed)
+        self.assertEqual(self.fm.tuner.stdin.getvalue(), b'v 1\nu\ng 7d\ng 9c\n')
+        self.assertEqual(self.fm.bins, [])
+
+    def test_controls_require_both_exact_readbacks_and_fresh_owner(self):
+        self.arm_capture()
+        os.write(self.fm.tuner.w, b'reg 7d = 040c\nreg 9c = 00')
+        with patch.object(self.fm, 'silent_preflight', return_value=False), patch.object(s.subprocess, 'Popen', side_effect=AssertionError):
+            self.fm.poll()
+        self.assertEqual(self.fm.controls, {'7d': 0x040c})
+        os.write(self.fm.tuner.w, b'00\n')
+        capture = self.process(bytes(4096))  # Synthetic silence, not broadcast PCM.
+        with patch.object(self.fm, 'silent_preflight', return_value=False) as gate, patch.object(s.subprocess, 'Popen', return_value=capture) as launch:
+            self.fm.poll()
+        gate.assert_called_once_with('idle')
+        launch.assert_called_once_with(['/usr/local/sbin/tablet-audio', 'fm-record', '5', '-'], stdout=s.subprocess.PIPE, stderr=s.subprocess.DEVNULL)
+        self.assertEqual(self.fm.bins, [], 'startup PCM cannot imply a running owner')
+        self.assertEqual(self.fm.audio_at, 0)
+        os.write(capture.w, bytes(4096))
+        with patch.object(self.fm, 'silent_preflight', return_value=True):
+            self.fm.poll()
+        self.assertIn('digital silence', self.fm.audio)
+        self.assertEqual(len(self.fm.bins), 40)
+
+    def test_bad_or_late_controls_remute_without_stopping_rf(self):
+        for output in (b'reg 7d = 0000\n', b'reg 9c = 0003\n', b'reg 9c = 0001\n',
+                       b'reg 7d = 040c bad\n', b'reg 0x7d: Input/output error\n',
+                       b'reg 7d = 040c\nreg 7d = 040c\n', b'headphones out: muted, they are the antenna\n', b''):
+            with self.subTest(output=output):
+                self.fm.close()
+                self.fm = s.FM(False)
+                self.arm_capture()
+                os.write(self.fm.tuner.w, output)
+                if not output:
+                    self.fm.control_deadline = 0
+                with patch.object(self.fm, 'silent_preflight', return_value=False), patch.object(s.subprocess, 'Popen', side_effect=AssertionError):
+                    self.fm.poll()
+                self.assertIsNotNone(self.fm.tuner)
+                self.assertFalse(self.fm.audio_armed)
+                self.assertTrue(self.fm.tuner.stdin.getvalue().endswith(b'm\nv 0\n'))
+                self.assertEqual(self.fm.bins, [])
+
+    def test_readback_arriving_at_deadline_cannot_start_capture(self):
+        self.arm_capture()
+        os.write(self.fm.tuner.w, b'reg 7d = 040c\nreg 9c = 0000\n')
+        self.fm.control_deadline = 0
+        with patch.object(self.fm, 'silent_preflight', return_value=False), patch.object(s.subprocess, 'Popen', side_effect=AssertionError):
+            self.fm.poll()
+        self.assertFalse(self.fm.audio_armed)
+        self.assertIn('timeout', self.fm.audio)
+
+    def test_reasserted_chipmute_stops_capture_and_clears_metrics(self):
+        self.arm_capture()
+        self.fm.capture = self.process()
+        self.fm.capture_live = True
+        self.fm.controls, self.fm.control_at = None, 0
+        self.fm.bins, self.fm.audio_at, self.fm.level_dbfs = [-6]*40, time.monotonic(), -6
+        with patch.object(self.fm, 'silent_preflight', return_value=True):
+            self.fm.poll()
+        self.assertTrue(self.fm.tuner.stdin.getvalue().endswith(b'g 7d\ng 9c\n'))
+        os.write(self.fm.tuner.w, b'reg 7d = 040c\nreg 9c = 0003\n')
+        self.fm.poll()
+        self.assertIsNone(self.fm.capture)
+        self.assertIsNone(self.fm.level_dbfs)
+        self.assertEqual(self.fm.audio_at, 0)
+        self.assertEqual(self.fm.bins, [])
+        self.assertIsNotNone(self.fm.tuner)
+
+    def test_optional_setup_failure_always_remutes(self):
+        for error in (OSError('absent status'), RuntimeError('unsafe pins')):
+            with self.subTest(error=error):
+                self.receiver(b'tuned 87.50 MHz\nrssi -95 dBm, mono\n')
+                self.fm.phase, self.fm.capture_ready = 'station-tuning', True
+                with patch.object(self.fm, 'silent_preflight', side_effect=error), patch.object(s.subprocess, 'Popen', side_effect=AssertionError):
+                    self.fm.poll()
+                self.assertIsNotNone(self.fm.tuner)
+                self.assertEqual(self.fm.tuner.stdin.getvalue(), b'm\nv 0\n')
+                self.assertEqual(self.fm.phase, 'dwell')
+
+    def test_startup_grace_is_bounded_and_running_gate_failure_stops(self):
+        for live, error in ((False, None), (True, RuntimeError('codec unsafe')), (True, OSError('missing status'))):
+            with self.subTest(live=live, error=error):
+                self.fm.close()
+                self.fm = s.FM(False)
+                self.arm_capture()
+                self.fm.controls, self.fm.control_at = None, time.monotonic()+10
+                self.fm.capture = self.process(bytes(4096))
+                self.fm.capture_deadline = time.monotonic()+2
+                self.fm.capture_live = live
+                with patch.object(self.fm, 'silent_preflight', return_value=False, side_effect=error):
+                    self.fm.poll()
+                self.assertEqual(self.fm.bins, [])
+                if not live:
+                    self.assertIsNotNone(self.fm.capture, 'safe prepared=0/running=0 is startup, not analogue unsafe')
+                    self.fm.capture_deadline = 0
+                    with patch.object(self.fm, 'silent_preflight', side_effect=AssertionError('late startup accepted')):
+                        self.fm.poll()
+                    self.assertIn('startup timeout', self.fm.audio)
+                self.assertIsNone(self.fm.capture)
+                self.assertIsNotNone(self.fm.tuner)
+                self.assertTrue(self.fm.tuner.stdin.getvalue().endswith(b'm\nv 0\n'))
+
+    def test_owner_gate_live_idle_and_starting(self):
+        policies = {'allow_playback': 'N', 'allow_capture': 'Y', 'legacy_quiesced': 'Y'}
+        for state, status, active in (('idle', IDLE_CAPTURE, False), ('starting', IDLE_CAPTURE, False),
+                                      ('starting', LIVE_CAPTURE.replace('capture_running=1', 'capture_running=0'), False),
+                                      ('running', LIVE_CAPTURE, True)):
+            with self.subTest(state=state, status=status), patch.object(s.Path, 'read_text', autospec=True, side_effect=lambda p: policies.get(p.name, status)), patch.object(s.os, 'open', return_value=91), patch.object(s.os, 'close'), patch.object(s.mmap, 'mmap', return_value=nullcontext(bytes(4096))):
+                self.assertEqual(self.fm.silent_preflight(state), active)
+
+    def test_owner_gate_rejects_unknown_unsafe_policy_status_and_pins(self):
+        policies = {'allow_playback': 'N', 'allow_capture': 'Y', 'legacy_quiesced': 'Y'}
+        bad_states = [LIVE_CAPTURE+' codec_on=0', LIVE_CAPTURE.replace('codec_on=0', 'codec_on=1'),
+                      LIVE_CAPTURE.replace('gpio_mapped=0', 'gpio_mapped=1'), LIVE_CAPTURE.replace('ADDA_DL=0x0f000000', 'ADDA_DL=0x0f000001'),
+                      LIVE_CAPTURE.replace('DAC_CON0=0x28000041', 'DAC_CON0=0x28000045'), LIVE_CAPTURE.replace('AUDDEC0=0x0000', 'AUDDEC0=0x0060'),
+                      LIVE_CAPTURE.replace('UL_DL=0x0000', 'UL_DL=0x0001'), LIVE_CAPTURE.replace('capture_xrun=0', 'capture_xrun=1'),
+                      LIVE_CAPTURE.replace('AWB_CUR=0xbda49000', 'AWB_CUR=0x00000000'), '']
+        bad_states += [' '.join(t for t in LIVE_CAPTURE.split() if not t.startswith(key+'=')) for key in dict(t.split('=') for t in LIVE_CAPTURE.split())]
+        for status in bad_states:
+            with self.subTest(status=status), patch.object(s.Path, 'read_text', autospec=True, side_effect=lambda p: policies.get(p.name, status)):
+                with self.assertRaises((RuntimeError, ValueError)):
+                    self.fm.silent_preflight('running')
+        for key in policies:
+            with self.subTest(policy=key), patch.object(s.Path, 'read_text', autospec=True, side_effect=lambda p: 'unknown' if p.name == key else policies.get(p.name, LIVE_CAPTURE)):
+                with self.assertRaisesRegex(RuntimeError, 'policy'):
+                    self.fm.silent_preflight('running')
+        for pin in (0, 54, 62):
+            page = bytearray(4096)
+            struct.pack_into('<I', page, 0x100+(pin//32)*0x10, 1 << (pin % 32))
+            with self.subTest(pin=pin), patch.object(s.Path, 'read_text', autospec=True, side_effect=lambda p: policies.get(p.name, LIVE_CAPTURE)), patch.object(s.os, 'open', return_value=91), patch.object(s.os, 'close'), patch.object(s.mmap, 'mmap', return_value=nullcontext(page)):
+                with self.assertRaisesRegex(RuntimeError, f'GPIO{pin}'):
+                    self.fm.silent_preflight('running')
+
+    def test_stop_remutes_before_retune_and_drain_reaps_on_timeout(self):
+        self.arm_capture()
+        child = self.fm.capture = self.process()
+        with patch.object(child, 'communicate', side_effect=[s.subprocess.TimeoutExpired('offline-child', 1), (b'', None)]) as drain, patch.object(child, 'kill', wraps=child.kill) as kill:
+            self.fm.tune(8870, 'station-tuning')
+        self.assertEqual(drain.call_count, 2)
+        kill.assert_called_once()
+        self.assertTrue(child.stdout.closed)
+        self.assertTrue(self.fm.tuner.stdin.getvalue().endswith(b'm\nv 0\nt 88.70\nr\n'))
+        self.assertIsNone(self.fm.capture)
+
+    def test_full_synthetic_sweep_keeps_all_206_sequential_positions(self):
+        self.receiver()
+        expected = list(range(8750, 10801, 10))
+        for frequency in expected:
+            self.assertEqual(self.fm.target, frequency)
+            os.write(self.fm.tuner.w, f'tuned {frequency/100:.2f} MHz\nrssi -95 dBm, mono\n'.encode())
+            self.fm.poll()
+            self.assertEqual(self.fm.phase, 'sweep')
+            self.fm.deadline = 0
+            self.fm.poll()
+        self.assertEqual(sorted(self.fm.samples), expected)
+        self.assertEqual(len(self.fm.samples), 206)
+        self.assertEqual(self.fm.phase, 'station-tuning')
+        self.assertIsNone(self.fm.capture)
+
+    def test_missing_numpy_keeps_rf_and_remutes_failed_setup(self):
+        self.receiver(b'tuned 87.50 MHz\nrssi -95 dBm, mono\n')
+        self.fm.phase, self.fm.capture_ready = 'station-tuning', True
+        with patch.dict(sys.modules, {'numpy': None}), patch.object(self.fm, 'silent_preflight', side_effect=AssertionError('dependency loaded too late')), patch.object(s.subprocess, 'Popen', side_effect=AssertionError):
+            self.fm.poll()
+        self.assertIsNotNone(self.fm.tuner)
+        self.assertFalse(self.fm.audio_armed)
+        self.assertEqual(self.fm.phase, 'dwell')
+        self.assertEqual(self.fm.tuner.stdin.getvalue(), b'm\nv 0\n')
+
+    def test_idle_gate_is_rechecked_after_valid_controls_before_launch(self):
+        self.arm_capture()
+        os.write(self.fm.tuner.w, b'reg 7d = 040c\nreg 9c = 0000\n')
+        with patch.object(self.fm, 'silent_preflight', side_effect=RuntimeError('idle state changed')), patch.object(s.subprocess, 'Popen', side_effect=AssertionError):
+            self.fm.poll()
+        self.assertIsNone(self.fm.capture)
+        self.assertIsNotNone(self.fm.tuner)
+        self.assertTrue(self.fm.tuner.stdin.getvalue().endswith(b'm\nv 0\n'))
+
+    def test_dismissal_remutes_even_before_capture_launch(self):
+        self.arm_capture()
+        tuner = self.fm.tuner
+        with patch.object(tuner.stdin, 'write', wraps=tuner.stdin.write) as writing:
+            self.fm.close()
+        self.assertEqual([c.args[0] for c in writing.call_args_list], [b'm\nv 0\n', b'q\n'])
+        self.assertIsNone(self.fm.tuner)
+        self.assertIsNone(self.fm.capture)
+
+    def test_real_offline_child_can_flush_full_pipe_on_stop(self):
+        import select
+        self.receiver()
+        script = ('import os,signal,sys\n'
+                  'def stop(*_):\n os.write(1,b"F"*262144)\n sys.exit(0)\n'
+                  'signal.signal(signal.SIGTERM,stop)\nos.write(1,b"R")\n'
+                  'while True: os.write(1,b"X"*65536)\n')
+        child = self.fm.capture = s.subprocess.Popen([sys.executable, '-B', '-c', script], stdout=s.subprocess.PIPE)
+        try:
+            self.assertTrue(select.select([child.stdout], [], [], 2)[0], 'offline child not ready')
+            self.assertEqual(os.read(child.stdout.fileno(), 1), b'R')
+            self.fm.stop_capture()
+            self.assertEqual(child.poll(), 0, 'draining should let the TERM handler finish without KILL')
+            self.assertTrue(child.stdout.closed)
+            self.assertTrue(self.fm.tuner.stdin.getvalue().endswith(b'm\nv 0\n'))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=2)
+            child.stdout.close()
+
+    def test_capture_end_clears_all_metrics_and_remutes(self):
+        self.arm_capture()
+        self.fm.capture = self.process(bytes(4096), returncode=0)
+        self.fm.capture_live = True
+        self.fm.controls, self.fm.control_at = None, time.monotonic()+10
+        with patch.object(self.fm, 'silent_preflight', return_value=True):
+            self.fm.poll()
+        self.assertEqual(self.fm.bins, [])
+        self.assertIsNone(self.fm.level_dbfs)
+        self.assertEqual(self.fm.audio_at, 0)
+        self.assertTrue(self.fm.tuner.stdin.getvalue().endswith(b'm\nv 0\n'))
+
+    def test_stale_window_cannot_be_refreshed_by_one_new_frame(self):
+        self.receiver()
+        self.fm.capture = self.process(bytes(4096))  # Synthetic offline silence.
+        self.fm.poll()
+        first = self.fm.audio_at
+        os.write(self.fm.capture.w, bytes(4))
+        with patch.object(s.time, 'monotonic', return_value=first+0.6):
+            self.fm.poll()
+        self.assertEqual(self.fm.bins, [])
+        self.assertIsNone(self.fm.level_dbfs)
+        self.assertEqual(self.fm.audio_at, first)
+        self.assertEqual(self.fm.pcm, bytes(4))
+
     def test_health_uses_real_source_contracts_and_warns(self):
         battery = '/sys/class/power_supply/battery/'
         values = {battery+'capacity': '15', battery+'health': 'Good', battery+'temp': '300', battery+'current_now': '100000', battery+'voltage_now': '4000000', '/proc/meminfo': 'MemTotal: 2048000 kB\nMemAvailable: 1024000 kB', '/test/thermal/type': 'cpu-thermal', '/test/thermal/temp': '85000', '/test/thermal/trip_point_0_type': 'hot', '/test/thermal/trip_point_0_temp': '80000'}
@@ -365,14 +629,16 @@ class SentinelTests(unittest.TestCase):
         self.assertIn('unavailable', self.fm.audio)
 
     def test_optional_capture_launch_failure_does_not_stop_rf(self):
-        self.receiver(b'tuned 87.50 MHz\nrssi -95 dBm, mono\n')
-        self.fm.phase, self.fm.capture_ready = 'station-tuning', True
-        with patch.object(s.subprocess, 'Popen', side_effect=OSError('capture absent')):
+        self.arm_capture()
+        os.write(self.fm.tuner.w, b'reg 7d = 040c\nreg 9c = 0000\n')
+        with patch.object(self.fm, 'silent_preflight', return_value=False), patch.object(s.subprocess, 'Popen', side_effect=OSError('capture absent')) as launch:
             self.fm.poll()
+        launch.assert_called_once()
         self.assertIsNotNone(self.fm.tuner)
         self.assertIsNone(self.fm.capture)
         self.assertEqual(self.fm.phase, 'dwell')
         self.assertIn('capture unavailable', self.fm.audio)
+        self.assertTrue(self.fm.tuner.stdin.getvalue().endswith(b'm\nv 0\n'))
 
     def test_retune_rejects_old_rf_and_names_until_ack_and_fresh_pi(self):
         self.receiver()

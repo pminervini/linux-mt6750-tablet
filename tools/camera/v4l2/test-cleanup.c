@@ -25,7 +25,7 @@ static int stop_fail, halt_fail, domain_fail, pmic_fail;
 static unsigned int stops, halts, domains, pmics, pins, restores, writes;
 static int sensor_stop(struct camera *c) { assert(c->sensor_started); stops++; return stop_fail; }
 static int mtk_dma_halt(int *io) { (void)io; halts++; return halt_fail; }
-static void writel(unsigned int val, unsigned int *reg) { (void)val; (void)reg; writes++; }
+static void writel(unsigned int val, unsigned int *reg) { *reg = val; writes++; }
 static void pin_out(struct board *b, unsigned int pin, bool high)
 {
 	(void)b;
@@ -64,7 +64,9 @@ int main(void)
 		domain_fail = scenario == 3 || scenario == 10 ? -33 : 0;
 		pmic_fail = scenario >= 4 && scenario < 10 ? scenario - 3 : 0;
 		stops = halts = domains = pmics = pins = restores = writes = 0;
+		mmio[0x200] = mmio[0x600] = 0xa0000001;
 		ret = power_down(&c);
+		assert(mmio[0x200] == 0 && mmio[0x600] == 0);
 		assert(stops == 1 && halts == 1 && domains == 1 && pmics == 6 && pins == 3 && restores == 1);
 		assert(!c.sensor_started && !b.snapshot);
 		assert(b.safe == (scenario != 10));
@@ -73,7 +75,7 @@ int main(void)
 		assert(ret == (scenario == 1 ? -11 : scenario == 2 || scenario == 10 ? -22 :
 			scenario == 3 ? -33 : scenario >= 4 && scenario < 10 ? -55 : 0));
 		/* Do not restore larb / gates while DMA might still be active. */
-		assert(writes == (halt_fail ? 1U : 3U));
+		assert(writes == (halt_fail ? 2U : 4U));
 	}
 	puts("PASS extracted production cleanup: success, sensor-stop, DMA-reset, domain-off, each PMIC field, combined unsafe failure; all cleanup steps attempted; quarantine flag");
 	return 0;

@@ -20,7 +20,7 @@ STOP = False
 
 
 class FM:
-    """One muted tuner: sweep first, then dwell for RDS and digital audio."""
+    """One silent tuner: sweep first, then dwell for RDS and digital audio."""
     def __init__(self, enabled=True):
         self.tuner = self.capture = None
         self.samples, self.names, self.bins = {}, {}, []
@@ -30,6 +30,9 @@ class FM:
         self.phase, self.deadline, self.audio_at = 'off', 0, 0
         self.tuned_at, self.rds_pi = 0, None
         self.capture_ready = False
+        self.audio_armed, self.controls = False, None
+        self.control_deadline = self.control_at = self.capture_deadline = 0
+        self.capture_live = False
         self.capture_status = 'PCM unavailable: kernel FM capture absent'
         self.audio = self.capture_status
         self.level_dbfs = self.peak_dbfs = self.clipped = None
@@ -61,18 +64,44 @@ class FM:
             self.status = f'FM unavailable: {error}'
             self.close()
 
-    def silent_preflight(self):
+    def silent_preflight(self, capture_state=None):
         """Fail closed on unknown codec state or an enabled amplifier pin.
 
         The audited legacy status path reads aligned registers and only selects
         PMIC read addresses. GPIO inspection below maps device memory read-only;
         it never changes the amplifier, pin mux, or output levels.
         """
-        status = subprocess.run(['/usr/local/sbin/tablet-audio', 'status'], capture_output=True, text=True, timeout=2)
-        expected = {'PWR_STATUS.audio': '0', 'DAC_CON0': '0x00000000',
-                    'ADDA_DL': '0x00000000', 'AUDDEC0': '0x0000', 'UL_DL': '0x0000'}
-        if status.returncode or any(re.findall(r'(?<!\S)'+re.escape(key)+r'=([^\s]+)', status.stdout) != [value] for key, value in expected.items()):
-            raise RuntimeError('silent preflight failed: codec state unsafe or unknown')
+        active = False
+        if capture_state is None:
+            status = subprocess.run(['/usr/local/sbin/tablet-audio', 'status'], capture_output=True, text=True, timeout=2)
+            expected = {'PWR_STATUS.audio': '0', 'DAC_CON0': '0x00000000',
+                        'ADDA_DL': '0x00000000', 'AUDDEC0': '0x0000', 'UL_DL': '0x0000'}
+            if status.returncode or any(re.findall(r'(?<!\S)'+re.escape(key)+r'=([^\s]+)', status.stdout) != [value] for key, value in expected.items()):
+                raise RuntimeError('silent preflight failed: codec state unsafe or unknown')
+        else:
+            parameters = Path('/sys/module/snd_soc_mt6755_tablet/parameters')
+            if any((parameters/key).read_text().strip() != value for key, value in
+                   (('allow_playback', 'N'), ('allow_capture', 'Y'), ('legacy_quiesced', 'Y'))):
+                raise RuntimeError('silent capture policy unsafe or unknown')
+            # Read the owner directly: the legacy status helper rejects active users.
+            tokens = Path('/sys/bus/platform/devices/mt6755-tablet/capture_status').read_text().split()
+            fields = dict(token.split('=', 1) for token in tokens)
+            required = {'users', 'capture_prepared', 'capture_running', 'codec_on', 'gpio_mapped',
+                        'PWR_STATUS.audio', 'DAC_CON0', 'ADDA_DL', 'AUDDEC0', 'UL_DL',
+                        'AWB_BASE', 'AWB_CUR', 'AWB_END', 'capture_xrun'}
+            if len(fields) != len(tokens) or not required <= fields.keys():
+                raise RuntimeError('silent capture status missing or duplicate')
+            values = {key: int(fields[key], 16 if fields[key].startswith('0x') else 10) for key in required}
+            active = values['capture_prepared'] == values['capture_running'] == 1
+            if (any(values[key] != 0 for key in ('codec_on', 'gpio_mapped', 'AUDDEC0', 'UL_DL', 'capture_xrun')) or
+                any(values[key] not in (0, 1) for key in ('users', 'capture_prepared', 'capture_running', 'PWR_STATUS.audio')) or
+                values['ADDA_DL'] & 0x00ffffff or values['DAC_CON0'] & 0x07ffffff not in (0, 0x41) or
+                (capture_state == 'idle' and (values['DAC_CON0'] & 0x07ffffff or any(values[key] for key in ('users', 'capture_prepared', 'capture_running', 'PWR_STATUS.audio')))) or
+                values['capture_running'] > values['capture_prepared'] or values['capture_prepared'] > values['users'] or
+                (capture_state == 'running' and not active) or
+                (active and (values['users'] != 1 or values['PWR_STATUS.audio'] != 1 or values['DAC_CON0'] & 0x07ffffff != 0x41 or
+                             not 0 < values['AWB_BASE'] <= values['AWB_CUR'] <= values['AWB_END']))):
+                raise RuntimeError('silent capture state unsafe or unknown')
         fd = os.open('/dev/mem', os.O_RDONLY | os.O_SYNC)
         try:
             with mmap.mmap(fd, 4096, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ, offset=0x10005000) as gpio:
@@ -85,6 +114,7 @@ class FM:
                         raise RuntimeError(f'silent preflight failed: GPIO{pin} must be MODE0/DOUT0')
         finally:
             os.close(fd)
+        return active
 
     def tune(self, frequency, phase):
         self.stop_capture()
@@ -115,17 +145,29 @@ class FM:
         self.deadline = time.monotonic()+8
 
     def stop_capture(self):
-        if self.capture is not None:
-            if self.capture.poll() is None:
-                self.capture.terminate()
-            try:
-                self.capture.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                self.capture.kill()
-                self.capture.wait(timeout=1)
-            self.capture.stdout.close()
-            self.capture = None
-        self.pcm = b''
+        remute = self.audio_armed or self.capture is not None
+        self.audio_armed, self.controls, self.capture_live = False, None, False
+        self.control_deadline = self.control_at = self.capture_deadline = 0
+        self.pcm, self.bins, self.audio_at = b'', [], 0
+        self.level_dbfs = self.peak_dbfs = self.clipped = None
+        try:
+            if remute and self.tuner is not None and self.tuner.poll() is None:
+                self.tuner.stdin.write(b'm\nv 0\n')
+                self.tuner.stdin.flush()
+        finally:
+            if self.capture is not None:
+                child, self.capture = self.capture, None
+                try:
+                    if child.poll() is None:
+                        child.terminate()
+                    try:
+                        # arecord can flush a full pipe on TERM; drain while reaping.
+                        child.communicate(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.communicate(timeout=1)
+                finally:
+                    child.stdout.close()
 
     def poll(self):
         if self.tuner is None:
@@ -156,12 +198,15 @@ class FM:
                     elif self.phase == 'station-tuning':
                         self.phase, self.deadline = 'dwell', now+6
                         if self.capture_ready:
+                            self.audio_armed = True  # Cleanup covers even a failed setup.
                             try:
-                                import numpy  # Optional transform dependency, never an RF prerequisite.
-                                self.capture = subprocess.Popen(['/usr/local/sbin/tablet-audio', 'fm-record', '5', '-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                                os.set_blocking(self.capture.stdout.fileno(), False)
-                                self.audio = 'starting digital capture'
-                            except (OSError, ImportError):
+                                import numpy  # Load before gain/unmute or DMA, never an RF prerequisite.
+                                self.silent_preflight('idle')
+                                self.controls, self.control_deadline = {}, time.monotonic()+2
+                                self.tuner.stdin.write(b'v 1\nu\ng 7d\ng 9c\n')
+                                self.tuner.stdin.flush()
+                                self.audio = 'verifying digital capture controls'
+                            except (OSError, ValueError, RuntimeError, ImportError):
                                 self.stop_capture()
                                 self.audio = 'FM digital capture unavailable'
                         else:
@@ -175,11 +220,52 @@ class FM:
                     name = line[len('rds PS "'):].rstrip('"').strip()
                     if name:
                         self.names[self.frequency] = (name[:8], now)
+                elif self.audio_armed and line.startswith(('reg ', 'headphones out:')):
+                    match = re.fullmatch(r'reg (7d|9c) = ([0-9a-fA-F]{4})', line)
+                    if (match is None or self.controls is None or match[1] in self.controls or
+                        (int(match[2], 16) != 0x040c if match[1] == '7d' else int(match[2], 16) & 3 != 0)):
+                        self.stop_capture()
+                        self.audio = 'FM digital capture unavailable: mute/gain readback'
+                    else:
+                        self.controls[match[1]] = int(match[2], 16)
                 elif any(line.startswith(prefix) for prefix in ('tune:', 'power up:', 'muted startup:', 'mute:', 'volume:', 'rssi:')):
                     raise RuntimeError('receiver command failed')
+            try:
+                if self.audio_armed:
+                    if self.capture is not None and not self.capture_live and now >= self.capture_deadline:
+                        raise RuntimeError('digital capture startup timeout')
+                    if self.capture is None:
+                        self.silent_preflight('idle')
+                    else:
+                        self.capture_live = self.silent_preflight('running' if self.capture_live else 'starting')
+                    if self.controls is not None:
+                        if now >= self.control_deadline:
+                            raise RuntimeError('mute/gain readback timeout')
+                        if len(self.controls) == 2:
+                            self.controls, self.control_at = None, now+0.5
+                            if self.capture is None:
+                                self.capture_deadline = time.monotonic()+2
+                                self.capture = subprocess.Popen(['/usr/local/sbin/tablet-audio', 'fm-record', '5', '-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                os.set_blocking(self.capture.stdout.fileno(), False)
+                                self.audio = 'starting digital capture'
+                    elif now >= self.control_at:
+                        self.controls, self.control_deadline = {}, now+2
+                        self.tuner.stdin.write(b'g 7d\ng 9c\n')
+                        self.tuner.stdin.flush()
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+                self.stop_capture()
+                self.audio = f'FM digital capture unavailable: {error}'
+            if self.bins and now-self.audio_at > 0.5:
+                self.bins, self.pcm = [], b''
+                self.level_dbfs = self.peak_dbfs = self.clipped = None
+                self.audio = 'audio capture ended / not live'
             if self.capture is not None:
+                eof = False
                 try:
                     chunk = os.read(self.capture.stdout.fileno(), 65536)
+                    eof = not chunk
+                    if self.audio_armed and not self.capture_live:
+                        chunk, self.pcm = b'', b''
                     new_frames = (len(self.pcm) % 4 + len(chunk)) // 4
                     self.pcm += chunk
                     if len(self.pcm) > 16384:
@@ -199,16 +285,9 @@ class FM:
                         self.audio = 'FM audio / dBFS' if np.any(stereo) else 'digital silence / no audio signal'
                 except BlockingIOError:
                     pass
-                if self.capture.poll() is not None:
-                    if self.capture.returncode or not self.pcm:
-                        self.audio, self.bins = 'FM digital capture unavailable', []
-                        self.level_dbfs = self.peak_dbfs = self.clipped = None
-                        self.audio_at = 0
+                if eof or self.capture.poll() is not None:
+                    self.audio = 'FM digital capture unavailable' if self.capture.returncode or not self.pcm else 'audio capture ended / not live'
                     self.stop_capture()
-            if self.bins and now-self.audio_at > 0.5:
-                self.bins = []
-                self.level_dbfs = self.peak_dbfs = self.clipped = None
-                self.audio = 'audio capture ended / not live'
             if now >= self.deadline:
                 if self.phase in ('tuning', 'station-tuning'):
                     raise RuntimeError('tuner response timeout')
