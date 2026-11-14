@@ -172,6 +172,9 @@ spm, gpio = Blk(0x10006000), Blk(0x10005000)
         for node in moved[-2:]:
             match = next(n for n in original_tree.body if ast.dump(n) == ast.dump(node))
             original_tree.body.remove(match)
+        # The pure image developer is covered separately; every legacy hardware statement remains exact.
+        for tree in (original_tree, current_tree):
+            tree.body = [n for n in tree.body if not (isinstance(n, ast.FunctionDef) and n.name == "develop")]
         self.assertEqual(ast.dump(original_tree), ast.dump(current_tree))
         source = (CAMERA / "tablet-camera").read_text()
         self.assertLess(source.index("return _native_main(a)"), source.index("_legacy_lock = _legacy_guard()"))
@@ -321,6 +324,26 @@ class NativePhoto(unittest.TestCase):
                 if level == 0:
                     self.assertGreater(calls[-1][1], calls[0][1])
                 self.assert_unlocked()
+
+    def test_native_ae_meters_each_bayer_plane(self):
+        import numpy as np
+        self.args.exposure = None
+        for front, full in ((False, False), (False, True), (True, False)):
+            self.args.front, self.args.full = front, full
+            black = 32 if front else 64
+            for row, column in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                with self.subTest(front=front, full=full, phase=(row, column)):
+                    calls = []
+                    frame = np.full((4, 8), black, np.uint16)
+                    frame[row::2, column::2] += 600
+                    def capture(device, cam, lines, gain):
+                        self.assert_locked()
+                        calls.append((lines, gain))
+                        return frame
+                    self.ns.update(_native_capture=capture, develop=lambda *a: self.assert_locked())
+                    self.ns["_native_main"](self.args)
+                    self.assertEqual(len(calls), 1)  # Every cell has mean level 150.
+                    self.assert_unlocked()
 
     def test_invalid_native_options_fail_before_capture(self):
         cases = (dict(front=True, full=True), dict(exposure=0), dict(exposure=5),
@@ -490,6 +513,68 @@ print("cap dqbuf: 0 seq: 2 bytesused: 64 ts: 1.000000 (ts-monotonic, ts-src-eof)
 
 
 class Processing(unittest.TestCase):
+    def test_measured_samples_and_precise_white_balance(self):
+        import copy
+        import numpy as np
+        for filename in ("tablet-camera", "raw-develop.py"):
+            tree = ast.parse((CAMERA / filename).read_text())
+            function = copy.deepcopy(next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "develop"))
+            body = []
+            for node in function.body:
+                body.append(node)
+                if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "mean" for t in node.targets):
+                    break
+            # Execute the actual demosaic/AWB-mean prefix, with no file output or device access.
+            function.args = ast.parse("def stage(raw, black): pass").body[0].args
+            function.body = body + [ast.parse("return rgb, mean").body[0]]
+            function.name = "stage"
+            namespace = {}
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "processing-prefix", "exec"), namespace)
+            with self.subTest(filename=filename, check="measured samples"):
+                frame = np.full((8, 8), 164, np.uint16)
+                frame[2, 3] = 564
+                rgb, _ = namespace["stage"](frame, 64)
+                self.assertEqual(rgb[2, 3, 1], 500)
+                for row, column, channel in ((1, 1, 0), (0, 1, 1), (1, 0, 1), (0, 0, 2)):
+                    np.testing.assert_array_equal(rgb[row::2, column::2, channel], frame[row::2, column::2] - 64)
+            with self.subTest(filename=filename, check="white-balance precision"):
+                frame = np.tile(np.array([[101, 201], [201, 301]], np.uint16), (512, 512))
+                _, means = namespace["stage"](frame, 64)
+                np.testing.assert_allclose(means, [237, 137, 37], rtol=0, atol=1e-9)
+
+    def test_chroma_noise_luma_and_flat_fields(self):
+        import copy
+        import tempfile
+        import numpy as np
+        from PIL import Image
+        function = copy.deepcopy(next(n for n in ast.parse((CAMERA / "raw-develop.py").read_text()).body
+                                     if isinstance(n, ast.FunctionDef) and n.name == "develop"))
+        cut = next(i for i, n in enumerate(function.body) if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "luma" for t in n.targets))
+        function.body = function.body[:cut] + [ast.parse("return out").body[0]]
+        namespace = {}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "pre-chroma", "exec"), namespace)
+        frame = np.clip(264 + np.random.default_rng(7).normal(0, 12, (64, 64)), 64, 1023).astype(np.uint16)
+        frame[:, 56:] = 964
+        before = namespace["develop"](frame, 64)
+        after = raw_develop.develop(frame, 64).astype(np.float64) / 255
+        area = np.s_[4:-4, 4:48]
+        weights = np.array([0.299, 0.587, 0.114])
+        self.assertLess(float((after[area][..., 0] - after[area][..., 1]).std()),
+                        float((before[area][..., 0] - before[area][..., 1]).std()) * 0.8)
+        np.testing.assert_allclose(after[area] @ weights, before[area] @ weights, rtol=0, atol=0.51 / 255)
+        exec(helper_function("develop"), namespace)
+        for black in (32, 64):
+            for flip in (False, True):
+                with self.subTest(black=black, flip=flip), tempfile.TemporaryDirectory(dir=TEST_OUTPUT) as directory:
+                    path = Path(directory) / "developed.png"
+                    namespace["develop"](frame, black, str(path), flip)
+                    expected = raw_develop.develop(frame, black)
+                    np.testing.assert_array_equal(np.asarray(Image.open(path)), expected[::-1] if flip else expected)
+            for level in (0, black, 164, 1023):
+                flat = raw_develop.develop(np.full((8, 8), level, np.uint16), black)
+                np.testing.assert_array_equal(flat, np.broadcast_to(flat[0, 0], flat.shape))
+
     def test_both_encodings_and_legacy_equivalence(self):
         import numpy as np
         pixels = np.arange(32, dtype=np.uint16) * 31

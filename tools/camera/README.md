@@ -31,8 +31,12 @@ approval. A loaded kernel owner selects V4L2 without opening `/dev/mem`.
     sudo /usr/local/bin/tablet-camera --front -o front.jpg
     sudo /usr/local/bin/tablet-camera --raw frame.raw ...   # also keep the packed RAW10 frame
 
-Native auto exposure uses at most eight attempts, each V4L2 child bounded to 30 s;
-full resolution takes longer. Both paths demosaic in numpy. Native `--raw` preserves
+Native auto exposure meters all four Bayer positions in sampled 2x2 cells and
+uses at most eight attempts, each V4L2 child bounded to 30 s; full resolution takes
+longer. Both paths preserve measured samples during demosaic, accumulate white
+balance in float64, and smooth chroma over 3x3 pixels while retaining display luma
+before gamut clipping. Chroma edges can soften by one pixel; luminance grain
+remains. Native `--raw` preserves
 the documented MediaTek packed10 file format by repacking LE16 capture data.
 sudo's PATH on this system has no /usr/local/bin: use the full path.
 
@@ -80,9 +84,10 @@ M=$PWD/physbuf ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules`):
 ## Not done
 
 Bounded native capture and BGGR are accepted; standard-app/libcamera compliance,
-full-rate video and colour calibration are not. No ISP features (lens shading,
-denoise, sharpening, autofocus: the rear focus motor on VLDO28 is not driven, so focus is fixed);
-no full-rate video. Practical output defaults are front unchanged, rear vertical flip,
+full-rate video and colour calibration are not. Hardware ISP features and
+autofocus are unavailable; the photo command does not drive the rear actuator.
+Keep VLDO28 unchanged because touch shares that supply. Practical output defaults
+are front unchanged, rear vertical flip,
 and no extra horizontal mirror. Exact physical chirality/rear upright proof remains unclaimed.
 The helper uses the I2C2 controller when its DT node exists (current s7x+ kernels), with a
 userspace bit-bang fallback on older kernels. The candidate requires the real controller.

@@ -3,8 +3,9 @@
 """Offline software development of a saved BGGR frame; never opens a camera.
 
 Accepts the V4L2 candidate's SBGGR10 (16-bit LE words) or the preserved legacy
-MediaTek LE bitstream. Bilinear demosaic / grey-world AWB / gamma are SOFTWARE,
-not a hardware ISP. Exposure/colour calibration and lens shading are not solved.
+MediaTek LE bitstream. Bilinear demosaic, grey-world AWB, gamma, and mild
+chroma smoothing run in software. Hardware ISP, exposure/colour calibration,
+and lens shading remain unavailable.
 """
 import argparse
 from pathlib import Path
@@ -49,11 +50,16 @@ def develop(raw, black):
         padded = np.pad(image, ((1, 1), (1, 1), (0, 0)), mode="edge")
         return sum(padded[y:y + height, z:z + width] for y in range(3) for z in range(3))
 
-    rgb = box(rgb) / np.maximum(box(weights), 1e-6)
-    mean = rgb.reshape(-1, 3).mean(axis=0)
+    rgb = np.where(weights, rgb, box(rgb) / np.maximum(box(weights), 1e-6))
+    mean = rgb.reshape(-1, 3).mean(axis=0, dtype=np.float64)
     rgb *= mean[1] / np.maximum(mean, 1e-3)
     rgb /= max(float(np.percentile(rgb, 99.7)), 1.0)
-    return (np.clip(rgb, 0, 1) ** (1 / 2.2) * 255 + 0.5).astype(np.uint8)
+    out = np.clip(rgb, 0, 1) ** (1 / 2.2)
+    del rgb, weights, x  # Release full-resolution intermediates before chroma smoothing.
+    luma = np.sum(out * np.array([0.299, 0.587, 0.114], np.float32), axis=2, keepdims=True)
+    out -= luma
+    out = luma + box(out) / 9  # Mild chroma-only smoothing; retain display luma.
+    return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
 def main():
