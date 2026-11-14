@@ -9,8 +9,9 @@ The guarded helper and module set were installed on 2026-11-13. Idle card/mixer
 enumeration, ordinary unload, and reload passed without changing the running
 kernel. Subsequent bounded tests accepted real broadcast-derived FM PCM and
 DMA, receiver/gain reversal controls, natural recorder close, and reopen with
-analogue outputs independently off. Capture is enabled for the current boot;
-playback remains disabled. Microphones and audible output remain unaccepted.
+analogue outputs independently off. Guarded capture-only startup passed one
+controlled reboot on 2026-11-14, followed by changing PCM/DMA and natural recorder
+shutdown. Playback remains disabled. Microphones and audible output remain unaccepted.
 Detailed hardware-trial receipts remain operator-local and are not shipped
 with this source checkpoint. Earlier build receipts do not identify current
 module bytes or establish PCM acceptance.
@@ -78,6 +79,51 @@ windows, and drains recorder output during cleanup. Real rotated framebuffer out
 normal dismissal, owned-renderer termination recovery, and the full sweep deadline
 passed. Existing controller timing, volume feedback, and console recovery are retained.
 
+## Guarded boot availability
+
+`fm-boot-load.in` and `tablet-fm.service.in` export the accepted startup path.
+They reproduce the qualified installed bytes after four operator-local token
+substitutions; no installer or new daemon is required. Startup checks identity
+and makes capture available, without tuning, opening PCM, or starting a display.
+
+Render `@QUALIFIED_DIR@`, `@KERNEL_RELEASE@`, `@KERNEL_BANNER@`, and
+`@KERNEL_CONFIG_SHA256@` from the qualified target, never from a release-name
+match alone. Substitute literal trusted values: use an absolute directory without
+whitespace/shell metacharacters, and release/banner values without single quotes
+or newlines. Leave no unresolved tokens. Keep rendered files and values private.
+
+In that root-owned directory, install the rendered script as `load` and supply:
+
+- `modules.list`: no header/blank lines; each row is the sysfs module name,
+  absolute qualified `.ko` path, then fixed insmod options. Order: `soundcore`,
+  `snd`, `snd_timer`, `snd_pcm`, `snd_soc_core`, `snd_soc_mt6755_tablet`,
+  `mtk_fm_drv`. The board row must specify
+  `legacy_quiesced=1 allow_capture=1 allow_playback=0`.
+- `notes/NAME`: expected GNU build-ID note bytes for every listed module and
+  `mtk_stp_wmt_soc`, derived from qualified module files and checked against live
+  identity. WMT must already belong to the working Wi-Fi bring-up; never unload it.
+- `files.sha256`: pin the rendered loader/unit, module list, note files, qualified
+  modules, and the guarded `tablet-audio`/`tablet-sentinel` dependencies. Use the
+  final installed paths; regenerate only after review/requalification, not merely
+  to silence a mismatch. Keep all inputs root-owned and non-writable by others.
+
+Install the rendered unit as `tablet-fm.service`, validate with
+`systemd-analyze verify`, and exercise its manual path in an approved idle window
+before separately enabling future boots. The service holds the existing hardware
+flock, verifies loaded policy/notes, and checks the passive analogue-off interlock.
+A failure may leave a partial module stack; inspect its identity before recovery.
+Do not add forced unload or WMT recovery. Stopping the unit does not unload modules; disabling it prevents
+future boot loading. Retain a hash-owned configuration rollback and independent
+remote recovery. A separate approved reboot establishes actual boot execution.
+
+Offline regression: `python3 -B tools/audio/test_fm_boot.py`. Its sixteen Linux
+fixtures exercise cold/partial synthetic loading, idempotence, foreign identity,
+wrong policy, insertion/interlock failures, and common-lock contention. Notes and
+module bytes are explicitly synthetic; no real ELF, device, RF, or PCM is opened.
+The rendered templates matched the accepted installation byte-for-byte. The live
+reboot check retained the normal ambient schedule; it did not await a six-hour
+automatic appearance or establish new framebuffer-rendering acceptance.
+
 ## Ownership and approval boundary
 
 `legacy_quiesced` defaults false, is read-only while loaded, and must be true
@@ -107,7 +153,7 @@ are not authorization to execute hardware operations.
 
 `allow_capture` also defaults false and is immutable while loaded. Capture open
 returns EPERM before power/clock/DMA setup unless it is explicitly enabled in a
-separately approved load. The accepted current-boot deployment uses
+separately approved load. The qualified startup deployment uses
 `allow_capture=1 allow_playback=0`; enumeration alone does not authorise capture.
 
 This cooperative guard cannot stop arbitrary root programs using `/dev/mem`
@@ -255,7 +301,8 @@ ordinary unload/reload, and coexistence with the RF display passed. These result
 establish the earlier idle gate, not general ABI compatibility on another kernel.
 Later bounded digital capture verified broadcast-derived PCM, changing AWB DMA,
 receiver/gain reversals, natural close, and reopen with analogue outputs off.
-Modules/helpers are installed; FM boot autoload remains unconfigured.
+Modules/helpers and guarded startup are installed; one controlled reboot and
+post-boot silent capture passed on the qualified combination.
 
 The board lacks an audio genpd/CCF consumer in the current DTS, so this candidate
 retains narrowly scoped BSP-derived AUDIO MTCMOS and AFE gates plus the
@@ -266,7 +313,7 @@ not a new complete codec DAPM/regulator/runtime-PM implementation. No suspend/
 resume, long-running DMA stability, thermal/power or audible acceptance exists.
 The ALSA path is S16, unlike the raw fallback's 24-in-32 samples. DMA/ASRC input
 clocking and RDS-preserving digital capture passed the bounded tests above;
-long-duration stability, explicit hardware XRUN stress, and reboot persistence remain untested.
+long-duration stability, explicit hardware XRUN stress, and repeated-boot coverage remain untested.
 
 No microphone or headphone-jack detection/playback capability is implemented
 or promised. HPL/HPR in the speaker sequence is evidence for the AW8736 feed,
@@ -276,6 +323,6 @@ board evidence. No guessed microphone/jack register writes were added.
 
 Further hardware work needs separate approval: analogue speaker playback,
 microphone/jack implementation after wiring evidence, live suspend/stress, and
-FM startup/reboot acceptance. Retain `allow_playback=0` and the independent
+further reboot/long-soak trials. Retain `allow_playback=0` and the independent
 analogue-off checks during digital capture. Do not unload shared WMT. A source
 checkout or successful build does not authorise loading or recording.

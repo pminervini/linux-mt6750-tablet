@@ -29,7 +29,8 @@ It is not a polished distribution.
 - FM receiver: tuning/retuning and RDS PI, station name, and RadioText verified under native Debian;
   requires the matching receiver-capable connsys revision and stock DSP firmware (see "Not included").
   bounded broadcast-derived digital PCM capture is verified with analogue outputs off.
-  Playback and reboot persistence remain unverified; FM module loading is manual.
+  Guarded startup and bounded silent capture passed one controlled reboot;
+  audible playback and long-duration stability remain unverified.
 - established userspace speaker path (`tools/audio/tablet-audio`) retained as an
   unload fallback; the new guarded ALSA deployment keeps playback disabled
 - side-button playback volume in 5% steps, with a rotating two-second bar and percentage
@@ -43,8 +44,8 @@ It is not a polished distribution.
   Analogue outputs remain off; approved PCM dwell verifies receiver gain/mute and
   cleanup remutes/zeros gain. Missing or unsafe PCM is labelled unavailable.
   Install the HUP-aware `fmctl` from the receiver-capable connsys source in `/usr/local/bin/`;
-  the display neither loads drivers nor enables playback. FM module loading remains manual,
-  and reboot persistence is unverified. Offline checks:
+  the display neither loads drivers nor enables playback. Guarded FM startup passed
+  one controlled reboot; [operator-local boot recipe](tools/audio/README.md#guarded-boot-availability). Offline checks:
   `python3 -B -m unittest discover -s tools/tablet-etc -p 'test_*.py' -v`.
 - boot splash: own boot logo (lk), lk's "Orange State" screen and 5 s delay patched out, quiet boot
   with an optional animation until the login prompt, console rotated for landscape
@@ -64,12 +65,12 @@ It is not a polished distribution.
   exposure/gain; its guarded legacy path remains an unload fallback.
 - standard interfaces: real digital FM DMA/PCM and camera RAW streams are accepted
   within the bounded test scope. Camera close recovers owned power and allocations.
-  Camera startup is enabled after separate approval and manual loader tests; actual
-  reboot persistence remains untested. See [the verified scope](STANDARD-INTERFACES.md).
+  Guarded camera/FM startup passed one controlled reboot, with all three photo
+  modes and silent PCM checked afterwards. See [the verified scope](STANDARD-INTERFACES.md).
 
 Not accepted yet: analogue playback, microphones/jack wiring, autofocus, calibrated
 colour/physical chirality, standard-app/libcamera compliance, live suspend stress,
-indefinite soak, and reboot persistence. CPU frequency scaling beyond the boot
+indefinite soak, and repeated-boot coverage. CPU frequency scaling beyond the boot
 loader's operating point uses a small two-point userspace governor; the GPU is unsupported.
 
 ## Building

@@ -1,0 +1,17 @@
+[Unit]
+Description=Qualified silent MT6755 FM capture availability
+After=systemd-modules-load.service mt6755-wifi.service
+ConditionKernelVersion=@KERNEL_RELEASE@
+ConditionPathExists=/sys/kernel/mt6755_pmic/reg
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+ExecStart=/usr/bin/flock -n /run/tablet-audio-hardware.lock /bin/sh @QUALIFIED_DIR@/load
+ExecStartPost=/usr/local/sbin/tablet-audio fm-check
+TimeoutStartSec=30
+# No stop/unload action: disabling availability must not disturb shared WMT.
+
+[Install]
+WantedBy=multi-user.target

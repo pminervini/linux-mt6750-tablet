@@ -1,0 +1,35 @@
+#!/bin/sh
+# Load only the qualified, capture-only FM stack. Never tune or open PCM here.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+cd @QUALIFIED_DIR@
+test "$(uname -r)" = '@KERNEL_RELEASE@'
+test "$(uname -v)" = '@KERNEL_BANNER@'
+test "$(gzip -cd /proc/config.gz | sha256sum | cut -d ' ' -f 1)" = '@KERNEL_CONFIG_SHA256@'
+sha256sum --check --status files.sha256
+systemctl is-active --quiet mt6755-wifi.service
+cmp notes/mtk_stp_wmt_soc /sys/module/mtk_stp_wmt_soc/notes/.note.gnu.build-id
+# Refuse foreign resident dependencies before inserting anything.
+while read -r module path options; do
+    if test -d "/sys/module/$module"; then
+        cmp "notes/$module" "/sys/module/$module/notes/.note.gnu.build-id"
+    fi
+done < modules.list
+if test -d /sys/module/snd_soc_mt6755_tablet; then
+    test "$(cat /sys/module/snd_soc_mt6755_tablet/parameters/allow_playback)" = N
+    test "$(cat /sys/module/snd_soc_mt6755_tablet/parameters/allow_capture)" = Y
+    test "$(cat /sys/module/snd_soc_mt6755_tablet/parameters/legacy_quiesced)" = Y
+fi
+while read -r module path options; do
+    if ! test -d "/sys/module/$module"; then
+        # Fixed root-owned options are intentionally expanded into separate words.
+        insmod "$path" $options
+    fi
+    cmp "notes/$module" "/sys/module/$module/notes/.note.gnu.build-id"
+done < modules.list
+test "$(cat /sys/module/snd_soc_mt6755_tablet/parameters/allow_playback)" = N
+test "$(cat /sys/module/snd_soc_mt6755_tablet/parameters/allow_capture)" = Y
+test "$(cat /sys/module/snd_soc_mt6755_tablet/parameters/legacy_quiesced)" = Y
+# Reuse the installed passive owner/amp interlock; enabled=False never opens FM.
+python3 -B -c 'import runpy; n=runpy.run_path("/usr/local/bin/tablet-sentinel",run_name="fm_boot_check"); n["FM"](enabled=False).silent_preflight("idle")'

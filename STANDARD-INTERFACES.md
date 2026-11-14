@@ -25,11 +25,16 @@ Camera close returns owned rails, pins, and DMA allocations to idle. The raw
 legacy paths remain excluded while their kernel owner exists; loading and legacy
 access share cooperative locks. Old unguarded copies must not run concurrently.
 
-A guarded camera startup unit is enabled on the qualified installation, without
-a reboot. Its manual loading path and enablement were checked; actual reboot
-persistence remains untested. FM activation remains current-boot-only. Reproduce
-camera startup with operator-local guards as described in the camera README;
-this source release neither enables services nor authorises hardware operation.
+Guarded camera and capture-only FM startup passed one controlled reboot on
+2026-11-14, followed by actual photos in all three modes and changing FM PCM/DMA
+with natural recorder shutdown. Remote access, existing services, idle recovery,
+and restoration of the previously mounted share also passed. Playback stayed
+disabled. This is one-boot, bounded acceptance, not repeated-boot or soak coverage.
+The normal six-hour ambient gate was unchanged; its automatic appearance was
+not awaited in this reboot check. An early-ioremap warning preceded both loaders;
+no new media-test kernel-error matches were observed. Reproduce startup with
+operator-local guards as described in the audio/camera READMEs; these sources
+neither enable services nor authorise hardware operation.
 
 Analogue playback, microphones/jack wiring, autofocus, calibrated colour/physical
 chirality, standard-app/libcamera compliance, live suspend stress, and indefinite

@@ -3,9 +3,9 @@
 The 2026-11-14 native camera release passed fifteen real capture/lifecycle phases across
 rear preview/full and front, including sensor patterns, scenes, starvation/EBUSY,
 cancellation and reopen. The deployed helper now produces JPEG/PNG using V4L2,
-and a guarded camera loader has passed manual startup. After separate approval,
-automatic loading is enabled on the qualified installation; reboot persistence
-has not been tested.
+and its guarded loader started automatically through one controlled reboot on
+2026-11-14. Actual front, rear-preview, and rear-full photos passed afterwards,
+with idle power/allocation recovery. Repeated-boot and long-soak coverage remain open.
 Sensors are unpowered when idle. The earlier 2026-11-13 idle-only trial had
 streaming disabled; an earlier failed trial had
 deadlocked QUERY_EXT_CTRL on shared ioctl/control locking and required an approved
@@ -351,5 +351,5 @@ This establishes the bounded idle gate, not capture or universal ABI compatibili
    queue starvation/requeue, two-process EBUSY, timeout/disconnect, cancellation,
    CPU/memory use and cleanup. Never infer this milestone from one saved frame
    or the synthetic 384-frame test. V4L2-compliance and actual app acceptance,
-   live system-PM stress, long soak, calibrated colour and reboot persistence remain
-   separate gates. Native software photos and boot configuration are now accepted as above.
+   live system-PM stress, long soak, calibrated colour, and repeated-boot coverage
+   remain separate gates. Native software photos and one controlled reboot are accepted as above.
